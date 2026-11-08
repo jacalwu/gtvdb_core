@@ -1,7 +1,7 @@
 # gtvdb_core — 时序图分析平台（核心仓）
 
 > **这个仓库只包含核心。** 时序图内存数据库内核、SQL 表面、可 mmap 的 GTVSeg 存储、量子状态元数据，以及「扩展接口」本身。
-> 银行监管、HFT/kdb+、量子计算求解、PQC/CBOM、q 前端等**工作负载不在这里**，它们仍留在原完整 workspace（`jacalwu/gtvdb` 的 `gtv_ext_lib/`），通过 `GtvExtension` 注册接入；独立扩展仓尚未创建。
+> 银行监管、HFT/kdb+、量子计算求解、PQC/CBOM、q 前端等**工作负载不在这里**：它们已拆到独立扩展仓 [`jacalwu/gtvdb_ext`](https://github.com/jacalwu/gtvdb_ext)，通过 `GtvExtension` 注册接入。
 
 定位与取舍见 [docs/positioning.md](docs/positioning.md)；路线图见 [ROADMAP.md](ROADMAP.md)。
 
@@ -12,9 +12,9 @@
 | 仓库 | 内容 | 依赖方向 |
 |:--|:--|:--|
 | **`jacalwu/gtvdb_core`**（本仓） | 12 个内核 lib crate + 精简 `gtv` REPL + 核心文档/测试 | 不依赖任何扩展 |
-| `jacalwu/gtvdb`（原完整 workspace） | `gtv_ext_lib/` 领域扩展、full-pack CLI、gRPC server、监管/行情脚本 | 单向依赖核心，经 `GtvExtension` 接入 |
+| [`jacalwu/gtvdb_ext`](https://github.com/jacalwu/gtvdb_ext) | 13 个领域扩展 crate、full-pack CLI、gRPC server、领域文档 | 以**固定 commit 的 git dependency** 单向依赖本仓，经 `GtvExtension` 接入 |
 
-本仓是从完整 workspace **拆分出来的独立仓库**，拥有干净的 git 历史：不含扩展代码、不含领域脚本、不含任何被提交的数据集（CSV / Parquet / Segment / PDF）。原仓与本地完整 workspace 不受影响。
+本仓是从完整 workspace **拆分出来的独立仓库**，拥有干净的 git 历史：不含扩展代码、不含领域脚本、不含任何被提交的数据集（CSV / Parquet / Segment / PDF）。扩展仓把 12 个内核 crate 钉在同一个本仓 commit SHA 上，因此「内核不依赖扩展」由 Cargo 依赖源保证，而不再只是目录约定。原 monorepo `jacalwu/gtvdb` 保留完整历史、监管脚本与历史数据，不再参与两仓构建。
 
 ---
 

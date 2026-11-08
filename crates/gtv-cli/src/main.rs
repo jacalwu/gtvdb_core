@@ -2,8 +2,8 @@
 //!
 //! This binary deliberately depends only on platform crates. Domain workloads
 //! (banking / HFT / quantum compute / crypto / q) are NOT linked in: they live
-//! in the original full workspace (jacalwu/gtvdb, gtv_ext_lib/) and are installed through
-//! `gtv_engine::GtvExtension` by their own composition root. Keeping this
+//! in the companion gtvdb_ext repository (jacalwu/gtvdb_ext) and are installed
+//! through `gtv_engine::GtvExtension` by their own composition root. Keeping this
 //! binary dependency-free is the proof that the core really is standalone.
 
 use anyhow::{anyhow, Result};
