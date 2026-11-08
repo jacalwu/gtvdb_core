@@ -2,7 +2,7 @@
 //!
 //! This binary deliberately depends only on platform crates. Domain workloads
 //! (banking / HFT / quantum compute / crypto / q) are NOT linked in: they live
-//! in the companion repository and are installed through
+//! in the original full workspace (jacalwu/gtvdb, gtv_ext_lib/) and are installed through
 //! `gtv_engine::GtvExtension` by their own composition root. Keeping this
 //! binary dependency-free is the proof that the core really is standalone.
 
@@ -36,7 +36,7 @@ Everything else is executed as SQL, for example:
   SELECT * FROM quantum_state_frontier('examples/quantum-state/ghz3.jsonl', 6, 0.05);
 
 Extensions are not bundled here. Implement gtv_engine::GtvExtension in the
-companion repository and pass it to GtvContext::with_extensions(...).";
+original full workspace and pass it to GtvContext::with_extensions(...).";
 
 /// A parsed REPL line. Kept as a pure value so command handling is testable
 /// without starting a DataFusion session.

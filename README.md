@@ -1,18 +1,18 @@
 # gtvdb_core — 时序图分析平台（核心仓）
 
 > **这个仓库只包含核心。** 时序图内存数据库内核、SQL 表面、可 mmap 的 GTVSeg 存储、量子状态元数据，以及「扩展接口」本身。
-> 银行监管、HFT/kdb+、量子计算求解、PQC/CBOM、q 前端等**工作负载不在这里**，它们在配套的扩展仓库中，通过 `GtvExtension` 注册接入。
+> 银行监管、HFT/kdb+、量子计算求解、PQC/CBOM、q 前端等**工作负载不在这里**，它们仍留在原完整 workspace（`jacalwu/gtvdb` 的 `gtv_ext_lib/`），通过 `GtvExtension` 注册接入；独立扩展仓尚未创建。
 
 定位与取舍见 [docs/positioning.md](docs/positioning.md)；路线图见 [ROADMAP.md](ROADMAP.md)。
 
 ---
 
-## 1. 两个仓库的分工
+## 1. 代码边界
 
 | 仓库 | 内容 | 依赖方向 |
 |:--|:--|:--|
 | **`jacalwu/gtvdb_core`**（本仓） | 12 个内核 lib crate + 精简 `gtv` REPL + 核心文档/测试 | 不依赖任何扩展 |
-| 配套的扩展仓 | 领域扩展 crate、full-pack CLI、gRPC server、监管/行情脚本 | 单向依赖本仓，经 `GtvExtension` 接入 |
+| `jacalwu/gtvdb`（原完整 workspace） | `gtv_ext_lib/` 领域扩展、full-pack CLI、gRPC server、监管/行情脚本 | 单向依赖核心，经 `GtvExtension` 接入 |
 
 本仓是从完整 workspace **拆分出来的独立仓库**，拥有干净的 git 历史：不含扩展代码、不含领域脚本、不含任何被提交的数据集（CSV / Parquet / Segment / PDF）。原仓与本地完整 workspace 不受影响。
 

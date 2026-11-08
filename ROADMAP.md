@@ -1,7 +1,7 @@
 # gtvdb_core — 核心路线圖
 
 嵌入式時序圖分析平台核心：在一個 Arrow 表上回答「`T` 時刻這張圖長什麼樣」與「這個狀態是怎麼變成的」。
-本倉只承諾**內核主線**；領域工作負載屬於配套擴展倉，不進本路線圖。定位理由見 [docs/positioning.md](docs/positioning.md)。
+本倉只承諾**內核主線**；領域工作負載仍留在原完整 workspace（`jacalwu/gtvdb` 的 `gtv_ext_lib/`），不進本路線圖。定位理由見 [docs/positioning.md](docs/positioning.md)。
 
 ---
 
@@ -21,13 +21,13 @@
 - [ ] **M8 分發**：`gtv-core` / `gtv-index` 發佈 crates.io，`v0.1.0-alpha` release
 - [ ] **M9 綁定**：pyo3（只暴露 6 個函式）
 - [ ] **M10 canonical demo**：point-in-time 特徵 join、量子 run 除錯各一
-- [ ] **M12 動態載入器**：把 dylib 的 C-stable vtable 包成 `GtvExtension`（由擴展倉交付）
+- [ ] **M12 動態載入器**：把 dylib 的 C-stable vtable 包成 `GtvExtension`（由擴展側交付）
 
 ## 明確不做（核心倉）
 
 | 項目 | 理由 |
 |:--|:--|
-| 銀行監管 / HFT / 量子求解 / PQC / q 前端 | 工作負載，屬擴展倉；核心只保留註冊介面 |
+| 銀行監管 / HFT / 量子求解 / PQC / q 前端 | 工作負載，留在原完整 workspace；核心只保留註冊介面 |
 | 分散式（shard / planner / worker） | 目前只是遠端執行 SQL；無真實多機工作負載前不承諾 |
 | 提交任何生成資料集 | 歷史教訓：兩個 >50MB CSV blob 曾拖慢每次 clone；改為生成器 + 校驗和 |
 | 熱層壓縮 | mmap 後必須能零解碼直接算，見 `docs/oceanbase-storage-lessons.md` |
