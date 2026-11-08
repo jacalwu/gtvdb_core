@@ -1,0 +1,37 @@
+[package]
+name = "gtv-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+arrow.workspace = true
+gtv-core = { path = "../gtv-core" }
+gtv-array = { path = "../gtv-array" }
+gtv-index = { path = "../gtv-index" }
+gtv-catalog = { path = "../gtv-catalog" }
+gtv-pattern = { path = "../gtv-pattern" }
+gtv-storage = { path = "../gtv-storage" }
+thiserror.workspace = true
+async-trait = "0.1"
+ureq = "2"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+anyhow.workspace = true
+chrono = "0.4"
+blake3.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[features]
+default = []
+# Exact LP CRM allocator (Phase 3) over the optimizable pool.
+# Enables gtv-array's `crm-lp` feature (pure-Rust microlp backend via good_lp)
+# and the `method = 'lp'` dispatch in crm_alloc / crm_audit.
+crm-lp = ["gtv-array/crm-lp"]
+# NOTE: no feature here may reference a crate under `gtv_ext_lib/`. An
+# extension's opt-in feature belongs on the extension crate itself (e.g.
+# `gtv-ext-quantum/qoqo`); the core must build with every extension absent.

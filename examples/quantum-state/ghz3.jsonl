@@ -1,0 +1,20 @@
+# ghz-3 with a mid-circuit measurement — a state tree, not a chain.
+#
+# Record format: state_id, parent_state, gate, timestamp, probability.
+# `probability` here is CONDITIONAL (weight given the parent), so the probability
+# of a state is the product along its root path. See docs/quantum-state-graph.md
+# for the absolute-probability convention.
+#
+# Try it from the REPL:
+#   cargo run -p gtv-cli --bin gtv
+#   SELECT * FROM quantum_state_summary('examples/quantum-state/ghz3.jsonl');
+{"state_id":0,"parent_state":null,"gate":"|000>","timestamp":0,"probability":1.0}
+{"state_id":1,"parent_state":0,"gate":"h q[0]","timestamp":1,"probability":1.0}
+{"state_id":2,"parent_state":1,"gate":"cx q[0],q[1]","timestamp":2,"probability":1.0}
+{"state_id":3,"parent_state":2,"gate":"cx q[0],q[2]","timestamp":3,"probability":1.0}
+{"state_id":4,"parent_state":3,"gate":"measure q[0]","timestamp":4,"probability":0.5}
+{"state_id":5,"parent_state":3,"gate":"measure q[0]","timestamp":4,"probability":0.5}
+{"state_id":6,"parent_state":4,"gate":"rx(0.785398) q[1]","timestamp":5,"probability":1.0}
+{"state_id":7,"parent_state":6,"gate":"measure q[1]","timestamp":6,"probability":0.8}
+{"state_id":8,"parent_state":6,"gate":"measure q[1]","timestamp":6,"probability":0.2}
+{"state_id":9,"parent_state":5,"gate":"x q[2]","timestamp":5,"probability":1.0}

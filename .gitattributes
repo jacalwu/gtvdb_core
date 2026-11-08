@@ -1,0 +1,6 @@
+# Local generated CSVs are NOT committed (see .gitignore + CI guard), but the
+# LF pin still matters: gen_datasets.sh compares them against SHA256SUMS, so
+# the bytes must be identical on every OS. Without this, `core.autocrlf=true`
+# on Windows would give CRLF in the working tree while Linux gets LF.
+/testcase/data/*.csv text eol=lf
+/testcase/data/*.parquet binary

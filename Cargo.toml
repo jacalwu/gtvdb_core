@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+# gtvdb_core is the platform ONLY: the temporal graph kernel, its SQL surface,
+# its mmap-backed storage and the extension ABI. Workloads (banking / HFT /
+# quantum compute / crypto / q) live in the companion repository and plug in
+# through `gtv_engine::ext::GtvExtension`; no crate here may depend on one.
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+arrow = { version = "59", features = ["prettyprint", "csv", "ipc"] }
+parquet = { version = "59", features = ["arrow"] }
+datafusion = "55"
+thiserror = "2"
+anyhow = "1"
+rustyline = "14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tonic = { version = "0.14", features = ["tls-ring"] }
+prost = "0.14"
+rayon = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+
+# ---------------------------------------------------------------------------
+# Build-time tuning.
+#
+# The third-party graph (arrow / parquet / datafusion / tonic / rustls / ...)
+# dominates cold-build time. Cargo's `[profile.*.package."*"]` override applies
+# to *registry* dependencies only — workspace members (the gtv-* crates) are
+# untouched and keep the base `[profile.release]` / `[profile.dev]` settings,
+# so the runtime-critical kernels stay fully optimized while dependency
+# compiles are made as cheap as possible.
+# ---------------------------------------------------------------------------
+
+[profile.release.package."*"]
+opt-level = 1
+
+[profile.dev.package."*"]
+debug = false

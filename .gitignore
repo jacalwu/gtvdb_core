@@ -1,0 +1,45 @@
+/target
+# heavy installers / runtimes
+/Futu_OpenD*/
+/Futu_OpenD_ubuntu.tar.gz
+# generated data & outputs
+/analytics_out/
+/data/
+# Generated datasets are NEVER committed (P1 hard rule).
+#
+# CSV in particular is a regenerable interchange format: it is what the
+# benchmark generators emit locally, and committing it once already left
+# >50 MB blobs in the git history (they still cost every fresh clone).
+# From P1 onwards, ingest/WAL/MemSegment/flush tests build their data in
+# memory or in a tempdir; no test may write a .csv into the tree.
+# Regenerate on demand with testcase/data/gen_datasets.sh, which verifies
+# the result against testcase/data/SHA256SUMS.
+# If a genuinely tiny fixture is ever needed, use `git add -f` explicitly
+# and explain why in the commit message — CI rejects any tracked *.csv.
+*.csv
+# personal runtime config (git add -f if you want to version them)
+/HOLDING.txt
+/HOLDING.cfg
+# editor / python artifacts
+**/__pycache__/
+*.pyc
+*.swp
+# Windows download artifacts (browser ADS sidecars)
+*:Zone.Identifier
+
+# scratch / duplicated notes
+/1.md
+# GTVSeg immutable segments are generated data, never source. `write_segment`
+# publishes *.seg via atomic rename; keep them out of version control.
+*.seg
+# WorkBuddy session data (local work logs). Keep on disk, do not publish.
+/.workbuddy/
+# tool-local cache (not project data; bifrost.json.bak is the only copy of that
+# config, so the directory is ignored rather than deleted)
+/.pi/
+# personal shell helper (unset auth token)
+/uns.sh
+# core-only split: generated binary datasets never enter this repository.
+# Only the deterministic generators + SHA256SUMS are committed.
+*.parquet
+*.pdf
