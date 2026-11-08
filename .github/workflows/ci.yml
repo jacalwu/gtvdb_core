@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Hard rule: generated datasets never enter version control. The core split
+  # also excludes Parquet/PDF blobs that used to live in the monorepo.
+  generated-data:
+    name: No generated data in git
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No tracked generated datasets
+        run: |
+          set -euo pipefail
+          bad=$(git ls-files | grep -Ei '\.(csv|seg|parquet|pdf)$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::generated data is tracked; regenerate it instead of committing it"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: no tracked generated datasets"
+
+  # The reason this repository exists: the core must stay core. Guard both the
+  # file tree and the actual resolved dependency graph, so a workload crate
+  # cannot sneak back in through a Cargo.toml or a transitive edge.
+  core-boundary:
+    name: Core contains no extension code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: No extension tree or manifest dependency
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -Eq '^gtv_ext_lib/'; then
+            echo "::error::extension sources are present in the core repository"
+            exit 1
+          fi
+          if grep -RInE 'path\s*=\s*"[^"]*gtv_ext_lib' --include='Cargo.toml' .; then
+            echo "::error::a manifest points at the extension tree"
+            exit 1
+          fi
+          if grep -RInE '^[[:space:]]*gtv-(ext-|crypto|quantum|q|shm|cbom|scenario|governance|refdata|largeexposure|enterprise-sql)[[:space:]]*=' --include='Cargo.toml' .; then
+            echo "::error::a manifest declares an extension crate as a dependency"
+            exit 1
+          fi
+          echo "OK: no extension tree and no extension manifest dependency"
+      - name: Resolved dependency graph is core-only
+        run: |
+          set -euo pipefail
+          bad_re='^gtv-(ext-|quantum|largeexposure|scenario|governance|enterprise-sql|crypto|cbom|q|refdata|shm)'
+          fail=0
+          for pkg in gtv-core gtv-array gtv-index gtv-index-store gtv-storage \
+                     gtv-catalog gtv-pattern gtv-ingest gtv-udf gtv-proto gtv-delta \
+                     gtv-engine gtv-cli; do
+            deps=$(cargo tree -p "$pkg" --edges normal --prefix none | awk '{print $1}' | sort -u)
+            if echo "$deps" | grep -Eq "$bad_re"; then
+              echo "::error::$pkg depends on an extension crate"
+              echo "$deps" | grep -E "$bad_re"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  # The front door: if the workspace does not compile, nothing else matters.
+  workspace-build:
+    name: Workspace build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build all crates
+        run: cargo build --workspace --all-targets
+
+  # The kernel is where the moat is (temporal CSR, ANN, provenance, GTVSeg).
+  kernel-tests:
+    name: Kernel + temporal graph tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Core kernel (temporal CSR, provenance, bitemporal)
+        run: cargo test -p gtv-core
+      - name: Vector index
+        run: cargo test -p gtv-index
+      - name: Temporal pattern matching
+        run: cargo test -p gtv-pattern
+      - name: Temporal + state-graph SQL surface
+        run: cargo test -p gtv-engine --test bitemporal --test quantum_state
+      - name: GTVSeg read path (P0) and write path (P1)
+        run: cargo test -p gtv-storage --test segment --test p1_write_path
+      - name: Segment SQL surface
+        run: cargo test -p gtv-engine --test segment_sql --test p1_segment_store_sql
+
+  full-tests:
+    name: Full workspace regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: All tests including doctests
+        run: cargo test --workspace --no-fail-fast
