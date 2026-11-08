@@ -53,6 +53,7 @@ use crate::atomic::write_atomic;
 use crate::error::{Result, StorageError};
 use crate::mem_segment::MemSegment;
 use crate::segment::{encode_segment, Segment, HEADER_SIZE};
+use crate::segment_meta::{PruneOutcome, SegmentMeta};
 use crate::wal::{EdgeRecord, Wal, WalFrame, OP_INSERT};
 
 const MANIFEST_VERSION: u32 = 1;
@@ -71,6 +72,12 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// One immutable, published GTVSeg plus its bitemporal/transaction envelope.
+///
+/// The `*_min` / `*_max` fields are **L2 pruning metadata** — the segment's
+/// business-time box and node-id box, computed once at flush time from the CSR
+/// (`SegmentMeta::from_csr`). They are `Option` so a manifest written before
+/// this field existed still loads: `None` means "unknown", and every predicate
+/// below then conservatively selects the segment instead of dropping it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentEntry {
     pub id: u64,
@@ -86,6 +93,73 @@ pub struct SegmentEntry {
     pub edge_count: u64,
     /// blake3 over the segment's column bytes (GTVSeg `data_checksum`).
     pub data_checksum: String,
+
+    // -- L2 union box: "may contain" ------------------------------------
+    /// Earliest `valid_from` in the segment.
+    #[serde(default)]
+    pub valid_from_min: Option<i64>,
+    /// Latest `valid_to` in the segment (`i64::MAX` for open-ended edges).
+    #[serde(default)]
+    pub valid_to_max: Option<i64>,
+    // -- L2 intersection window: "all edges active" ---------------------
+    #[serde(default)]
+    pub max_valid_from: Option<i64>,
+    #[serde(default)]
+    pub min_valid_to: Option<i64>,
+    /// Smallest / largest node id the segment actually touches.
+    #[serde(default)]
+    pub node_id_min: Option<u64>,
+    #[serde(default)]
+    pub node_id_max: Option<u64>,
+}
+
+impl SegmentEntry {
+    /// L2 metadata, when the entry carries it.
+    pub fn meta(&self) -> Option<SegmentMeta> {
+        Some(SegmentMeta {
+            node_count: self.node_count,
+            edge_count: self.edge_count,
+            valid_from_min: self.valid_from_min?,
+            valid_to_max: self.valid_to_max?,
+            max_valid_from: self.max_valid_from?,
+            min_valid_to: self.min_valid_to?,
+            node_id_min: self.node_id_min?,
+            node_id_max: self.node_id_max?,
+            edge_type_min: 0,
+            edge_type_max: 0,
+        })
+    }
+
+    /// May this segment hold an edge active somewhere in `[t1, t2)`?
+    ///
+    /// Unknown metadata ⇒ `true` (a legacy manifest must never lose rows).
+    pub fn overlaps(&self, t1: i64, t2: i64) -> bool {
+        match self.meta() {
+            Some(m) => m.overlaps(t1, t2),
+            None => true,
+        }
+    }
+
+    /// May this segment hold an edge active exactly at `t`?
+    pub fn may_contain(&self, t: i64) -> bool {
+        match self.meta() {
+            Some(m) => m.may_contain(t),
+            None => true,
+        }
+    }
+
+    /// Is every edge of this segment active at `t`? Unknown ⇒ `false`.
+    pub fn all_active_at(&self, t: i64) -> bool {
+        self.meta().is_some_and(|m| m.all_active_at(t))
+    }
+
+    /// Three-way decision used by segment selection.
+    pub fn classify(&self, t1: i64, t2: i64) -> PruneOutcome {
+        match self.meta() {
+            Some(m) => m.classify(t1, t2),
+            None => PruneOutcome::Scan,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +210,31 @@ pub struct FlushReport {
     pub checkpoint_txn: u64,
     pub system_ts: i64,
     pub wal_bytes_reclaimed: usize,
+}
+
+/// Segment-selection outcome for one time range (`prune_summary`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneSummary {
+    /// Segments dropped without opening the file.
+    pub skipped: usize,
+    /// Segments where every edge is active over the whole window.
+    pub full_hit: usize,
+    /// Segments that need a per-edge test.
+    pub scan: usize,
+    /// `full_hit + scan`.
+    pub selected: usize,
+}
+
+impl PruneSummary {
+    /// Fraction of segments that never had to be opened, in `[0, 1]`.
+    pub fn skip_ratio(&self) -> f64 {
+        let total = self.skipped + self.selected;
+        if total == 0 {
+            0.0
+        } else {
+            self.skipped as f64 / total as f64
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -360,6 +459,9 @@ impl SegmentStore {
         let mut new_entries = Vec::with_capacity(groups.len());
         for ((table_id, partition_id), edges) in &groups {
             let csr = MemSegment::to_csr(edges, self.node_count)?;
+            // L2: one linear pass over the (already sorted) CSR columns.
+            // Flush-time only — the read path never recomputes this.
+            let meta = SegmentMeta::from_csr(&csr);
             let bytes = encode_segment(&csr)?;
             let checksum = to_hex(blake3::hash(&bytes[HEADER_SIZE..]).as_bytes());
             let id = self.manifest.next_segment_id;
@@ -373,9 +475,15 @@ impl SegmentStore {
                 txn_start,
                 txn_end,
                 system_ts,
-                node_count: self.node_count as u64,
-                edge_count: edges.len() as u64,
+                node_count: meta.node_count,
+                edge_count: meta.edge_count,
                 data_checksum: checksum,
+                valid_from_min: Some(meta.valid_from_min),
+                valid_to_max: Some(meta.valid_to_max),
+                max_valid_from: Some(meta.max_valid_from),
+                min_valid_to: Some(meta.min_valid_to),
+                node_id_min: Some(meta.node_id_min),
+                node_id_max: Some(meta.node_id_max),
             });
             self.manifest.next_segment_id += 1;
         }
@@ -432,6 +540,72 @@ impl SegmentStore {
             .iter()
             .filter(|e| e.system_ts <= t)
             .collect()
+    }
+
+    /// Segments that may hold an edge active at business time `t`.
+    ///
+    /// Pure manifest read: **no `.seg` file is opened**. This is the L2 win —
+    /// segment selection costs a few integer comparisons per segment instead of
+    /// a page fault per candidate file.
+    pub fn entries_at_business(&self, t: i64) -> Vec<&SegmentEntry> {
+        self.manifest
+            .segments
+            .iter()
+            .filter(|e| e.may_contain(t))
+            .collect()
+    }
+
+    /// Segments that may hold an edge active somewhere in `[t1, t2)`.
+    pub fn entries_overlapping(&self, t1: i64, t2: i64) -> Vec<&SegmentEntry> {
+        self.manifest
+            .segments
+            .iter()
+            .filter(|e| e.overlaps(t1, t2))
+            .collect()
+    }
+
+    /// Bitemporal selection: visible at system time `system_t` **and** possibly
+    /// active at business time `business_t`.
+    pub fn entries_at(&self, business_t: i64, system_t: i64) -> Vec<&SegmentEntry> {
+        self.manifest
+            .segments
+            .iter()
+            .filter(|e| e.system_ts <= system_t && e.may_contain(business_t))
+            .collect()
+    }
+
+    /// Aggregate L2 box of the whole manifest (union over segments).
+    ///
+    /// `None` for an empty manifest. A query whose window misses this box needs
+    /// no segment work at all — the cheapest possible negative answer.
+    pub fn business_span(&self) -> Option<(i64, i64)> {
+        self.manifest
+            .segments
+            .iter()
+            .filter_map(|e| Some((e.valid_from_min?, e.valid_to_max?)))
+            .reduce(|(a1, b1), (a2, b2)| (a1.min(a2), b1.max(b2)))
+    }
+
+    /// How many segments a `[t1, t2)` query would skip / short-circuit / scan.
+    ///
+    /// Telemetry, not a correctness path: the returned counts are exactly what
+    /// [`Self::entries_overlapping`] used to make its decision.
+    pub fn prune_summary(&self, t1: i64, t2: i64) -> PruneSummary {
+        let mut out = PruneSummary::default();
+        for e in &self.manifest.segments {
+            match e.classify(t1, t2) {
+                PruneOutcome::Skip => out.skipped += 1,
+                PruneOutcome::FullHit => {
+                    out.full_hit += 1;
+                    out.selected += 1;
+                }
+                PruneOutcome::Scan => {
+                    out.scan += 1;
+                    out.selected += 1;
+                }
+            }
+        }
+        out
     }
 
     /// Materialise `as_of_system(T)` as **one contiguous CSR**.

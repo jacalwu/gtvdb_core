@@ -10,6 +10,7 @@ pub mod hdb;
 pub mod mem_segment;
 pub mod parquet;
 pub mod segment;
+pub mod segment_meta;
 pub mod snapshot;
 pub mod store;
 pub mod wal;
@@ -29,6 +30,7 @@ pub use snapshot::{Snapshot, SnapshotStore};
 pub use segment::{
     encode_segment, open_segment, write_segment, ColumnDir, Segment, SegmentHeader,
 };
+pub use segment_meta::{PruneOutcome, SegmentMeta};
 pub use mem_segment::{IngestedEdge, MemSegment};
-pub use store::{FlushReport, Manifest, RecoveryReport, SegmentEntry, SegmentStore};
+pub use store::{FlushReport, Manifest, PruneSummary, RecoveryReport, SegmentEntry, SegmentStore};
 pub use wal::{EdgeRecord, Wal, WalFrame, WalScan};

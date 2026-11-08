@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{ArrayRef, Int64Array, StringArray, UInt16Array, UInt64Array};
+use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, UInt16Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
@@ -29,7 +29,20 @@ use crate::expr_util::expr_to_string;
 /// Opened segments keyed by their registration name. Shared with both UDTFs.
 pub type SegmentRegistry = Arc<RwLock<HashMap<String, Arc<Segment>>>>;
 
+/// L2 time-box per registered segment, when the caller knows it (i.e. when the
+/// segment came from a manifest rather than from a bare `.seg` path).
+///
+/// Kept separate from [`SegmentRegistry`] on purpose: opening a file yields a
+/// header (O(1)) but not the union box, which would need an `O(E)` scan. A
+/// segment registered by path therefore has no entry here, and `gtv_segments()`
+/// reports NULL for its bounds — honest, and it keeps `register_segment` O(1).
+pub type SegmentMetaRegistry = Arc<RwLock<HashMap<String, gtv_storage::SegmentMeta>>>;
+
 pub fn empty_registry() -> SegmentRegistry {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+pub fn empty_meta_registry() -> SegmentMetaRegistry {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
@@ -41,11 +54,21 @@ fn plan_err(msg: impl Into<String>) -> DataFusionError {
 #[derive(Debug)]
 pub struct SegmentsTableFunction {
     registry: SegmentRegistry,
+    metas: SegmentMetaRegistry,
 }
 
 impl SegmentsTableFunction {
     pub fn new(registry: SegmentRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            metas: empty_meta_registry(),
+        }
+    }
+
+    /// Same as [`Self::new`], plus the L2 metadata registry filled by
+    /// `register_segment_store`.
+    pub fn with_metas(registry: SegmentRegistry, metas: SegmentMetaRegistry) -> Self {
+        Self { registry, metas }
     }
 }
 
@@ -60,6 +83,15 @@ impl TableFunctionImpl for SegmentsTableFunction {
             Field::new("chunk_count", DataType::UInt64, false),
             Field::new("chunk_size", DataType::UInt64, false),
             Field::new("file_bytes", DataType::UInt64, false),
+            // -- L2: intersection window, straight from the GTVSeg header ----
+            Field::new("all_active_from", DataType::Int64, false),
+            Field::new("all_active_to", DataType::Int64, false),
+            // -- L2: union box, from the manifest (NULL for a bare .seg) -----
+            Field::new("valid_from_min", DataType::Int64, true),
+            Field::new("valid_to_max", DataType::Int64, true),
+            Field::new("node_id_min", DataType::UInt64, true),
+            Field::new("node_id_max", DataType::UInt64, true),
+            Field::new("prunable", DataType::Boolean, false),
         ]));
 
         // Sort by name so the result is deterministic for tests / dashboards.
@@ -67,8 +99,14 @@ impl TableFunctionImpl for SegmentsTableFunction {
             .registry
             .read()
             .map_err(|_| plan_err("segment registry lock poisoned"))?;
+        let metas = self
+            .metas
+            .read()
+            .map_err(|_| plan_err("segment metadata lock poisoned"))?;
         let mut rows: Vec<_> = guard.iter().collect();
         rows.sort_by(|a, b| a.0.cmp(b.0));
+
+        let meta_of = |name: &str| metas.get(name).copied();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -106,6 +144,31 @@ impl TableFunctionImpl for SegmentsTableFunction {
                     rows.iter()
                         .map(|(_, s)| s.file_len() as u64)
                         .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter()
+                        .map(|(_, s)| s.header().max_valid_from)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter()
+                        .map(|(_, s)| s.header().min_valid_to)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from_iter(
+                    rows.iter().map(|(n, _)| meta_of(n).map(|m| m.valid_from_min)),
+                )),
+                Arc::new(Int64Array::from_iter(
+                    rows.iter().map(|(n, _)| meta_of(n).map(|m| m.valid_to_max)),
+                )),
+                Arc::new(UInt64Array::from_iter(
+                    rows.iter().map(|(n, _)| meta_of(n).map(|m| m.node_id_min)),
+                )),
+                Arc::new(UInt64Array::from_iter(
+                    rows.iter().map(|(n, _)| meta_of(n).map(|m| m.node_id_max)),
+                )),
+                Arc::new(BooleanArray::from_iter(
+                    rows.iter().map(|(n, _)| Some(!matches!(meta_of(n), None))),
                 )),
             ],
         )?;

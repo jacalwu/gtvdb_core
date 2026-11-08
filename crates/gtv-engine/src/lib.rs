@@ -20,6 +20,7 @@
 pub mod ann;
 pub mod asof;
 pub mod bitemporal;
+pub mod catalog_meta;
 pub mod cbo;
 pub mod context;
 pub mod csv;
@@ -40,6 +41,7 @@ pub mod workload;
 pub mod expr_util;
 
 pub use context::{ExecutionOptions, GtvContext};
+pub use catalog_meta::{CatalogSlot, FilesTableFunction, SnapshotsTableFunction, TablesTableFunction};
 pub use dq::{
     blocking_failures, decision_from_outcomes, evaluate, evaluate_rule, evaluate_rules,
     DqGateTableFunction, RuleOutcome,

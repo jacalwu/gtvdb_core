@@ -101,6 +101,10 @@ jobs:
         run: cargo test -p gtv-storage --test segment --test p1_write_path
       - name: Segment SQL surface
         run: cargo test -p gtv-engine --test segment_sql --test p1_segment_store_sql
+      - name: Metadata layers (L1 catalog surface, L2 time box)
+        run: |
+          cargo test -p gtv-storage --test l2_time_box
+          cargo test -p gtv-engine --test l1_catalog_meta --test l2_segment_prune_sql
 
   full-tests:
     name: Full workspace regression

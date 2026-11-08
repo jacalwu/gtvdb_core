@@ -73,12 +73,25 @@ fn apply_execution_env(config: SessionConfig) -> SessionConfig {
 /// Run a DataFusion future from a sync call site without nesting runtimes
 /// unsafely: prefer the current Tokio handle + `block_in_place`, else a
 /// private current-thread runtime.
+///
+/// `block_in_place` is only legal on a multi-thread runtime, so a single-thread
+/// runtime (the default for `#[tokio::test]`) gets an actionable error instead
+/// of a panic.
 fn block_on_df<F, T>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Ok(handle) => {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "gtv: blocking catalog I/O cannot run on a single-threaded Tokio runtime; \
+                     use #[tokio::main(flavor = \"multi_thread\")] or #[tokio::test(flavor = \"multi_thread\")]"
+                        .into(),
+                ));
+            }
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
         Err(_) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -135,6 +148,11 @@ pub struct GtvContext {
     extension_info: Arc<Vec<ExtensionInfo>>,
     /// Opened GTVSeg segments served through mmap, keyed by registered name.
     segments: crate::segment::SegmentRegistry,
+    /// L2 time boxes for the segments above, when they came from a manifest.
+    segment_metas: crate::segment::SegmentMetaRegistry,
+    /// Attached `FsCatalog`, the single authority behind `gtv_tables()` /
+    /// `gtv_snapshots()` / `gtv_files()` (L1).
+    catalog: crate::catalog_meta::CatalogSlot,
 }
 
 impl GtvContext {
@@ -312,15 +330,36 @@ impl GtvContext {
 
         // -- core: immutable GTVSeg segments (mmap-backed temporal CSR) --
         let segments = crate::segment::empty_registry();
+        let segment_metas = crate::segment::empty_meta_registry();
         ctx.register_udtf(
             "gtv_segments",
-            Arc::new(crate::segment::SegmentsTableFunction::new(segments.clone())),
+            Arc::new(crate::segment::SegmentsTableFunction::with_metas(
+                segments.clone(),
+                segment_metas.clone(),
+            )),
         );
         ctx.register_udtf(
             "gtv_segment_edges",
             Arc::new(crate::segment::SegmentEdgesTableFunction::new(
                 segments.clone(),
             )),
+        );
+
+        // -- core: L1 metadata surface (one authority: FsCatalog) -----------
+        let catalog = crate::catalog_meta::empty_slot();
+        ctx.register_udtf(
+            "gtv_tables",
+            Arc::new(crate::catalog_meta::TablesTableFunction::new(catalog.clone())),
+        );
+        ctx.register_udtf(
+            "gtv_snapshots",
+            Arc::new(crate::catalog_meta::SnapshotsTableFunction::new(
+                catalog.clone(),
+            )),
+        );
+        ctx.register_udtf(
+            "gtv_files",
+            Arc::new(crate::catalog_meta::FilesTableFunction::new(catalog.clone())),
         );
 
         Self {
@@ -335,6 +374,8 @@ impl GtvContext {
             extensions: ExtensionRegistry::new(),
             extension_info: Arc::new(Vec::new()),
             segments,
+            segment_metas,
+            catalog,
             table_sources: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -508,7 +549,28 @@ impl GtvContext {
                 )
             })?
             .insert(name.to_string(), Arc::new(seg));
+        // A re-registered name must not keep the previous file's time box.
+        if let Ok(mut metas) = self.segment_metas.write() {
+            metas.remove(name);
+        }
         Ok(())
+    }
+
+    /// Attach an L2 time box to an already-registered segment.
+    ///
+    /// `register_segment` cannot derive the union box without an `O(E)` scan, so
+    /// callers that know it (manifest readers, offline tooling) supply it here.
+    pub fn register_segment_meta(&self, name: &str, meta: gtv_storage::SegmentMeta) -> Result<()> {
+        let mut metas = self.segment_metas.write().map_err(|_| {
+            datafusion::error::DataFusionError::Execution("segment metadata lock poisoned".into())
+        })?;
+        metas.insert(name.to_string(), meta);
+        Ok(())
+    }
+
+    /// Shared L2 metadata registry (for extensions / tooling).
+    pub fn segment_metas(&self) -> crate::segment::SegmentMetaRegistry {
+        self.segment_metas.clone()
     }
 
     /// Register every segment published by a P1 [`SegmentStore`] under
@@ -525,7 +587,14 @@ impl GtvContext {
     ) -> Result<()> {
         for entry in store.segments() {
             let path = store.segment_path(entry).to_string_lossy().into_owned();
-            self.register_segment(&path, &format!("{prefix}_{}", entry.id))?;
+            let name = format!("{prefix}_{}", entry.id);
+            self.register_segment(&path, &name)?;
+            // L2 box comes from the manifest, so it is free here — no O(E) scan.
+            if let Some(meta) = entry.meta() {
+                if let Ok(mut metas) = self.segment_metas.write() {
+                    metas.insert(name, meta);
+                }
+            }
         }
         Ok(())
     }
@@ -538,6 +607,93 @@ impl GtvContext {
     /// Shared registry of opened segments (for extensions / tooling).
     pub fn segments(&self) -> crate::segment::SegmentRegistry {
         self.segments.clone()
+    }
+
+    // -- L1: catalog metadata surface --------------------------------------
+
+    /// Attach a filesystem catalog. After this, `gtv_tables()` /
+    /// `gtv_snapshots()` / `gtv_files()` answer from it, and
+    /// [`Self::sync_catalog`] can publish its tables into SQL.
+    ///
+    /// Re-attaching replaces the previous catalog (the slot is shared with the
+    /// table functions, so SQL sees the change immediately).
+    pub fn attach_catalog(&self, root: impl Into<PathBuf>) -> Result<gtv_catalog::FsCatalog> {
+        let cat = gtv_catalog::FsCatalog::open(root.into())
+            .map_err(|e| datafusion::error::DataFusionError::Execution(format!("attach_catalog: {e}")))?;
+        let mut slot = self.catalog.write().map_err(|_| {
+            datafusion::error::DataFusionError::Execution("catalog slot lock poisoned".into())
+        })?;
+        *slot = Some(cat.clone());
+        Ok(cat)
+    }
+
+    /// The attached catalog, if any.
+    pub fn catalog(&self) -> Option<gtv_catalog::FsCatalog> {
+        self.catalog.read().ok()?.clone()
+    }
+
+    /// Publish every committed catalog table into the SQL session, reading
+    /// **exactly** the file list of its latest snapshot.
+    ///
+    /// This is the "single source of truth" step: a table is visible in SQL
+    /// because the catalog says so, not because someone called `register_csv`.
+    /// Tables are registered as DataFusion views over their snapshot files, so
+    /// the scan is still a lazy Parquet scan (row-group pruning included) —
+    /// nothing is materialised into memory.
+    ///
+    /// Returns the number of tables registered. Tables without a committed
+    /// snapshot are skipped (they have no data to expose).
+    pub fn sync_catalog(&self) -> Result<usize> {
+        use gtv_catalog::FileFormat;
+
+        let cat = self.catalog().ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "sync_catalog: no catalog attached (call attach_catalog first)".into(),
+            )
+        })?;
+        let map = |e: gtv_catalog::CatalogError| {
+            datafusion::error::DataFusionError::Execution(e.to_string())
+        };
+
+        let mut registered = 0usize;
+        for meta in cat.list_tables().map_err(map)? {
+            let Some(snap) = cat.latest(meta.table_id).map_err(map)? else {
+                continue;
+            };
+            let files = cat.files(meta.table_id, snap).map_err(map)?;
+            if files.is_empty() {
+                continue;
+            }
+            let all_parquet = files.iter().all(|f| f.format == FileFormat::Parquet);
+            let all_csv = files.iter().all(|f| f.format == FileFormat::Csv);
+            let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+
+            let df = if all_parquet {
+                block_on_df(self.ctx.read_parquet(
+                    paths,
+                    datafusion::prelude::ParquetReadOptions::default(),
+                ))?
+            } else if all_csv {
+                block_on_df(self.ctx.read_csv(
+                    paths,
+                    datafusion::prelude::CsvReadOptions::default(),
+                ))?
+            } else {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "sync_catalog: table `{}` mixes CSV and Parquet files",
+                    meta.name
+                )));
+            };
+
+            let _ = self.ctx.deregister_table(&meta.name);
+            self.ctx.register_table(&meta.name, df.into_view())?;
+            // Seed relational stats from the catalog so EXPLAIN is not blind.
+            if let Ok(stats) = cat.table_stats(meta.table_id) {
+                let _ = self.set_table_stats(&meta.name, stats);
+            }
+            registered += 1;
+        }
+        Ok(registered)
     }
 
     /// Run a SQL query and collect all result batches.
