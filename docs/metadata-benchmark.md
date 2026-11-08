@@ -177,7 +177,7 @@ assert_eq!(pruned, full, "pruning lost rows");
 | :-- | --: | :-- |
 | `FsCatalog::list_tables()` | **0.62 ms** | 50 张表的注册表 |
 | 空 catalog 跑 `gtv_tables()`（基线） | **0.62 ms** | UDTF + planner 固定开销 |
-| `gtv_tables()` | 121.53 ms | 50 行 × (schema + latest + 1,000 条快照日志 + 1,000 条文件索引) |
+| `gtv_tables()` | 121.53 ms | 50 行 ×（schema + latest + 20 条快照日志 + 20 条文件索引） |
 | `gtv_snapshots()` | 25.03 ms | 1,000 行统一版本日志 |
 | `gtv_files('t0000')` | 2.31 ms | 单表 20 个文件 |
 | `sync_catalog()` | 329.40 ms | 50 张表按快照文件清单注册成视图（≈6.6 ms/表） |
