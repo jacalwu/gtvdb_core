@@ -125,13 +125,52 @@ impl Caps {
     }
 }
 
+/// Device width of the `dst` column.
+///
+/// The source CSR stores a node id as `u64`, which is 8 B per edge on the wire
+/// and in VRAM for every edge in the graph. No database this project targets
+/// comes close to `u32::MAX` nodes, so the narrow form is worth having — but it
+/// has to arrive *already narrow*, because converting it at upload loses: the
+/// pass reads 8 B/edge and writes 4 to save 4 on a link that is slower than
+/// either, and 1e7 edges measured 14 ms of host work against 5.4 ms of transfer.
+/// See `docs/cuda-acceleration-plan.md` §9.2 for the numbers.
+///
+/// So a view never converts. It either carries a `u32` column a producer already
+/// built ([`SnapshotView::with_dst32`]) or it carries the source `u64` one, and
+/// [`SnapshotView::bytes`] prices whichever it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DstLayout {
+    /// 4 B per edge, from a column the caller already holds.
+    U32,
+    /// 8 B per edge, the source width.
+    U64,
+}
+
+impl DstLayout {
+    pub fn bytes_per_edge(self) -> usize {
+        match self {
+            DstLayout::U32 => 4,
+            DstLayout::U64 => 8,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DstLayout::U32 => "u32",
+            DstLayout::U64 => "u64",
+        }
+    }
+}
+
 /// A borrowed, immutable view of one snapshot's CSR arrays.
 ///
-/// Field-for-field the same arrays the CPU reads, so uploading is a straight
-/// `memcpy` per column and nothing has to be re-derived. `chunk_index` /
-/// `chunk_max_valid_to` are deliberately absent: they are a CPU-side scan
-/// accelerator that a device backend rebuilds from `valid_from` / `valid_to` if
-/// it wants them.
+/// Four columns are uploaded as-is, a straight `memcpy` each. `dst` is uploaded
+/// at whatever width the caller has it in — `u64` from the CSR, or `u32` if a
+/// producer built one — and never converted here, because a conversion pass
+/// measured more expensive than the bytes it saves (see [`DstLayout`]).
+/// `chunk_index` / `chunk_max_valid_to` are deliberately absent: they are a
+/// CPU-side scan accelerator that a device backend rebuilds from `valid_from` /
+/// `valid_to` if it wants them.
 #[derive(Debug, Clone, Copy)]
 pub struct SnapshotView<'a> {
     pub snapshot_id: SnapshotId,
@@ -141,6 +180,12 @@ pub struct SnapshotView<'a> {
     pub valid_from: &'a [i64],
     pub valid_to: &'a [i64],
     pub edge_type: &'a [u16],
+    /// The same edges as `dst`, already at 4 B/edge.
+    ///
+    /// `Some` means `dst` may be left empty and the backend uploads this column
+    /// instead. Built by whichever producer can afford the pass once — at build
+    /// time, where it is free, not at upload time, where it is not.
+    pub dst32: Option<&'a [u32]>,
 }
 
 impl<'a> SnapshotView<'a> {
@@ -162,7 +207,20 @@ impl<'a> SnapshotView<'a> {
             valid_from,
             valid_to,
             edge_type,
+            dst32: None,
         }
+    }
+
+    /// Carry the `dst` column at 4 B/edge instead of 8.
+    ///
+    /// For a producer that can build the narrow column once — at CSR build time,
+    /// where the pass is amortised over every query, not at upload time, where
+    /// it is not. The ids are not range-checked here: whatever built a `u32`
+    /// column already had to prove they fit, and re-scanning 40 MB per upload to
+    /// re-prove it would reintroduce the cost this method exists to avoid.
+    pub fn with_dst32(mut self, dst32: &'a [u32]) -> Self {
+        self.dst32 = Some(dst32);
+        self
     }
 
     /// From an already-materialised [`CsrColumns`].
@@ -175,6 +233,7 @@ impl<'a> SnapshotView<'a> {
             valid_from: c.valid_from,
             valid_to: c.valid_to,
             edge_type: c.edge_type,
+            dst32: None,
         }
     }
 
@@ -194,18 +253,36 @@ impl<'a> SnapshotView<'a> {
     }
 
     pub fn edge_count(&self) -> usize {
-        self.dst.len()
+        // Exactly one of the two carries the edges; `validate` enforces it.
+        match self.dst32 {
+            Some(d) => d.len(),
+            None => self.dst.len(),
+        }
+    }
+
+    /// The width `dst` will be uploaded at — whatever the caller holds.
+    ///
+    /// O(1): it is a property of which column the view carries, not of the
+    /// graph's contents, so pricing an upload never costs a pass over it.
+    pub fn dst_layout(&self) -> DstLayout {
+        match self.dst32 {
+            Some(_) => DstLayout::U32,
+            None => DstLayout::U64,
+        }
     }
 
     /// Bytes of a device copy of this snapshot.
     ///
-    /// `dst` is `u64` because that is the source width — a `u32` narrowing is a
-    /// separate decision for whoever writes the first kernel, and doing it here
-    /// would mean a conversion on every upload with no kernel to pay it back.
+    /// This is the number the resident cache charges against
+    /// `Caps::max_device_bytes`, so it has to be the number the backend really
+    /// allocates — 22 B/edge with a `u32` column, 26 B/edge with the source
+    /// `u64` one. A backend that allocates differently must fail rather than
+    /// disagree; see `CudaAccelerator::load_graph`, which compares its column
+    /// total with this figure before returning a handle.
     pub fn bytes(&self) -> usize {
         let offsets = (self.node_count + 1) * std::mem::size_of::<u32>();
-        let per_edge = std::mem::size_of::<u64>()          // dst
-            + 2 * std::mem::size_of::<i64>()              // valid_from, valid_to
+        let per_edge = self.dst_layout().bytes_per_edge()  // dst
+            + 2 * std::mem::size_of::<i64>()             // valid_from, valid_to
             + std::mem::size_of::<u16>(); // edge_type
         offsets + self.edge_count() * per_edge
     }
@@ -213,6 +290,17 @@ impl<'a> SnapshotView<'a> {
     /// Shape checks shared by every backend.
     pub fn validate(&self) -> Result<(), AcceleratorError> {
         let e = self.edge_count();
+        // Two widths of the same column may both be present, but not disagree:
+        // a backend uploads one of them and prices the edge count from it.
+        if let Some(d) = self.dst32 {
+            if !self.dst.is_empty() && d.len() != self.dst.len() {
+                return Err(AcceleratorError::InvalidArgument(format!(
+                    "dst holds {} ids and dst32 holds {}, both describe the same edges",
+                    self.dst.len(),
+                    d.len()
+                )));
+            }
+        }
         if self.offsets.len() != self.node_count + 1 {
             return Err(AcceleratorError::InvalidArgument(format!(
                 "offsets has {} entries for {} nodes",
@@ -312,6 +400,7 @@ pub struct ResidentGraph {
     node_count: usize,
     edge_count: usize,
     bytes: usize,
+    dst_layout: DstLayout,
 }
 
 impl ResidentGraph {
@@ -328,7 +417,22 @@ impl ResidentGraph {
             node_count,
             edge_count,
             bytes,
+            // The source width, so a receipt built by hand describes the graph
+            // it was built from. A backend that narrowed its copy must say so.
+            dst_layout: DstLayout::U64,
         }
+    }
+
+    /// Record the width `dst` was copied at. A kernel reads this instead of
+    /// assuming, because reading a `u32` column as `u64` yields two garbage
+    /// node ids per real one and no error anywhere.
+    pub fn with_dst_layout(mut self, layout: DstLayout) -> Self {
+        self.dst_layout = layout;
+        self
+    }
+
+    pub fn dst_layout(&self) -> DstLayout {
+        self.dst_layout
     }
 
     pub fn token(&self) -> Token {
@@ -588,8 +692,85 @@ mod tests {
         let vt = [10i64, 10];
         let et = [1u16, 1];
         let v = view(&offsets, &dst, &vf, &vt, &et);
-        // 3 offsets * 4 B + 2 edges * (8 + 8 + 8 + 2) = 12 + 52
-        assert_eq!(v.bytes(), 64);
+        // No `dst32`, so the source width: 3 offsets * 4 B + 2 edges * (8 + 8 + 8 + 2).
+        assert_eq!(v.dst_layout(), DstLayout::U64);
+        assert_eq!(v.bytes(), 12 + 2 * 26);
+
+        // The same graph with the narrow column the caller already holds.
+        let dst32 = [1u32, 2];
+        let v = v.with_dst32(&dst32);
+        assert_eq!(v.dst_layout(), DstLayout::U32);
+        assert_eq!(v.bytes(), 12 + 2 * 22);
+        assert_eq!(v.edge_count(), 2);
+    }
+
+    #[test]
+    fn a_ten_million_edge_graph_costs_22_bytes_per_edge_narrow() {
+        // The number the break-even is computed from, asserted rather than
+        // quoted: 1e7 edges at 22 B is 209.8 MiB, against 247.9 MiB wide.
+        let edges = 10_000_000usize;
+        let nodes = edges / 4;
+        let offsets = vec![0u32; nodes + 1];
+        let dst = vec![0u64; edges];
+        let dst32 = vec![0u32; edges];
+        let ts = vec![0i64; edges];
+        let et = vec![0u16; edges];
+        let offsets_bytes = (nodes + 1) * 4;
+
+        let wide = SnapshotView::new(1, nodes, &offsets, &dst, &ts, &ts, &et);
+        let narrow = wide.with_dst32(&dst32);
+        assert_eq!(wide.dst_layout(), DstLayout::U64);
+        assert_eq!(narrow.dst_layout(), DstLayout::U32);
+        assert_eq!(narrow.bytes() - offsets_bytes, edges * 22);
+        // 40 MB — the 15% of VRAM that the narrow column buys, and the reason
+        // it is worth having a producer build one.
+        assert_eq!(wide.bytes() - narrow.bytes(), edges * 4);
+    }
+
+    #[test]
+    fn the_width_comes_from_the_column_not_from_the_node_count() {
+        // A `u64` column is uploaded as `u64` even though every id would fit:
+        // the view never converts, so the width it prices is the width it has.
+        // This is the whole finding of §9.2 — converting costs more than the
+        // transfer it saves, so the narrow width must arrive from upstream.
+        let dst = [1u64, 2, 3];
+        let ts = [0i64; 3];
+        let et = [0u16; 3];
+        let v = SnapshotView::new(1, 4, &[0, 3, 3, 3, 3], &dst, &ts, &ts, &et);
+        assert_eq!(v.dst_layout(), DstLayout::U64);
+        assert_eq!(v.bytes() - 5 * 4, 3 * 26);
+    }
+
+    #[test]
+    fn two_widths_of_one_column_must_agree_on_the_edge_count() {
+        let dst = [1u64, 2, 3];
+        let ts = [0i64; 3];
+        let et = [0u16; 3];
+        let offsets = [0u32, 3, 3, 3, 3];
+        let short = [1u32, 2];
+        let err = SnapshotView::new(1, 4, &offsets, &dst, &ts, &ts, &et)
+            .with_dst32(&short)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("dst32 holds 2"), "{err}");
+
+        // Empty `dst` plus a `dst32` is the intended shape, and it validates.
+        let dst32 = [1u32, 2, 3];
+        let v = SnapshotView::new(1, 4, &offsets, &[], &ts, &ts, &et).with_dst32(&dst32);
+        assert!(v.validate().is_ok());
+        assert_eq!(v.edge_count(), 3);
+    }
+
+    #[test]
+    fn a_receipt_carries_the_width_of_its_own_copy() {
+        let h = ResidentGraph::new(1, 41, 2, 2, 56);
+        // Built by hand = the source width; a narrowing backend must say so.
+        assert_eq!(h.dst_layout(), DstLayout::U64);
+        let narrowed = h.clone().with_dst_layout(DstLayout::U32);
+        assert_eq!(narrowed.dst_layout(), DstLayout::U32);
+        // Two copies of one snapshot at different widths are not the same fact,
+        // so the receipts differ and a cache cannot substitute one for the other.
+        assert_ne!(h, narrowed);
     }
 
     #[test]

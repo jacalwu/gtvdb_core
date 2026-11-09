@@ -9,10 +9,11 @@
 //! the device, accounted for, and given back — and that the cache in
 //! `gtv-accelerator` drives that correctly, including on a snapshot change.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use gtv_accelerator::{
-    Accelerator, CpuAccelerator, DecisionInputs, ExecutionPolicy, Op, ResidentCache, SnapshotView,
+    Accelerator, CpuAccelerator, DecisionInputs, DstLayout, ExecutionPolicy, Op, ResidentCache,
+    SnapshotView,
 };
 use gtv_accelerator_cuda::CudaAccelerator;
 
@@ -64,8 +65,24 @@ macro_rules! device_or_skip {
     };
 }
 
+/// Serialises every test in this file.
+///
+/// They share one primary context and therefore one allocator pool, so the
+/// free-memory delta around an upload only belongs to that upload if no sibling
+/// test allocated in between. Without this the delta reads 0 for a 260 KB
+/// snapshot — indistinguishable from a leak, and a red test that says nothing
+/// about the code. Six tests at a few milliseconds each: the serialisation is
+/// free, the false negative is not.
+static DEVICE: Mutex<()> = Mutex::new(());
+
+fn exclusive() -> MutexGuard<'static, ()> {
+    // A panicking test must not poison the rest into cascading failures.
+    DEVICE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn the_device_reports_what_the_upload_needs() {
+    let _serial = exclusive();
     let acc = device_or_skip!();
     let d = acc.device();
     eprintln!(
@@ -85,6 +102,7 @@ fn the_device_reports_what_the_upload_needs() {
 
 #[test]
 fn a_snapshot_becomes_resident_and_gives_the_memory_back() {
+    let _serial = exclusive();
     let acc = device_or_skip!();
     let (o, dst, vf, vt, et) = chain(10_000);
     let v = view(1, 10_000, &o, &dst, &vf, &vt, &et);
@@ -97,6 +115,13 @@ fn a_snapshot_becomes_resident_and_gives_the_memory_back() {
     assert_eq!(acc.resident_bytes(), expected, "accounting, not the driver");
     assert_eq!(h.bytes(), expected);
     assert_eq!(h.edge_count(), 9_999);
+
+    // The width is part of what was proved: these columns are the source `u64`
+    // ones, so this copy's `dst` is 8 B/edge and a kernel must read it as such.
+    // 10 001 offsets + 9 999 edges at 26 B is the whole footprint — no hidden
+    // padding column.
+    assert_eq!(h.dst_layout(), DstLayout::U64);
+    assert_eq!(expected, 10_001 * 4 + 9_999 * 26);
 
     // The driver charges a 2 MiB granularity: the first allocation on a fresh
     // context reserves a pool, and a 300 KB snapshot costs a 2 MiB step. That is
@@ -138,8 +163,37 @@ fn a_snapshot_becomes_resident_and_gives_the_memory_back() {
     );
 }
 
+/// A `u32` column the caller already holds is uploaded as-is — no conversion in
+/// `load_graph`, 4 B/edge less on the wire and in VRAM, and a receipt that says
+/// which width the copy is. This is the whole reason `SnapshotView` carries
+/// `dst32`: the conversion measured more expensive than the transfer it saves
+/// (plan §9.2), so the narrow width has to arrive from upstream.
 #[test]
-fn releasing_twice_and_releasing_a_stranger_are_no_ops() {
+fn a_prebuilt_u32_column_costs_four_bytes_less_per_edge() {
+    let _serial = exclusive();
+    let acc = device_or_skip!();
+    let (o, dst, vf, vt, et) = chain(10_000);
+    let dst32: Vec<u32> = dst.iter().map(|&d| d as u32).collect();
+
+    let wide = view(1, 10_000, &o, &dst, &vf, &vt, &et);
+    let narrow = wide.with_dst32(&dst32);
+    assert_eq!(wide.dst_layout(), DstLayout::U64);
+    assert_eq!(narrow.dst_layout(), DstLayout::U32);
+    // Same edges, same node count, 4 B/edge apart — nothing else differs.
+    assert_eq!(narrow.edge_count(), wide.edge_count());
+    assert_eq!(wide.bytes() - narrow.bytes(), 9_999 * 4);
+
+    let h = acc.load_graph(narrow).unwrap().expect("device does residency");
+    assert_eq!(h.dst_layout(), DstLayout::U32);
+    assert_eq!(h.bytes(), 10_001 * 4 + 9_999 * 22);
+    // The device agrees with the price, not just the bookkeeping.
+    assert_eq!(acc.resident_bytes(), narrow.bytes());
+    acc.release_graph(&h);
+    assert_eq!(acc.resident_bytes(), 0);
+}
+
+#[test]
+fn releasing_twice_and_releasing_a_stranger_are_no_ops() {    let _serial = exclusive();
     let acc = device_or_skip!();
     let (o, dst, vf, vt, et) = chain(64);
     let h = acc.load_graph(view(1, 64, &o, &dst, &vf, &vt, &et)).unwrap().unwrap();
@@ -154,6 +208,7 @@ fn releasing_twice_and_releasing_a_stranger_are_no_ops() {
 
 #[test]
 fn the_cache_drives_the_device_lifecycle() {
+    let _serial = exclusive();
     let acc = Arc::new(device_or_skip!());
     let backend = Arc::clone(&acc) as Arc<dyn Accelerator>;
     let (o, dst, vf, vt, et) = chain(4096);
@@ -188,6 +243,7 @@ fn the_cache_drives_the_device_lifecycle() {
 
 #[test]
 fn the_device_is_not_used_until_a_kernel_exists() {
+    let _serial = exclusive();
     // C1 boundary, asserted rather than described: a route through the registry
     // must say `Unsupported`, because the backend advertises no operator.
     let acc = device_or_skip!();
@@ -208,6 +264,7 @@ fn the_device_is_not_used_until_a_kernel_exists() {
 
 #[test]
 fn the_cpu_reference_still_answers_the_same_question() {
+    let _serial = exclusive();
     // The fallback contract: when the device declines, the CPU path answers, and
     // the answer is the reference. Both are exercised here on the same columns.
     let acc = device_or_skip!();

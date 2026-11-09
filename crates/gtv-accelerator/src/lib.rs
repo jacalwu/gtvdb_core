@@ -71,8 +71,8 @@ pub mod registry;
 pub mod resident;
 
 pub use api::{
-    Accelerator, BackendKind, Caps, Op, ResidentGraph, ResidentVectors, SnapshotId, SnapshotView,
-    VectorView, WindowOp,
+    Accelerator, BackendKind, Caps, DstLayout, Op, ResidentGraph, ResidentVectors, SnapshotId,
+    SnapshotView, VectorView, WindowOp,
 };
 pub use cpu::{live_at, CpuAccelerator};
 pub use error::{AcceleratorError, Fallback};

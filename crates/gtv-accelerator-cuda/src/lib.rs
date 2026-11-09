@@ -8,13 +8,14 @@
 //! [`gtv_accelerator::AcceleratorError::Unsupported`] and the policy sends the
 //! work to the CPU.
 //!
-//! That is not an unfinished C1; it is C1. The C0 probe measured 12 GB/s pinned
-//! H2D and found the valid-time filter spending 96% of its cold path in the
-//! transfer, with break-even at 2.1 invocations. A kernel measured before
-//! residency exists measures PCIe, not arithmetic. So the order is: prove the
-//! device can hold a snapshot and give it back — including under eviction, a
-//! snapshot change, and a driver that is not there — then write kernels against
-//! a copy that is already resident.
+//! That is not an unfinished C1; it is C1. Measured on this machine: pageable
+//! H2D runs at 7.3–7.9 GB/s, so one upload of a 1e7-edge snapshot costs 40–46 ms
+//! against a 6.9 ms CPU scan of the same graph — the cold path loses by 6×, and
+//! residency needs 4.9–5.9 queries on one snapshot to break even. A kernel
+//! measured before residency exists measures PCIe, not arithmetic. So the order
+//! is: prove the device can hold a snapshot and give it back — including under
+//! eviction, a snapshot change, and a driver that is not there — then write
+//! kernels against a copy that is already resident.
 //!
 //! # Why `Caps` advertises nothing
 //!
@@ -225,21 +226,30 @@ impl Accelerator for CudaAccelerator {
             .bind(self.context)
             .map_err(|reason| self.backend_error("cuCtxSetCurrent", reason))?;
 
+        // `dst` goes up at whatever width the view carries. Nothing is converted
+        // here: a narrowing pass costs 9.5–11 ms at 1e7 edges to save 5.7 ms of
+        // transfer (§9.2), so the 4 B/edge only arrive when a producer already
+        // has the narrow column. The receipt records which width it was, and a
+        // kernel must read the receipt rather than assume.
+        let dst_src: (*const u8, usize) = match view.dst32 {
+            Some(d) => (d.as_ptr() as *const u8, std::mem::size_of_val(d)),
+            None => (
+                view.dst.as_ptr() as *const u8,
+                std::mem::size_of_val(view.dst),
+            ),
+        };
+
         // One allocation per column rather than one arena: an eviction frees
         // exactly what was allocated, and a partial failure frees exactly what
-        // it already got. The source order is the CSR's own order, so each
-        // upload is a straight memcpy with no repacking.
+        // it already got. Four of the five uploads are straight memcpys of the
+        // CSR's own order, so nothing is repacked on the host.
         let cols: [(&'static str, *const u8, usize); 5] = [
             (
                 "offsets",
                 view.offsets.as_ptr() as *const u8,
                 std::mem::size_of_val(view.offsets),
             ),
-            (
-                "dst",
-                view.dst.as_ptr() as *const u8,
-                std::mem::size_of_val(view.dst),
-            ),
+            ("dst", dst_src.0, dst_src.1),
             (
                 "valid_from",
                 view.valid_from.as_ptr() as *const u8,
@@ -258,6 +268,7 @@ impl Accelerator for CudaAccelerator {
         ];
 
         let mut columns: Vec<u64> = Vec::with_capacity(cols.len());
+        let mut allocated = 0usize;
         for (name, src, len) in cols {
             let ptr = match self.driver.alloc(len) {
                 Ok(p) => p,
@@ -270,7 +281,8 @@ impl Accelerator for CudaAccelerator {
                 }
             };
             // SAFETY: `ptr` came from `alloc(len)` in the line above and `src`
-            // points at `len` readable bytes of the borrowed view.
+            // points at `len` readable bytes of the borrowed view — or of the
+            // caller's `dst32` slice, which the view borrows for as long.
             if let Err(reason) = unsafe { self.driver.copy_htod(ptr, src, len) } {
                 self.driver.free(ptr);
                 self.free_all(&mut columns);
@@ -280,8 +292,18 @@ impl Accelerator for CudaAccelerator {
                 ));
             }
             columns.push(ptr);
+            allocated += len;
         }
 
+        // The ratchet on the budget: whatever a later change does to a column
+        // width, an upload that allocates something other than what `bytes()`
+        // priced fails here instead of silently over-admitting snapshots.
+        if allocated != bytes {
+            self.free_all(&mut columns);
+            return Err(AcceleratorError::InvalidArgument(format!(
+                "upload allocated {allocated} bytes but the view priced {bytes}"
+            )));
+        }
         let token = next_token();
         let handle = ResidentGraph::new(
             token,
@@ -289,7 +311,8 @@ impl Accelerator for CudaAccelerator {
             view.node_count,
             view.edge_count(),
             bytes,
-        );
+        )
+        .with_dst_layout(view.dst_layout());
         self.graphs()?.insert(
             token,
             DeviceGraph {
