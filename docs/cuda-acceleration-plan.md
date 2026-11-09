@@ -2,19 +2,20 @@
 
 > 版本：2026-11-09 ｜ 前置文档：[`design-review-2026-11.md`](design-review-2026-11.md)
 > 触发：第三方评审意见（§1–§6）＋ 本机 C0 探针实测
-> 状态：**C0 已交付**（探针 + 结论），C1 起未开工。本文只定义边界与准入门槛，不含 kernel 实现。
+> 状态：**C0 / C1 / C2 已交付**（探针 + 边界 + 驻留句柄 + flat batch KNN），C3 起未开工。
 
 ---
 
 ## 0. 结论先行
 
-三条，按重要性排序：
+六条，按重要性排序：
 
 1. **GPU 在本项目的唯一可行形态是「设备常驻」，不是「每次查询传一次」。** 实测：1e7 边的图（153 MiB）单向上传 **13.3 ms**，而 CPU 全量 valid-time 扫描只要 **6.9 ms**。冷路径上 GPU 一定输，且 96% 的时间花在传输上。
 2. **因此 C0 的交付物不是 kernel，而是「驻留句柄 + 失效路径 + 容量预算」。** 没有这一层，后面每个 kernel 的加速比都会被传输吃掉。
 3. **评审给出的优先级我大部分接受，但有两处要下调**：批量 k-hop（P4）在 Q1 当前规模（N=32–128）上不成立；Compaction prepare（P7）在数据未常驻时同样不成立。两处都加了量化门禁，而不是直接排进里程碑。
 4. **容量比带宽更早成为墙，而容量可以靠"少传"买回来。** 8 GiB 卡上 budget 是 4.8 GiB；五列 23 B/edge 只装 224M 边，只传漫步要用的拓扑（5 B/edge）装 **1.03B 边**，上载同时快约 5×（§9.5，实测）。这一步不需要 kernel，已完成。
 5. **"超过显存就溢出到主机内存"在图上不自动成立。** 传一条边的 5 B（0.625 ns）与 CPU 扫一条边（0.69 ns）同价，而图漫步不像 LLM 的权重那样天然被复用；分层的全部前提是"搬过去的字节会被 reread"。所以 slab 换入换出排在 kernel 之后，并配一个 spill guard 决定何时降级（§9.6）。
+6. **第一个 kernel 落地后，瓶颈从传输换成了计算，而这正是想要的结果。** C2 的 flat KNN 在 100k×128 上：batch 1 赢 **3.5×**（上传全算进去），batch 32 赢 **14.3×**，盈亏点 **5 次**。阶段表里 **kernel 占 99.1%**，upload 0.2%、download 0.5%（§9.7）。也就是说 §9.5 的列投影 + `k·12 B` 的回传把传输压到可以忽略，接下来值得做的只有"让 kernel 更快"（访存形态，约 2×，见 §9.7 末尾）和"再落一个 kernel"（C3），而不是继续省传输。
 
 ---
 
@@ -310,7 +311,7 @@ T_kernel + T_seeds + T_result < 316 µs
 |:--|:--|:--|
 | **C0** ✅ 已交付 | 设备探针（带宽 / filter / dot）+ 成本模型 + 本文档 | 本机数据可复现；`R*` 公式与三个候选的判定 |
 | **C1** ✅ 已交付 | `cuda` feature + `Accelerator` trait + 驻留缓存 + CPU 回落（**无 kernel**） | 无 GPU 机器 `cargo test` 全绿（571 项）；失效场景见 §9.1 |
-| C2 | TC4 flat batch KNN（向量常驻） | vs CPU flat ≥ 2×（端到端、含摊销后的首次上传），top-k 集合相等 |
+| **C2** ✅ 已交付 | TC4 flat batch KNN（向量常驻） | 实测 batch 1 → **3.5×**、batch 32 → **14.3×**（100k×128，含摊销后的首次上传），top-k 集合相等；盈亏 **5 次**（见 §9.7） |
 | C3 | TC2 OFI（prefix sum + window diff） | vs CPU fused ≥ 2×，逐值相等 |
 | C4 | valid-time filter + `ActiveEdgeBitmap`（链式，不回传） | 「filter → 聚合」端到端改善；单独 filter 不单独立项 |
 | C5 | 批量 k-hop（Push BFS） | 仅在 `seeds ≥ 1e4` 或 frontier ≥ 1e6 的场景验收 |
@@ -576,6 +577,97 @@ budget 是显存的 60%（4.8 GiB），剩下 3.2 GiB 给驱动、上下文、ke
 
 ---
 
+### 9.7 C2：flat 批量 KNN（已交付）
+
+§9 的门禁是「vs CPU flat ≥ 2×（端到端、含摊销后的首次上传），top-k 集合相等」。实测 **3.5×（batch=1）到 14.3×（batch=32）**，集合相等，盈亏点 5 次。
+
+#### 交付物
+
+| 文件 | 作用 |
+|:--|:--|
+| `kernels/knn_flat.cu` | 内核源码：一块处理一个 query，8 个 warp 各持一个 shared 候选堆 |
+| `kernels/knn_flat.ptx` | 入库的 `compute_80` PTX（25 KB，ASCII，带源码 BLAKE3 章） |
+| `src/knn.rs` | 模块加载、`MAX_K`、split 启发式、`Launch` 参数表 |
+| `src/driver.rs` | `cuModuleLoadDataEx`（带 JIT 错误日志）、`cuLaunchKernel`、`cuMemcpyDtoH`、event 三件套 |
+| `src/lib.rs` | `load_vectors` / `knn_flat` / `release_vectors`、`VectorLoadMetrics`、`KnnMetrics` |
+| `tests/device.rs` | 三种 metric 的 top-k parity、过滤、退化输入、上传账目、失效 |
+| `tests/ptx_stamp.rs` | 无 GPU 也能跑：入库 PTX 是否由入库 `.cu` 编译而来 |
+| `examples/bench_knn.rs` | parity 闸门 → 冷/常驻 → 批量曲线 → 阶段表 → 盈亏点 |
+| `crates/xtask` | `cargo xtask cuda-ptx [--check]`，唯一需要 toolkit 的一步 |
+
+#### 为什么是入库 PTX，而不是 NVRTC
+
+§7.1 选的是「预编译 PTX 入库」，理由是 CUB 头文件过 NVRTC 很脆。C2 的内核**一个 CUB/头文件都不用**（只有 `float4` 和算术），所以那条理由不成立，需要重新判一次。重判的结论仍然是入库 PTX，但理由换成了更硬的一条：
+
+| 方案 | 构建期 | **运行期** | 结论 |
+|:--|:--|:--|:--|
+| `build.rs` + `nvcc` | 需要 toolkit | 不需要 | 无 GPU 的 CI 直接挂，否决 |
+| NVRTC 运行时编译 | 不需要 | **需要 `libnvrtc`** | 只装驱动、不装 toolkit 的机器/容器是常规部署，那里 C2 会静默不可用 |
+| 入库 PTX（`include_str!`） | 不需要 | 只要驱动（驱动自己 JIT PTX） | **采纳** |
+
+代价是"制品可能与源码漂移"。这一条用机械手段堵住：`cargo xtask cuda-ptx` 把 `.cu` 的 BLAKE3 写进 PTX 头部，`tests/ptx_stamp.rs` 在每次 `cargo test` 重算——**在没有 GPU 的 CI 上，这是关于内核唯一能被验证的东西**。
+
+一份 `compute_80` 覆盖 Ampere 及之后（PTX 向前兼容）；不兼容的只有"比生成它的 toolkit 更老的驱动"，那时 `cuModuleLoadDataEx` 报 `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`，用那台机器的 toolkit 重跑一次 xtask 即可。
+
+#### 内核形状
+
+```
+grid  = (batch, splits)      一块 = 一个 query 的一段行
+block = 256                  8 warps x 32 lanes
+heap  = WARPS x k x 12 B     每个 warp 一个升序候选堆，放 shared
+```
+
+四条设计决定，每条都对应一个会出错的方式：
+
+1. **每个 warp 一个堆，不是一个线程一个、也不是一块一个。** 线程级要 `k` 个寄存器（k=100 放不下）；块级要么一把锁、要么原子。warp 级是中间那个：8 个独立堆，每个用 `__ballot_sync` + leader 选举在 warp 内串行，**没有锁**。
+2. **`splits` 维度存在，是因为一块扫一百万行只用一个 SM。** 主机按 SM 数和 batch 定 `splits`（目标 4 块/SM，上限 64），kernel 留下每块的有序部分表，主机侧 k 路合并。batch=1 时实测 8 块 0.50 ms、24 块 0.30 ms——这就是它存在的理由。
+3. **ties 按 id 升序，和 CPU 的 `cmp_scored` 一致。** 否则同一距离的两行谁在前面取决于调度，"top-k 集合相等"就变成掷硬币。
+4. **`float4` 路径的门是 `dim % 4 == 0`，不是 `i + 4 <= dim`。** 一行从 `row * dim * 4` 字节开始，`dim` 不是 4 的倍数时行首只有 4 字节对齐，向量化读是 UB——而且只在"行足够多"时才炸。这个 bug 在探针阶段被 `DIM=130` 抓到。
+
+`k` 的上限 256 是 shared 算出来的（8 x 256 x 12 B = 24 KB，一块不额外申请就是 48 KB）。它不是"没实现"，所以既进 `Caps::max_k` 让 planner 提前避开，也在 `knn_flat` 里返回 `LimitExceeded`（`Fallback::Cpu`）——CPU 参考没有这个上限。
+
+#### 实测（RTX 4060 Laptop 8 GiB，budget 4.8 GiB，release，三次取最小）
+
+`100 000 x 128`，k=10，51.2 MB 语料，上传 6.8 ms（7.91 GB/s）：
+
+| batch | CPU ms | GPU ms | 加速 | GPU µs/query |
+|--:|--:|--:|--:|--:|
+| 1 | 1.402 | 0.398 | 3.5x | 397 |
+| 2 | 3.017 | 0.404 | 7.5x | 202 |
+| 4 | 6.390 | 0.526 | 12.1x | 132 |
+| 8 | 12.786 | 0.961 | 13.3x | 120 |
+| 16 | 24.939 | 1.777 | 14.0x | 111 |
+| 32 | 49.195 | 3.437 | **14.3x** | 107 |
+| 64 | 99.752 | 7.569 | 13.2x | 118 |
+
+`1 000 000 x 128`（512 MB，超过 L2 也不影响结论），上传 65.0 ms：
+
+| batch | CPU ms | GPU ms | 加速 |
+|--:|--:|--:|--:|
+| 1 | 10.538 | 3.960 | 2.7x |
+| 8 | 103.374 | 8.868 | 11.7x |
+| 32 | 316.780 | 34.241 | 9.3x |
+| 64 | 634.679 | 76.379 | 8.3x |
+
+阶段表（100k，batch=64）：**kernel 99.1%**（7.493 ms），upload 0.2%，download 0.5%（15.9 KB），merge 0.1%。传输在这里彻底不是问题了——这是 §9.5 的投影 + `k·12 B` 的回传共同的结果，也是 §8 第 13 条（必须报回传字节）的价值：它现在是 0.5%，一年后如果变成 30%，表里会写着。
+
+盈亏点：**5 次**（100k）/ **7 次**（1M）。契约里的 2× 在 batch=1、把上传全部算进去时就已经达到（3.5×），摊销后是 13–14×。`ExecutionPolicy::min_knn_work = 1e5` 的默认值因此仍然成立——它拦的是"行数 x query 数太少"，而那种情形下上传确实吃不回来。
+
+#### 两个必须记下来的坑
+
+1. **PTX 里不能有非 ASCII 字节，注释也不行。** 生成的头里放了一个 em dash（U+2014），`cuModuleLoadData` 报 `a PTX JIT compilation failed`，没有任何行号。修法三层：xtask 头部改 ASCII、xtask 读回时校验 `is_ascii()`、`knn.rs` 单测直接断言 `PTX.is_ascii()`。顺带把 `cuModuleLoadData` 换成 `cuModuleLoadDataEx` + `CU_JIT_ERROR_LOG_BUFFER`，以后这类失败会带行号。
+2. **内核模块挂在 context 上，context 会被 `Drop` 拆掉。** 模块是进程级 `OnceLock`（一次 JIT，不是一次一个），但它属于设备 0 的 primary context；第一个 `CudaAccelerator` drop 时 `cuDevicePrimaryCtxRelease` 把引用计数降到 0，context 销毁，缓存的模块句柄变成悬空——下一次 launch 报 `CUDA_ERROR_INVALID_HANDLE`。修法：**一旦加载过内核，就保留这次 context retain**（context 升级为进程级），代价是退出时泄漏一个 context。`tests/device.rs::a_second_accelerator_reuses_the_loaded_kernel` 就是这个 bug 的回归测试。
+
+#### 数值一致性：能保证什么，不能保证什么
+
+整数路径逐位相等；浮点路径 `|Δ| ≤ 1e-5·max(1,|d|)`。**top-k 集合相等有前提**：参考侧第 k 与第 k+1 名距离之差要大于 `2 x 容差`，否则 f32 的求和顺序（GPU 按 4 个一组、CPU AVX2 按 8 个一组）就能合法地翻转名次。测试把这个前提写成了断言（先跑 `k+1` 拿到间隙，间隙不够就报"语料在边界有并列"），所以"集合不等"永远不会是"语料恰好有并列"的马甲。实测在 `dim=512, k=100` 时确实出现过这种边界并列（第 49 名差 7.7e-6），两条距离都在容差内——这不是 bug，是 f32 的极限，写进契约比藏起来好。
+
+#### 已知的下一根杠杆（不在 C2 范围内）
+
+单 query 的带宽只有 **129 GB/s**（1M x 128），而这张卡的 DRAM 是 272 GB/s。原因是"一线程一行"的访存形态：一条 warp load 命中 32 个不同的 32 B sector，每次只用 16 B。换成"shared 转置 + 8 lane 一行 + 3 次 shuffle 归约"能贴到 DRAM 上限，大约 2×。它只影响 batch ≤ 2（那里已经赢 2.7–3.5×），而 batch ≥ 4 时跨 query 的 L2 复用把有效带宽推到 430–490 GB/s，已经不是瓶颈——**所以先记下来，不动手**。
+
+---
+
 ## 10. 风险
 
 | 风险 | 影响 | 缓解 |
@@ -613,7 +705,20 @@ cargo run --release -p gtv-engine --example bench_graph_load -- 10000000
 cargo run --release -p gtv-engine --example bench_graph_load --features cuda -- 10000000
 ```
 
-三类数字都要落在报表里：**传输 / kernel-only / 端到端**，缺任何一项的结论不接受。第四条从本次起加进去：**materialize**——端到端里不含它，报出来的永远是"传输占 97%"，而那个 97% 只对整条路径的 2.5% 成立。
+三类数字都要落在报表里：**传输 / kernel-only / 端到端**，缺任何一项的结论不接受。第四条从本次起加进去：**materialize**——端到端里不含它，报出来的永远是"传输占 97%"，而那个 97% 只对整条路径的 2.5% 成立。C2 起再加第五条：**阶段表**（upload / kernel / download / merge 各占多少），因为 kernel 占 99.1% 和传输占 97% 是两条完全不同的优化方向。
+
+C2 的内核多一步构建期依赖，其余不需要 toolkit：
+
+```bash
+# 只有这一条要 toolkit（nvcc + MSVC），产物 `kernels/*.ptx` 入库
+cargo xtask cuda-ptx            # 生成并写源码 BLAKE3
+cargo xtask cuda-ptx --check    # 只校验：入库 PTX 是否由入库 .cu 编译而来
+# kernel 侧：parity 闸门 → 冷/常驻 → 批量曲线 → 阶段表 → 盈亏点
+cargo run --release -p gtv-accelerator-cuda --example bench_knn -- 100000 128 10
+cargo run --release -p gtv-accelerator-cuda --example bench_knn -- 1000000 128 10
+```
+
+`bench_knn` 第一段是 **parity 闸门**（三种 metric 的 top-k 与 CPU 逐个比），闸门不过就不计时——一个跑得很快但答案错的 kernel 没有加速比可言。
 
 `bench_graph_load` 会打**两行** `graph_at`：一行是未压实的（归并），一行是它自己 `spawn_compaction` 之后的（原样拷贝），并在两行之间逐列断言新路径等于行路径。§9.4 的两个数就是这两行——只报其中一行，报的是"这台机器上恰好有几个段"，不是材料化的成本。
 

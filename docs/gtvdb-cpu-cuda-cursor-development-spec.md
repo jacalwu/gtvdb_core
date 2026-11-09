@@ -470,7 +470,7 @@ workbuddy 不得自行引入新的 CUDA 框架，除非先提交依赖比较和�
 
 ---
 
-## Phase D：CUDA flat batch KNN
+## Phase D：CUDA flat batch KNN （✅ 已交付，见 §16 的 H 行与 `docs/cuda-acceleration-plan.md` §9.7）
 
 ### 范围
 
@@ -786,9 +786,9 @@ E. Phase A 实施顺序
 | 2026-11-10 | `7220bfd` | C（驻留 + 预算 + 失效） | 571 | 6 实机通过（RTX 4060 Laptop） | 1e7 边 257.5 MiB：冷 46.3 ms / 暖 35.7 ms（5.6–7.6 GB/s）；break-even 7.6 次 | 同快照命中 1 次上载；`business_t` 不入键；快照变更/显式失效不返回旧结果；驱逐跳过 pinned 且查询照常回答；延迟释放不悬空；2 MiB 显存粒度已实测记录 |
 | 2026-11-10 | 本次 | E（阶段计时 + pinned A/B） | 583 | 8 实机通过 | `GraphLoadMetrics` 逐列：1e7 边窄列上载 29.68 ms / 7.75 GB/s，**97.3% 是 PCIe**；pack/transform/staging 三项恒 0。pinned 端到端 33.35 ms vs pageable 30.64 ms（慢 9%）。`graph_at` 1e7 边 **1 579 ms**，占冷路径 98% | 隐性复制在 materialize 而不在上载：`live_rows_at` 498 ms + `Vec<EdgeRecord>`（686 MiB AoS）折成 SoA 1 081 ms。端到端盈亏 **255 次**，上载内盈亏 4.8 次；C2 之前必须先修 `graph_at` |
 | 2026-11-10 | 本次 | D（`dst` 宽度） | 577 | 7 实机通过 | 双宽度独立进程：u64 冷 45.9 ms / 稳态 34.8 ms（break-even 7.3 / 5.9 次），u32 冷 40.4 ms / 稳态 30.9 ms（6.4 / 4.9 次） | 22 B/edge 成立，但**只能由上游提供窄列**：上载时转换实测 9.5–11.2 ms 换 5.7 ms 传输，第一版实现因此删除。`ResidentGraph::dst_layout()` 是 kernel 必须读的宽度凭据 |
-
 | 2026-11-10 | 本次 | F（列式 materialize） | 592 | 8 实机通过 | `graph_at` 1e7 边：旧实现 1 508–1 579 ms → **393 ms**（3 个存活段，k 路归并）/ **176 ms**（压实后单段，原样拷贝）；行路径 oracle 同步 1 455 ms。探针拆解：只读 102 ms、+写列 175 ms、完整归并 390 ms，**选择器约 215 ms**（3 条 run 在 src 上交错，分支预测必错） | 不再经 AoS：段内 CSR 已按 `(src, valid_from, valid_to, dst)` 有序，flush 时付过的排序不再付第二次。`tests/graph_at_columnar.rs` 用行路径逐列比对并直接断言排序不变量（9 项）。端到端盈亏 255 → 69 次（未压实）/ 34 次（压实）；压实后已贴住本机拷贝上限（同 260 MiB 的 `fs::read` 78 ms） |
 | 2026-11-10 | 本次 | G（列投影 + 预算预检） | 604 | 10 实机通过 | `bench_residency … topology`：1e7 边窄列 23.00 B/edge / 29–31 ms → 拓扑投影 **5.00 B/edge / 5.9–6.4 ms**，三次带宽都在 7.5–8.8 GB/s 同一档（省下的是字节，不是效率）；4.8 GiB budget 的容量 224M → **1.03B 边（4.6×）**；去掉 label 一档 21.00 B/edge / 25–26 ms | `ColumnSet` 位集合承载投影，`(snapshot_id, projection)` 是缓存键（少这一半就是错答案而不是 miss），`ResidentGraph::check_columns` 让读 `valid_from` 的算子拿到具名错误，`Caps::admit` 在第一次 `cuMemAlloc` 之前用 `OutOfBudget`（`Fallback::Cpu`）拒绝装不下的拷贝。`tests/columns.rs` 11 项 + 设备侧 2 项 |
+| 2026-11-10 | 本次 | H（flat batch KNN 内核，即 §8 Phase D） | 596（+28 设备侧，合计 **624**） | 28 实机通过（8 单测 + 16 设备 + 4 PTX 章校验） | `bench_knn`：100k×128 k=10，语料 51.2 MB、上传 6.8 ms（7.91 GB/s），batch 1 **3.5×** / 8 13.3× / 32 **14.3×** / 64 13.2×；1M×128 上传 65.0 ms，batch 1 2.7× / 8 11.7× / 32 9.3×。阶段表（batch 64）**kernel 99.1%**、upload 0.2%、download 0.5%（15.9 KB）、merge 0.1%。盈亏 **5 次**（100k）/ **7 次**（1M） | `grid=(batch, splits)`、`block=256`、每 warp 一个 shared 升序候选堆（`WARPS×k×12 B`），`__ballot_sync` + leader 选举插入，**无锁**；tie 按 `(distance, id)` 与 CPU `cmp_scored` 一致；`k ≤ 256` 进 `Caps::max_k`（`DecisionReason::KTooLarge` 让 planner 提前避开），超出返回 `LimitExceeded`（`Fallback::Cpu`）。**PTX 入库而不是 NVRTC**：只装驱动、不装 toolkit 的机器是常规部署，那里 NVRTC 会让 C2 静默不可用；`cargo xtask cuda-ptx` 把 `.cu` 的 BLAKE3 写进 PTX 头，`tests/ptx_stamp.rs` 每次 `cargo test` 重算——无 GPU 的 CI 上这是内核唯一可验证的东西。两个坑写进 §9.7：PTX 不得含非 ASCII（含注释），模块属于 primary context 故加载过内核后不再 release |
 **与规范的三处偏离，都有理由：**
 
 1. **没有 `EndpointMask`。** 草案里 `valid_time_filter(…, policy: EndpointMask)` 需要"节点在 t 是否存活"，而 v1 视图只有出边，判断 `DST` 侧存活要转置图。C1 的签名是 `valid_time_filter(&ResidentGraph, t) -> Sel`；端点策略推迟到确实需要它的那一步（C4），届时视图要加节点寿命列，而不是在签名里先放一个算不出来的参数。
