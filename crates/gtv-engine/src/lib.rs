@@ -54,7 +54,7 @@ pub use dq::{
 pub use embedding::{EmbeddingCollection, EmbeddingHit, EmbeddingRegistry, EmbeddingSearchTableFunction};
 pub use ext::{ExtensionInfo, ExtensionRegistry, GtvExtension};
 pub use invalidation::{
-    empty_invalidation_slot, InvalidationsTableFunction, InvalidationSlot,
+    empty_invalidation_slot, InvalidationsTableFunction, InvalidationSlot, TagsTableFunction,
 };
 pub use lineage::{extract_udfs, ReplayError, ENGINE_VERSION, LINEAGE_TABLE};
 pub use registry::{AsofResource, HftRegistry, PitResource, ResourceRegistry};

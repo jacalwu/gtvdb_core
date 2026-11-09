@@ -115,6 +115,12 @@ jobs:
           cargo test -p gtv-engine --test m2_aggregate_sql
       - name: M2 control-plane regression gate
         run: cargo run --release -p gtv-storage --example bench_correction
+      - name: M3 admission (bitmap, tags, GC pinning, maintenance worker)
+        run: |
+          cargo test -p gtv-storage --test m3_admission
+          cargo test -p gtv-engine --test m3_tags_sql
+      - name: M3 admission gate (evidence for go/no-go decisions)
+        run: cargo run --release -p gtv-storage --example bench_m3_gate
 
   full-tests:
     name: Full workspace regression

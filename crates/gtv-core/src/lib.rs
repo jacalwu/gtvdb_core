@@ -4,6 +4,7 @@
 //! Phase 1 provides the immutable in-memory Temporal-CSR index, Arrow-backed
 //! node/edge tables, and the three core extension traits.
 
+pub mod active_bitmap;
 pub mod bitemporal;
 pub mod chunk;
 pub mod column;
@@ -19,6 +20,9 @@ pub mod temporal;
 pub mod traits;
 pub mod traversal;
 
+pub use active_bitmap::{
+    ActiveNodeBitmap, BitmapCache, BitmapDecision, BitmapKey, BitmapPlanner,
+};
 pub use bitemporal::{
     bitemporal_edge_schema, business_date, find_overlaps, migrate_legacy_edges, BitemporalRange,
     Overlap, OPEN_ENDED,

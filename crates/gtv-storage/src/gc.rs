@@ -73,6 +73,9 @@ pub struct GcReport {
     pub orphan_files_removed: usize,
     pub bytes_reclaimed: u64,
     pub manifest_rewritten: bool,
+    /// M3: the effective cutoff was lowered because a named tag still pins
+    /// older history. Reported so a "GC did nothing" result is explainable.
+    pub pinned_by_tags: bool,
 }
 
 impl GcReport {

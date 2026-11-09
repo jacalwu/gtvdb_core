@@ -378,6 +378,13 @@ impl GtvContext {
                 invalidation_root.clone(),
             )),
         );
+        // M3: named snapshot tags are another projection of the same manifest.
+        ctx.register_udtf(
+            "gtv_tags",
+            Arc::new(crate::invalidation::TagsTableFunction::new(
+                invalidation_root.clone(),
+            )),
+        );
 
         // -- core: M2 L2 aggregates over a folded snapshot -----------------
         let aggregate = crate::aggregate::empty_aggregate_slot();

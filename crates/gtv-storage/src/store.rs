@@ -358,6 +358,15 @@ pub struct Manifest {
     /// restart through the manifest rather than the WAL tail.
     #[serde(default)]
     pub next_commit_id: u64,
+    /// M3: lightweight named snapshot references (`name -> system_ts`).
+    ///
+    /// A tag pins one published point so delayed GC cannot collect the files
+    /// needed to answer `AS KNOWN AT` it. This is **not** a branch: the
+    /// manifest stays a single linear history (review R6). Creating or
+    /// dropping a tag never advances `system_ts`, so an in-flight compaction
+    /// plan does not go stale.
+    #[serde(default)]
+    pub tags: BTreeMap<String, i64>,
 }
 
 impl Manifest {
@@ -376,6 +385,7 @@ impl Manifest {
             next_observation_id: 1,
             gc_floor: None,
             next_commit_id: 0,
+            tags: BTreeMap::new(),
         }
     }
 
@@ -480,6 +490,27 @@ impl CompactionInput {
             deltas: &self.deltas,
             mem_records: &self.mem_records,
         }
+    }
+
+    /// M3: run phase 1 from an owned read-only snapshot. This is the only
+    /// entry point a background maintenance worker needs, so no private view
+    /// type leaks out of `store.rs`. Pure CPU: no file, no manifest, no lock.
+    pub fn prepare(&self, system_ts: i64) -> Result<CompactionPlan> {
+        prepare_compaction(self.view(), system_ts)
+    }
+
+    /// Live (not yet materialized) delta count in this snapshot. The worker
+    /// uses it as its compaction trigger without borrowing the store.
+    pub fn delta_depth(&self) -> usize {
+        self.manifest
+            .deltas
+            .iter()
+            .filter(|d| d.superseded_at.is_none())
+            .count()
+    }
+
+    pub fn head(&self) -> i64 {
+        self.manifest.system_ts
     }
 }
 
@@ -1486,6 +1517,60 @@ impl SegmentStore {
         Ok(checked)
     }
 
+    // -- M3: named snapshot tags -------------------------------------------
+
+    /// All named snapshot references, in name order.
+    pub fn tags(&self) -> &BTreeMap<String, i64> {
+        &self.manifest.tags
+    }
+
+    /// Resolve a tag to its published system-time point. A tag below the GC
+    /// retention floor is rejected rather than silently returning a graph
+    /// whose files no longer exist.
+    pub fn resolve_tag(&self, name: &str) -> Result<i64> {
+        let t = *self
+            .manifest
+            .tags
+            .get(name)
+            .ok_or_else(|| err(format!("unknown tag `{name}`")))?;
+        self.check_history(t)?;
+        Ok(t)
+    }
+
+    /// Create (or move) a named reference to an already published point.
+    ///
+    /// One atomic manifest write; `system_ts`, `next_segment_id` and
+    /// `checkpoint_txn` are untouched, so an in-flight compaction plan stays
+    /// valid. Tags are references, not branches: the history stays linear.
+    pub fn create_tag(&mut self, name: &str, system_ts: i64) -> Result<()> {
+        validate_tag_name(name)?;
+        if system_ts > self.manifest.system_ts {
+            return Err(err(format!(
+                "cannot tag system_ts {system_ts}: head is {}",
+                self.manifest.system_ts
+            )));
+        }
+        self.check_history(system_ts)?;
+        let mut next = self.manifest.clone();
+        next.tags.insert(name.to_string(), system_ts);
+        self.save_manifest_as(&next)?;
+        self.manifest = next;
+        Ok(())
+    }
+
+    /// Remove a tag. Returns whether it existed.
+    pub fn drop_tag(&mut self, name: &str) -> Result<bool> {
+        validate_tag_name(name)?;
+        if !self.manifest.tags.contains_key(name) {
+            return Ok(false);
+        }
+        let mut next = self.manifest.clone();
+        next.tags.remove(name);
+        self.save_manifest_as(&next)?;
+        self.manifest = next;
+        Ok(true)
+    }
+
     // -- M2: persisted observation versions -------------------------------
 
     pub fn observations_dir(&self) -> PathBuf {
@@ -1636,6 +1721,9 @@ impl SegmentStore {
         points.extend(self.manifest.deltas.iter().filter_map(|d| d.superseded_at));
         points.extend(self.manifest.node_versions.iter().map(|v| v.system_ts));
         points.extend(self.manifest.observations.iter().map(|v| v.system_ts));
+        // M3: a tag is an explicit reference to a published snapshot, so its
+        // point participates in `keep_last_n` exactly like a segment point.
+        points.extend(self.manifest.tags.values().copied());
         points.sort_unstable();
         points.dedup();
         let keep_floor = if policy.keep_last_n == 0 {
@@ -1643,7 +1731,14 @@ impl SegmentStore {
         } else {
             points[points.len().saturating_sub(policy.keep_last_n)]
         };
-        let cutoff = retain.min(keep_floor);
+        let mut cutoff = retain.min(keep_floor);
+        // M3: never collect the history a tag still pins. Lowering the cutoff
+        // is conservative — it can only keep more files, never fewer.
+        let tag_floor = self.manifest.tags.values().copied().min();
+        let pinned = tag_floor.is_some_and(|t| t < cutoff);
+        if let Some(t) = tag_floor {
+            cutoff = cutoff.min(t);
+        }
         if cutoff <= self.manifest.gc_floor.unwrap_or(i64::MIN) {
             return Ok(GcReport::no_op(active));
         }
@@ -1669,6 +1764,7 @@ impl SegmentStore {
             cutoff,
             dry_run: policy.dry_run,
             active_readers: active,
+            pinned_by_tags: pinned,
             ..GcReport::default()
         };
         // (directory, file) pairs staged for unlink *after* the manifest publish.
@@ -1983,6 +2079,47 @@ fn invalidation_row(inv: &InvalidationRecord, de: &DeltaEntry) -> InvalidationRo
 
 /// Read the invalidation log straight from a store root (no `SegmentStore`
 /// handle needed). Used by the `gtv_invalidations()` SQL surface.
+/// One row of the SQL tag projection. Pure manifest read — no cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRow {
+    pub name: String,
+    pub system_ts: i64,
+}
+
+/// M3: read-only projection of named snapshot references. Like
+/// `read_invalidation_log`, this reads the published manifest directly so a
+/// tag becomes visible exactly at the atomic manifest write.
+pub fn read_tag_log(root: &Path) -> Result<Vec<TagRow>> {
+    let manifest_path = root.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(&manifest_path)?;
+    let m: Manifest = serde_json::from_slice(&bytes)
+        .map_err(|e| err(format!("cannot parse {}: {e}", manifest_path.display())))?;
+    let mut out: Vec<TagRow> = m
+        .tags
+        .into_iter()
+        .map(|(name, system_ts)| TagRow { name, system_ts })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+fn validate_tag_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    if !valid {
+        return Err(err(format!(
+            "invalid tag name `{name}` (1..=64 ascii alphanumeric / _ / - / .)"
+        )));
+    }
+    Ok(())
+}
+
 pub fn read_invalidation_log(root: &Path, since_commit: u64) -> Result<Vec<InvalidationRow>> {
     let manifest_path = root.join("manifest.json");
     if !manifest_path.exists() {

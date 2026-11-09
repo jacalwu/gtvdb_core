@@ -140,3 +140,64 @@ impl TableFunctionImpl for InvalidationsTableFunction {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 }
+
+/// M3: `gtv_tags()` — named snapshot references as a read-only projection.
+///
+/// Shares the same manifest-root slot as `gtv_invalidations()`: both are
+/// views of the single atomic publish, so neither can be stale relative to
+/// the graph. Tags pin history against delayed GC; they are not branches.
+#[derive(Debug)]
+pub struct TagsTableFunction {
+    slot: InvalidationSlot,
+}
+
+impl TagsTableFunction {
+    pub fn new(slot: InvalidationSlot) -> Self {
+        Self { slot }
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("system_ts", DataType::Int64, false),
+        ]))
+    }
+}
+
+impl TableFunctionImpl for TagsTableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
+        if !args.exprs().is_empty() {
+            return Err(plan_err("gtv_tags takes no arguments"));
+        }
+        let root = {
+            let guard = self
+                .slot
+                .read()
+                .map_err(|_| exec_err("tag slot lock poisoned"))?;
+            guard.clone().ok_or_else(|| {
+                exec_err(
+                    "gtv_tags: no store attached \
+                     (call GtvContext::attach_delta_log or register_segment_store first)",
+                )
+            })?
+        };
+        let rows = gtv_storage::read_tag_log(&root)
+            .map_err(|e| exec_err(format!("gtv_tags: {e}")))?;
+
+        let schema = Self::schema();
+        let n = rows.len();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|r| r.name.as_str()),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(
+                    rows.iter().map(|r| r.system_ts),
+                )),
+            ],
+        )?;
+        debug_assert_eq!(batch.num_rows(), n);
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+}

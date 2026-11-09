@@ -10,6 +10,7 @@ pub mod delta;
 pub mod error;
 pub mod gc;
 pub mod hdb;
+pub mod maintenance;
 pub mod mem_segment;
 pub mod node_lifetime;
 pub mod observation;
@@ -29,6 +30,7 @@ pub use cache::StaticCache;
 pub use csv::read_csv;
 pub use error::{Result, StorageError};
 pub use hdb::{read_parquet_mmap, HdbStore};
+pub use maintenance::{MaintenanceConfig, MaintenanceService, MaintenanceStatus};
 pub use parquet::{
     default_writer_properties, infer_csv_schema, parquet_schema, read_batches, write_batch,
     DEFAULT_MAX_ROW_GROUP_ROWS,
@@ -43,9 +45,9 @@ pub use observation::{
     decode_observation, encode_observation, read_observation, ObservationEntry,
 };
 pub use store::{
-    read_invalidation_log, CompactionInput, CompactionPlan, DeltaDraft, DeltaEntry,
+    read_invalidation_log, read_tag_log, CompactionInput, CompactionPlan, DeltaDraft, DeltaEntry,
     EdgeCorrectionPlan, FlushReport, InvalidationRow, LiveRow, Manifest, MaterializeReport,
     NodePublish, NodeVersionEntry, PruneSummary, PublishReport, RecoveryReport, SegmentEntry,
-    SegmentStore, MAX_DELTA_DEPTH,
+    SegmentStore, TagRow, MAX_DELTA_DEPTH,
 };
 pub use wal::{EdgeRecord, Wal, WalFrame, WalScan};
