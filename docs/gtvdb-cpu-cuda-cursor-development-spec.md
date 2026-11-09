@@ -781,7 +781,15 @@ E. Phase A 实施顺序
 
 | 日期 | Commit | Phase | CPU tests | CUDA tests | Benchmark | 结论 |
 |---|---|---|---:|---:|---|---|
-| 待填写 | 待填写 | A | 待填写 | N/A | adapter overhead | 待填写 |
+| 2026-11-10 | `7220bfd` `942e844` | A（CPU reference + 抽象） | 571 | N/A | 无回归（未改查询路径） | `Accelerator` / `SnapshotView` / `CpuAccelerator` / `ExecutionPolicy` / `AcceleratorRegistry` 落地；CPU 实现直接复用 `FlatIndex` 与 `gtv-array::window`，所以"参考实现"就是既有 kernel 本身 |
+| 2026-11-10 | `7220bfd` | B（空后端 + 能力发现） | 571 | 4（无 GPU 时全部跳过） | `accel_state`：默认 `feature_disabled`、`--features cuda` 下 `device_ready` 且四算子均 `unsupported` | 驱动运行期加载（`LoadLibraryW` / `dlopen`），**无链接期 CUDA 依赖、无 build.rs、无 nvcc**；`FeatureDisabled` / `DeviceUnavailable` / `Unsupported` 三种原因可分辨，无 panic |
+| 2026-11-10 | `7220bfd` | C（驻留 + 预算 + 失效） | 571 | 6 实机通过（RTX 4060 Laptop） | 1e7 边 257.5 MiB：冷 46.3 ms / 暖 35.7 ms（5.6–7.6 GB/s）；break-even 7.6 次 | 同快照命中 1 次上载；`business_t` 不入键；快照变更/显式失效不返回旧结果；驱逐跳过 pinned 且查询照常回答；延迟释放不悬空；2 MiB 显存粒度已实测记录 |
+
+**与规范的三处偏离，都有理由：**
+
+1. **没有 `EndpointMask`。** 草案里 `valid_time_filter(…, policy: EndpointMask)` 需要"节点在 t 是否存活"，而 v1 视图只有出边，判断 `DST` 侧存活要转置图。C1 的签名是 `valid_time_filter(&ResidentGraph, t) -> Sel`；端点策略推迟到确实需要它的那一步（C4），届时视图要加节点寿命列，而不是在签名里先放一个算不出来的参数。
+2. **`SelectionBitmap` 改为复用 `gtv_core::Sel`。** 草案要求"不得创建第三套选择向量"，`Sel` 就是 M1 立的那一套（带 `snapshot_id`、可 `to_mask()` 成 Arrow、即 H2D 输入）。边过滤器返回的是**边 id** 的 `Sel`（universe = edge_count），与节点候选集同一类型。
+3. **cuda feature 挂在 `gtv-engine`，不在 `gtv-accelerator`。** 因为 `gtv-accelerator-cuda` 依赖 `gtv-accelerator`，若后者再 feature 依赖前者会构成 package 循环，Cargo 直接拒绝。注册表因此放在 engine（与 §3.1 的依赖方向一致）。
 
 ---
 

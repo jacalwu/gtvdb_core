@@ -149,7 +149,7 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 | `Neighbor::edge_idx` | `csr.rs`：`u32` 槽位，**结构体仍是 32 B**（`const` 断言守门）；`MatchedEdge` 同步带出 | 解决"同源同目标同区间的两笔转账不可区分"；转置图的槽位不是正排身份，以 `u32::MAX` 表示未知并在 `needs_edge_identity()` 时强制 push |
 | 预算语义 | `traversal.rs`：`Truncation` / `TraversalOutcome` / `TriState{Found, NoMatch, Incomplete}`；`khop_*` 与 `find_bounded` 返回**残缺结果 + 截断原因**，不再丢结果报错 | `TruncReason` 含 `Edges/Nodes/Frontier/Rows/Hops/Memory/Deadline`；`max_hops` 少跑也计作截断。SQL 的 `khop` 无三态通道，遇截断直接报错而不是返回空行集 |
 
-**验收**：`cargo test --workspace` 521 项全绿，其中新增 10 项（`selection::tests` 9 项 + 边身份 4 项 + 预算三态 3 项，含 `p1_4_motif_sql` 中新增的槽位回址断言）。**未做**：Top-K 证据路径、provenance 三层拆分（M2）；CUDA 一切实现（M4 之后）。
+**验收**：`cargo test --workspace` 521 项全绿（C1 后为 571 项），其中新增 10 项（`selection::tests` 9 项 + 边身份 4 项 + 预算三态 3 项，含 `p1_4_motif_sql` 中新增的槽位回址断言）。**未做**：Top-K 证据路径、provenance 三层拆分（M2）；CUDA 一切实现（M4 之后）。
 
 ---
 
@@ -163,7 +163,7 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 | M7 增量 frontier | 🧊 冻结 | 与 AML / CRM / LE 无关；仅 quantum state 有真实分支集需求时再评估 |
 | M8 crates.io、M9 pyo3、M10 canonical demo、M12 dylib loader | 🗑 主线下架 | 出现真实嵌入用户后按需；对速度零贡献，且会继续扩大接口面积 |
 | 任何新的非图算子 UDTF / 领域功能 | ⛔ 本轮禁止 | 领域一律进 `gtvdb_ext`；核心只保留注册接口 |
-| CUDA 加速（C1 起） | 🧊 C0 已完成、M1 前置已解除；C1 起按需 | [`docs/cuda-acceleration-plan.md`](docs/cuda-acceleration-plan.md)：本机实测冷路径传输占 96%、break-even 2.1 次，**只有设备常驻才成立**；C1 前置是驻留句柄 + `snapshot_id` 失效，不是 kernel |
+| CUDA 加速（C2 起） | 🧊 C1 已完成（驻留 + 失效 + 回落），C2 起按需 | [`docs/cuda-acceleration-plan.md`](docs/cuda-acceleration-plan.md) §9.1：C1 实测把 break-even 从估算的 2.1 次修正为 **7.6 次**（视图是 26–27 B/edge 而非 16 B，pageable 上载 5.6–7.6 GB/s 而非 pinned 12.0 GB/s）。C2 第一个要测的量是 `dst` 从 u64 收窄到 u32 |
 
 **门禁索引**：触发条件与 go/no-go 结论以 [`docs/perf-first-roadmap-review.md`](docs/perf-first-roadmap-review.md) 为准；CI 已有「M6 batch graph operator」（step 17，逐条 parity）、「M6 admission gate」（step 18，目标查询延迟 + 段粒度）与「P1-4 motif SQL」（step 19，9 项 parity + Q1 准入基准）三道门禁，generated-data guard 与 core-boundary 保持不变。§3.2 的工程/文档欠账**不占里程碑**；§3.3 已被业主批准纳入 P1-4 并交付。
 

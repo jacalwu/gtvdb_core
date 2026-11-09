@@ -307,7 +307,7 @@ T_kernel + T_seeds + T_result < 316 µs
 | 阶段 | 内容 | 验收 |
 |:--|:--|:--|
 | **C0** ✅ 已交付 | 设备探针（带宽 / filter / dot）+ 成本模型 + 本文档 | 本机数据可复现；`R*` 公式与三个候选的判定 |
-| C1 | `cuda` feature + `Accelerator` trait + `DeviceGraph` 驻留缓存 + CPU 回落 | 无 GPU 机器 `cargo test` 全绿；失效三场景测试通过 |
+| **C1** ✅ 已交付 | `cuda` feature + `Accelerator` trait + 驻留缓存 + CPU 回落（**无 kernel**） | 无 GPU 机器 `cargo test` 全绿（571 项）；失效场景见 §9.1 |
 | C2 | TC4 flat batch KNN（向量常驻） | vs CPU flat ≥ 2×（端到端、含摊销后的首次上传），top-k 集合相等 |
 | C3 | TC2 OFI（prefix sum + window diff） | vs CPU fused ≥ 2×，逐值相等 |
 | C4 | valid-time filter + `ActiveEdgeBitmap`（链式，不回传） | 「filter → 聚合」端到端改善；单独 filter 不单独立项 |
@@ -316,6 +316,25 @@ T_kernel + T_seeds + T_result < 316 µs
 | C7 | compaction prepare | 仅在「ingest → 设备常驻 → compaction」整链成立后评估 |
 
 顺序理由：C1 是所有后续的前置（没有驻留就没有赢面）；C2/C3 是数值密集、语义最简单、最容易验证；C5/C6 有分支与语义，放后面。
+
+### 9.1 C1 交付后的实测修正
+
+C1 把 §3.4 的成本模型从"估算"换成"测量"，并推翻了两处：
+
+| 项 | C0 的估算 | C1 实测（RTX 4060 Laptop，2026-11） |
+|:--|:--|:--|
+| 每边上载字节 | 16 B | **26–27 B**（`dst` u64 + 2×i64 + u16；C0 按 u32 `dst` 算） |
+| 1e7 边上载 | 153 MiB / 13.3 ms（pinned，12.0 GB/s） | **257.5 MiB / 46.3 ms 冷、35.7 ms 暖（5.6–7.6 GB/s，pageable）** |
+| filter break-even | 2.1 次 | **7.6 次（冷）/ 5.9 次（暖）** |
+
+两处修正的含义：
+
+1. **`dst` 的宽度直接决定盈亏点。** 现在按源宽度 `u64` 上载，零转换；改成 `u32` 可降到 22 B/edge，break-even 回到约 6.4 次。这是 C2 第一个要测的量，而不是 kernel 的算术优化。
+2. **pageable 与 pinned 差 1.6×。** 上载走 `Vec` 直接 H2D，实测 7.0–7.6 GB/s；C0 的 12.0 GB/s 是 pinned。是否加 staging 池，取决于 C2 能否把传输摊销掉——在 7.6 次 break-even 面前，1.6× 传输改善只把门槛降到 4.7 次，不改变结论。
+
+另有一条只在实测中出现的事实：**显存按 2 MiB 粒度计费**。300 KB 的图首次上载实测占用 2 097 152 B，第二个同尺寸快照为 0 B（落在同一池内）。所以 `max_device_bytes` 按"申请字节"记账会低估真实占用，预算不能设成刚好等于显存。
+
+C1 刻意**不**注册任何算子（`Caps::supports` 全 false），因此 `ExecutionPolicy` 在 C1 期间总是把查询判给 CPU，`AcceleratorRegistry::route` 报 `Unsupported` 而非 `NoDevice`——"这台机器没有 GPU"和"GPU 还没移植这个算子"是两种结论。C2 每落一个 kernel 翻一个 bit，policy 不用改。
 
 ---
 
