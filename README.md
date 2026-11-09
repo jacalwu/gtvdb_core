@@ -61,6 +61,7 @@ crates/
 └── gtv-cli         精简 REPL（本仓唯一 bin，零扩展依赖）
 
 docs/               定位、存储设计、OceanBase 对照评估、量子状态图
+tools/cuda-probe/   C0 加速准入探针（CUDA C++，不参与 cargo 构建）
 testcase/data/      基准数据生成器 + SHA256SUMS（数据本身不入库）
 examples/           量子状态示例（ghz3.jsonl）
 ```
@@ -131,6 +132,7 @@ let ctx = GtvContext::with_extensions(
 | 文档 | 内容 |
 |:--|:--|
 | [docs/design-review-2026-11.md](docs/design-review-2026-11.md) | **第三方评审用设计文档**：架构、存储格式、读写路径、正确性策略、已知限制、评审问题清单 |
+| [docs/cuda-acceleration-plan.md](docs/cuda-acceleration-plan.md) | CUDA 边界、C0 实测（传输/filter/点积）、常驻设计与准入门禁；探针见 `tools/cuda-probe/` |
 | [docs/positioning.md](docs/positioning.md) | 为什么定位为 Temporal Graph Analytics Platform |
 | [docs/storage-mmap-design.md](docs/storage-mmap-design.md) | GTVSeg 格式、CPU cache 布局、P0 §8 / P1 §9 实现记录 |
 | [docs/oceanbase-storage-lessons.md](docs/oceanbase-storage-lessons.md) | OceanBase 压缩与 LSM 的可借鉴点及不适用处 |

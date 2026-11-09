@@ -44,6 +44,12 @@ nodes_c*.bin
 # tool-local cache (not project data; bifrost.json.bak is the only copy of that
 # config, so the directory is ignored rather than deleted)
 /.pi/
+# CUDA probe build products (tools/cuda-probe builds with nvcc, not cargo)
+tools/cuda-probe/*.exe
+tools/cuda-probe/*.obj
+tools/cuda-probe/*.lib
+tools/cuda-probe/*.exp
+tools/cuda-probe/*.pdb
 # personal shell helper (unset auth token)
 /uns.sh
 # core-only split: generated binary datasets never enter this repository.

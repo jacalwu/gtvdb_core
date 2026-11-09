@@ -125,14 +125,34 @@ gtvdb_core/crates/
 
 三者在同一个 `RecordBatch` 里。所以「时间切片 → 向量检索 → 图遍历」不需要跨系统搬数据。护城河不是功能，是**这个数据布局**。
 
-### 4.2 双时间：业务时间 vs 系统时间
+### 4.2 双时间：业务时间在行上，系统时间在版本上
+
+**两条轴不在同一个粒度上**，这一点容易误读，先把边界钉死（2026-11-09 修订，依据第三方评审意见）：
+
+| 轴 | 粒度 | 存在哪里 | 谁负责解析 |
+|:--|:--|:--|:--|
+| **业务时间** | 行级 | GTVSeg 列区 `valid_from` / `valid_to`，CSR 索引 | 读路径（§7） |
+| **系统时间** | 版本级（段 / 快照） | `SegmentEntry.system_ts` + `superseded_at`；`BitemporalStore` 的整表版本 | 存储层（`entries_at(business_t, system_t)`） |
+
+代码里对此有明确注释：
+
+- `crates/gtv-storage/src/store.rs:113` —— `system_ts` 的注释是 *"Global snapshot point: this segment is `as_of_system(system_ts)`"*，**一个段只有一个系统时间点**；
+- `crates/gtv-core/src/bitemporal.rs:11-14` —— *"The temporal CSR keeps indexing **business** time only (two axes in one index would blow up the structure); system time is versioned by the storage / catalog layer, where each system write appends a new immutable version."*
+
+那 `BitemporalRange` 的四字段是什么？
 
 ```rust
 pub struct BitemporalRange {
-    business_from: i64, business_to: i64,   // 这件事在现实世界里何时成立
-    system_from:   i64, system_to:   i64,   // 我们何时知道 / 何时不再这么认为
+    business_from: i64, business_to: i64,
+    system_from:   i64, system_to:   i64,
 }
 ```
+
+它是**值类型**，服务于两件事：① 列式表面（`BitemporalStore` 的整表版本，`as_of_system(t)` / `as_of(b, s)`）；② 重叠检测（`find_overlaps`，判断同一实体的两条记录在两个轴上是否都冲突）。`migrate_legacy_edges(batch, system_from)` 给一批数据盖的是**同一个** `system_valid_from`——所以即使它出现在行上，值也是版本戳，不是逐行独立版本。
+
+**结论**：热路径（GTVSeg → TemporalCSR）上的边**只有业务时间**；系统时间通过「选哪个快照」体现，不是逐行比较四个时间。初版文档把 §4.2 写成了行级双时间，与 §9 的快照级三原语自相矛盾，是文档缺陷，已按代码事实更正。
+
+这条边界对加速器设计是硬约束：**GPU 只看到两个 valid-time 比较 + 一个 endpoint 掩码**，不做系统时间版本解析。见 [`docs/cuda-acceleration-plan.md`](cuda-acceleration-plan.md) §2。
 
 两轴的语义差异是**更正（correction）与回填（backfill）的差别**：
 
@@ -561,13 +581,26 @@ pub trait GtvExtension: Any + Debug + Send + Sync {
 
 三处历史文档仍停在早期时点（`metadata-benchmark.md` §6.2、`storage-mmap-design.md` §9.5、`oceanbase-storage-lessons.md` §6）。它们不影响代码事实，但**评审时请以本文与 `ROADMAP.md` 为准**。
 
-### 12.7 CUDA 尚未开始
+### 12.7 CUDA：C0 已实测，C1 起未开工
 
-GPU 环境已探明（RTX 4060 Laptop，8 GiB，CC 8.9，CUDA 13.0），但没有一行 GPU 代码。
+环境：`RTX 4060 Laptop`，24 SM，8 GiB，CC 8.9，128-bit 总线，CUDA 13.0。
 
-**先给一个可能不中听的判断**：这份基线里最贵的 join（41.7 ms / 1M 行）恰恰最不适合上 GPU。它的成本在字符串哈希与内存带宽，166 MiB 经 PCIe 传一次约 10 ms，还要回传 4.2 倍行数。除非数据常驻显存且多次复用，单次查询不可能赢。
+C0 探针已在**本机**跑出实数（源码与复现：[`tools/cuda-probe/`](../tools/cuda-probe/)）：
 
-真正 GPU-shaped 的是 **TC4 512 维 KNN**（稠密浮点、无分支、算力受限）和 **TC2 OFI**（纯数值扫描）。所以推进顺序定为「先证伪再动手」：设备抽象层 + `cuda` feature（默认关闭，无 GPU 的 CI 必须继续全绿）→ 传输成本探针 → 按 ROI 做 TC4 → TC2 → CSV 聚合。
+| 项 | 实测 |
+|:--|:--|
+| H2D pinned（153 MiB，1e7 边） | 13.3 ms（12.0 GB/s） |
+| valid-time filter 1e7 边 | CPU 6.86 ms（1.46 G/s）／GPU kernel 0.556 ms（17.98 G/s） |
+| filter 冷路径 | 13.86 ms，**传输占 96%**，break-even **2.1 次** |
+| 512 维点积（102.4 GFLOP） | CPU 14.17 s／GPU 0.912 s（112 GFLOP/s，225 GB/s 有效带宽） |
+
+三条由此确定的结论（详 [`docs/cuda-acceleration-plan.md`](cuda-acceleration-plan.md)）：
+
+1. **冷路径必输**：1e7 边的图传一次 13.3 ms，已超过 CPU 全量扫描的 6.9 ms。所以「每次查询传一次」这种形态不存在。
+2. **唯一可行形态是设备常驻**，因此 C1 要交付的不是 kernel，而是「驻留句柄 + `snapshot_id` 失效 + 显存预算」。
+3. **TC4 的 GPU 收益只能来自减少读取字节**：225 GB/s 已接近总线峰值，加算力无用；IVF 路径（扫 3.1% 候选、亚毫秒）留在 CPU，GPU 只接 flat 全扫 + 批量 query。
+
+最贵的 join（41.7 ms / 1M 行）仍判定不适合 GPU：成本在字符串哈希与带宽，输出还膨胀 4.2 倍。
 
 ---
 
@@ -679,6 +712,7 @@ CPU 明细：load 929%、count(CSV) 1339%、aggregation 644%、join 799%、`coun
 | 热路径 | `crates/gtv-core/src/csr.rs`、`crates/gtv-core/src/endpoint.rs` |
 | TC1–TC5 | `gtvdb_ext/doc/tc1_tc5_usecases.md` |
 | SQL/CSV 基准 | `gtvdb_ext/doc/sql_csv_benchmark.md` |
+| CUDA 边界与准入门禁 | `docs/cuda-acceleration-plan.md`（C0 实测见 `tools/cuda-probe/`） |
 
 ### 15.3 术语
 
