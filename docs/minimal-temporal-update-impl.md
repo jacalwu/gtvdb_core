@@ -2,7 +2,7 @@
 
 > 2026-11-09｜针对 `gtvdb-minimal-temporal-update-design.md` 的业务补充，结合 `past-update-design.md` 与 `gtvdb_core` 当前代码事实。
 > 目标：**支持全部 5 个业务场景，且不因为实现复杂而让图遍历变慢。**
-> 状态：收敛设计 + M0 / M1 / M2 全部落地。`csr.rs` 与 GTVSeg v1 列格式从 M0 起一行未改。
+> 状态：收敛设计 + M0 / M1 / M2 / M3 全部落地。M3 按准入门禁实测裁剪（§14）。`csr.rs` 与 GTVSeg v1 列格式从 M0 起一行未改。
 
 ---
 
@@ -274,6 +274,7 @@ commit_id C  →  { GTVSeg 段清单,      nodes_C.bin,
 | **M0** | `EndpointPolicy` / `NodeLifetime` / `EndpointView` / `active_neighbors()`；7 项测试（含 250 组随机属性测试）+ release 零回归基准 | ✅ 本次完成 |
 | M1 | 位置化 retract + WAL v2 + `graph_at` 折叠；`nodes_<S>.bin` 快照文件；`gtv_invalidations()` UDTF | ✅ §12 |
 | M2 | 两阶段后台 compaction、延迟 GC、观测表落盘、L2 聚合去重、段内源点窄化 | ✅ §13 |
+| M3 | 准入门禁实测；planner 可选 `ActiveNodeBitmap`、常驻维护线程 + 滚动 retention、轻量 Tag；Parent+Diff / Branch / 列扩展按实测判定不进主干 | ✅ §14 |
 
 M0 落点：
 
@@ -466,6 +467,118 @@ M2 的六项能力**全部落在 `gtv-storage` 控制面与 `gtv-engine` SQL 面
 
 这些是**控制面与文件系统**成本，不进入 `neighbors()`。Linux CI runner（run `42558214981`，同配置）对照：publish p50 **1.75 ms**、forced **3.69 ms**、P99 depth=0 **0.185 ms** / depth=1 **0.210 ms（1.13x）** / materialized **0.172 ms（0.93x）**。同一份代码在 Windows 上的 19.5 ms 与 2.60x 主要来自 fsync 与文件系统，而非 overlay 本身的算法开销——所以跨机器只看「所有路径结果一致」与相对趋势，不看绝对毫秒数；门禁的硬断言是 `Overlay == Materialized`。
 
-### 13.8 明确不做 / 留给 M3
+### 13.8 M2 交付时的边界（已在 §14 处理）
 
-Parent+Diff Manifest、Branch/Tag、`ActiveNodeBitmap`（planner 按 `E_selected/V` 选）、常驻后台线程与自动 retention、GTVSeg 列扩展（更丰富的属性版本化）。dev 仍默认同步物化、关闭自动 GC，让每个崩溃点可复现；prod 才使用 `spawn_compaction()` + 显式 `GcPolicy::collect()`。
+M2 交付时留给 M3 的是：Parent+Diff Manifest、Branch/Tag、`ActiveNodeBitmap`（planner 按 `E_selected/V` 选）、常驻后台线程与自动 retention、GTVSeg 列扩展。M3 **没有照单全收**：评审 §7 要求「每项必须有基准证明收益，否则不进主干」，因此先做 `bench_m3_gate` 实测，再按结果裁剪，详见 §14。dev 仍默认同步物化、关闭自动 GC，让每个崩溃点可复现。
+
+---
+
+## 14. M3 落地：准入门禁决定范围，读路径仍然零回归
+
+### 14.1 为什么 M3 不等于「把 5 项做完」
+
+`asymmetric-bitemporal-review.md` §7 把 M3 定义为**按需**：「每项必须有基准证明收益，否则不进主干」；R5 判 Parent+Diff「收益未被测量，成本是确定的」，R6 判 Branch「不在 5 个业务需求里，现有线性 manifest 不支持分支」，R1 判 Bitmap 必须降级为可选加速器。
+
+所以 M3 的第一步不是写功能，而是新增 `crates/gtv-storage/examples/bench_m3_gate.rs`：用 release 实测三条曲线，输出显式 go/no-go。实测后再决定实现哪些。**结论是 2 项 GO、1 项 DEFER、1 项只做一半、1 项 NO-GO**：
+
+| 候选项 | 判定 | 依据 |
+|:--|:--|:--|
+| `ActiveNodeBitmap`（planner 可选） | ✅ GO | `E_selected/V` 实测交叉点 2–4；默认阈值 8 留 2–4x 边际 |
+| 常驻维护线程 + 滚动 retention | ✅ GO（opt-in） | 前台只需 0.5 µs 入队，prepare 2.4 ms 移到 worker |
+| Parent + Diff Manifest | ⏸ DEFER | 序列化成本到 ~5000 段才越过 2 ms 触发线；当前 <600 段 |
+| Branch / Tag | ◐ 只做 Tag | R6：线性 manifest 不能承载分支；Tag 是纯命名引用，成本极低 |
+| GTVSeg 列扩展 | ❌ NO-GO | R3：变长属性混进定宽列区会破坏 `disk == memory == cache line` |
+
+本节数值均为 **Windows 本机 release**；M2 已证实同代码在 Linux CI 上的 fsync 成本相差一个数量级（publish 1.75 ms vs 19.5 ms），所以跨机器只看趋势与硬断言，不看绝对毫秒数。
+
+### 14.2 A：`ActiveNodeBitmap` 是派生缓存，不是事实源
+
+`crates/gtv-core/src/active_bitmap.rs` 落地四条约束：
+
+- `BitmapKey = (snapshot_id, business_time, partition_id)`，**snapshot_id 必填**；复用旧快照的位图会让节点修正静默消失（设计 §19.2 / 评审 R1）。
+- `NodeLifetime` 仍是唯一事实源。`BitmapCache::invalidate()` 后 `active_at()` 自动回落到事实数组，查询结果逐条不变（§23.4）。
+- `BitmapPlanner::decide()` 三重门：全节点活跃 → `AllActive`（走 M0 的 O(1) 包围盒，连位图都不建）；`E_selected < 1024` 或 `< 8·V` → `TooSmall`；超出 `max_cache_bytes` → `OverBudget`。**单点查询永远不付 O(V)**。
+- `verify_against()` 逐节点比对事实源，供测试与显式校验使用。
+
+`EndpointView::active_neighbors()` / `csr.rs` / `segment.rs` 一行未改：位图是 planner 可选加速器，不是必选执行路径。
+
+`bench_m3_gate` A 段（V=50,000，30% 节点在 t=500 到期，t=600）：
+
+| E/V | direct µs | bitmap µs | bitmap/direct | planner |
+|:--|--:|--:|--:|:--|
+| 1 | 58.2 | 82.6 | 1.42 | TooSmall |
+| 2 | 116.5 | 119.4 | 1.02 | TooSmall |
+| 4 | 232.7 | 195.8 | 0.84 | TooSmall |
+| 8 | 467.4 | 348.4 | 0.75 | Build |
+| 16 | 1035.2 | 674.5 | 0.65 | Build |
+| 64 | 3969.0 | 2457.6 | 0.62 | Build |
+
+交叉点 run-to-run 在 2–4 之间；默认阈值 8 是刻意保守的（基准未计入缓存失效、内存占用与快照切换成本）。
+
+### 14.3 B：Parent+Diff 的收益边界被实测出来了
+
+R5 当时说「收益未被测量」。B 段补上曲线，并明确 **fsync 两边都要付，Diff 只能省掉序列化列**：
+
+| 段数 | manifest 字节 | serialize µs | parse µs | atomic-write µs | ser / 100 段 |
+|--:|--:|--:|--:|--:|--:|
+| 100 | 55,192 | 52.3 | 93.8 | 5917.6 | 1.0x |
+| 1,000 | 549,292 | 587.0 | 560.2 | 6296.3 | 11.2x |
+| 5,000 | 2,745,292 | 3869.6 | 3681.2 | 9435.3 | 74.0x |
+| 20,000 | 10,980,292 | 17250.5 | 14376.9 | 16648.2 | 329.8x |
+
+4 KB delta `write_atomic` 基线 5.5 ms（Windows fsync 主导，与段数无关），**不是** Parent+Diff 的收益。以「serialize > 2 ms ≈ 一次 M2 Linux CI publish 的量级」为触发线，实测触发点是 **~5000 段**；当前 `metadata-benchmark.md` 的典型 store 是 586 段以下。
+
+判定 **DEFER**：切 Parent+Diff 只能省 serialize，却要新增父链解析、Full Checkpoint 周期策略、checkpoint 前后一致性测试与父链中途损坏的恢复路径（R5 列的确定成本）。**触发条件写死**：当持续段数 > 5000 且每次更正都要重写 manifest 时再评估，且应优先选「Full Checkpoint + 有界增量 diff」而不是任意深度父链。
+
+### 14.4 C：常驻线程只做 prepare，不接管 store
+
+`crates/gtv-storage/src/maintenance.rs` 的关键取舍是**不给 store 套常驻锁**：
+
+```text
+前台 publish → submit(CompactionInput)  [0.5 µs 入队，有界 channel=1]
+worker       → input.prepare(head+1)    [纯 CPU：不写盘、不改 manifest、不持 store 锁]
+前台         → take_plan() → store.apply_compaction(plan)  [短 &mut 临界区，三游标校验]
+```
+
+- `apply_compaction()` 原有的 `base_head / next_segment_id / checkpoint_txn` 校验仍然拒绝 stale plan，所以 worker 与前台并发发布不会重写新数据（§8.2 位置空间失效）。
+- worker 期间持 `ReadScope`，延迟 GC 不会删掉它正在读的段。
+- `gc_policy(head)` 由 `retain_window` 生成滚动 floor；**默认 `None` + `dry_run = true`，全历史不删**，prod 才显式开 `retain_window` 与 `gc_dry_run = false`。策略生成不删任何文件，GC 仍是前台显式调用。
+- `stop()` 幂等，`Drop` 自动 join；未消费的 plan 丢弃即可，下次显式 `materialize()` 会重算。
+
+C 段实测：前台 submit **0.5 µs**、worker prepare+wait **2.4 ms**、`apply_compaction` **12.4 ms**、同步 `materialize` **13.1 ms**。所以收益是「prepare 与前台重叠」，**不是免费的 materialize**——apply 的写盘与 manifest 发布仍在前台。文档刻意不把入队耗时说成「phase-1 CPU 全部移出」，避免误读。
+
+### 14.5 D：只做 Tag，不做 Branch
+
+`Manifest.tags: BTreeMap<String, i64>`（`#[serde(default)]`，旧 manifest 直接可加载）。`create_tag / drop_tag / resolve_tag / tags()` 是**单次原子 manifest 写**，且不改 `system_ts / next_segment_id / checkpoint_txn`，因此在途 compaction plan 不会失效。
+
+- **GC 保护**：tag 指向的点加入 `points`（参与 `keep_last_n`），且 `cutoff = cutoff.min(min_tag_ts)`；`GcReport.pinned_by_tags` 让「GC 什么都没删」可解释。测试验证重开后 tag 仍在、`AS KNOWN AT 10` 与 GC 前逐条相等，`drop_tag` 后 pin 才释放。
+- **SQL**：`gtv_tags()` 复用 `gtv_invalidations()` 的同一个 manifest-root slot，是提交日志的只读投影，随原子发布立即可见，无事件总线。
+- **Branch 不做**：R6 与 `past-update-design.md` §5.1 已判定线性 manifest 不支持分支；`branch_id / sequence_number`、Branch Head、跨分支冲突解决是一整套控制面，且不在 5 个业务需求里。§13.3 要求的「基础修正与派生结果同时可见」由 `WAL/MemSegment` 暂存 + 单次原子发布满足。
+
+### 14.6 E：GTVSeg 列扩展 NO-GO
+
+GTVSeg v1 的定宽列区是 `disk == memory == cache line` 恒等式的基础。R3 已写明：变长 Property after-image 必须走 **独立 sidecar + offset 表**，不能混进列区。M3 没有引入任何 GTVSeg 列改动；更丰富的属性版本化应作为独立 sidecar 设计，触发条件是出现明确的「属性级时间旅行」查询需求，而不是为了对称双时间而扩列。
+
+### 14.7 验收与门禁
+
+| 门禁 | 结果 |
+|:--|:--|
+| 全量 `cargo test --workspace` | **487 passed / 0 failed / 1 ignored**，52 suites（M2 为 466 / 50，本轮 +21） |
+| `cargo check --workspace --all-targets` | 零 warning（rustfmt 组件未安装） |
+| 新测试 | `active_bitmap` 7 项 + `maintenance` 3 项单测；`m3_admission` 7 项（含 200 组随机 bitmap 可丢弃性）+ `m3_tags_sql` 4 项 |
+| 关键属性 | worker plan == 同步物化 == 重开；stale plan 被拒且历史不变；tag 跨重启、GC pin、旧 manifest 兼容；bitmap 丢弃后逐点一致 |
+| 读路径 | `bench_endpoint` 所有路径结果一致，行级双时间方案仍 2.19–2.46x；`csr.rs` / `endpoint.rs` / `segment.rs` diff 为空 |
+| 控制面 | `bench_correction` 硬断言 `Overlay == Materialized` 通过；`bench_m3_gate` 输出 A–E 五项判定且 `all paths agree` |
+| 生成数据 | 仅 tempdir；无新文件类型，`.gitignore` / CI guard 保持 `*.csv / *.seg / *.gtvd / *.gtvobs / nodes_c*.bin` 拦截 |
+
+### 14.8 剩余项与明确的触发条件
+
+| 未做项 | 何时才做 |
+|:--|:--|
+| Parent + Diff Manifest | 持续段数 > 5000 且 manifest 序列化 > 2 ms/次发布；优先 Full Checkpoint + 有界 diff |
+| Branch / Tag 中的 Branch | 出现「多个分析者同时持有分叉认知」的真实需求，且 L1 与 storage manifest 先统一 |
+| day-bucket 缓存 | 仅在 bitmap 缓存命中率有实测数据后；键必须仍含 `snapshot_id` |
+| GTVSeg 列扩展 / sidecar | 出现属性级时间旅行查询；变长值走 sidecar，不动定宽列区 |
+| 自动 GC 默认开启 | 不开启。dev 永远 dry-run + 全历史，prod 由运维显式给 `retain_window` |
+
+M0–M3 全程遵守同一条边界：**系统时间在 Snapshot、Valid Time 在行；新增复杂度只进控制面与 SQL 面；`neighbors()` 仍是 2 次比较、GTVSeg v1 一列不加。**
