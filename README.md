@@ -133,6 +133,8 @@ let ctx = GtvContext::with_extensions(
 |:--|:--|
 | [docs/design-review-2026-11.md](docs/design-review-2026-11.md) | **第三方评审用设计文档**：架构、存储格式、读写路径、正确性策略、已知限制、评审问题清单 |
 | [docs/cuda-acceleration-plan.md](docs/cuda-acceleration-plan.md) | CUDA 边界、C0 实测（传输/filter/点积）、常驻设计与准入门禁；探针见 `tools/cuda-probe/` |
+| [docs/aml-core-ext-enablement.md](docs/aml-core-ext-enablement.md) | **AML 就绪方案**：边界四问、10 项评审逐条裁定（含 3 处事实修正）、五项 P0 通用原语、ext 分层、CPU/CUDA 两个发行物的落地顺序 |
+| [docs/gtvdb-cpu-cuda-cursor-development-spec.md](docs/gtvdb-cpu-cuda-cursor-development-spec.md) | CPU + CUDA 双后端开发规范（Phase A–G、API 草案、测试矩阵、DoD）；执行前提见上一条 |
 | [docs/positioning.md](docs/positioning.md) | 为什么定位为 Temporal Graph Analytics Platform |
 | [docs/storage-mmap-design.md](docs/storage-mmap-design.md) | GTVSeg 格式、CPU cache 布局、P0 §8 / P1 §9 实现记录 |
 | [docs/oceanbase-storage-lessons.md](docs/oceanbase-storage-lessons.md) | OceanBase 压缩与 LSM 的可借鉴点及不适用处 |
