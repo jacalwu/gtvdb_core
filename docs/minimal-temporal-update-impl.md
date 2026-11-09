@@ -2,7 +2,7 @@
 
 > 2026-11-09｜针对 `gtvdb-minimal-temporal-update-design.md` 的业务补充，结合 `past-update-design.md` 与 `gtvdb_core` 当前代码事实。
 > 目标：**支持全部 5 个业务场景，且不因为实现复杂而让图遍历变慢。**
-> 状态：收敛设计 + 可验证的 M0 原型（`crates/gtv-core/src/endpoint.rs`）。M1/M2 未实现。
+> 状态：收敛设计 + M0 / M1 / M2 全部落地。`csr.rs` 与 GTVSeg v1 列格式从 M0 起一行未改。
 
 ---
 
@@ -272,8 +272,8 @@ commit_id C  →  { GTVSeg 段清单,      nodes_C.bin,
 | 阶段 | 内容 | 状态 |
 |:--|:--|:--:|
 | **M0** | `EndpointPolicy` / `NodeLifetime` / `EndpointView` / `active_neighbors()`；7 项测试（含 250 组随机属性测试）+ release 零回归基准 | ✅ 本次完成 |
-| M1 | 位置化 retract + WAL v2 + `graph_at` 折叠；`nodes_<S>.bin` 快照文件；`gtv_invalidations()` UDTF | 未做（沿用 `past-update-design.md` U0–U1） |
-| M2 | compaction 重写 retract 集、延迟 GC、快照化观测表落盘 | 未做 |
+| M1 | 位置化 retract + WAL v2 + `graph_at` 折叠；`nodes_<S>.bin` 快照文件；`gtv_invalidations()` UDTF | ✅ §12 |
+| M2 | 两阶段后台 compaction、延迟 GC、观测表落盘、L2 聚合去重、段内源点窄化 | ✅ §13 |
 
 M0 落点：
 
@@ -378,8 +378,94 @@ WAL 头保留 v1 兼容（`WAL_VERSION_V1` 仍可读）；manifest 的 `deltas` 
 | 读路径基准 | `bench_endpoint` 所有路径结果一致；行级双时间方案仍为 2.0–2.6x。`csr.rs` 未改，包装开销在本机噪声区间 1.13–1.26x（M0 静默环境实测 1.00–1.06x），非代码回归 |
 | CI | `Kernel + temporal graph tests` 新增 M1 两步；`full-tests` 已覆盖 |
 
-### 12.7 明确不做 / 留给 M2
+### 12.7 M1 当时的边界
 
-后台 compaction 与延迟 GC、观测表落盘、段内节点区间窄化、L2 `range_agg()` / `active_edge_count()`、`BitemporalStore` 持久化、Parent+Diff Manifest、Branch、ActiveNodeBitmap。当前 `materialize()` 是同步、显式调用、关闭自动 GC 的开发模式，便于复现每个崩溃点。
+M1 交付时 `materialize()` 是同步、显式调用、关闭自动 GC 的开发模式，便于复现每个崩溃点；后台 compaction、延迟 GC、观测表落盘、段内区间窄化、L2 聚合与 `BitemporalStore` 持久化均留给 M2（已在 §13 落地）。Parent+Diff Manifest、Branch、ActiveNodeBitmap 继续留给 M3。
 
-另一个语义边界：GTVSeg v1 只存 `src / dst / valid_from / valid_to / edge_type` 五列，因此 after-image 唯一能变更的属性是 `edge_type`（重分类）。端点 `(src, dst)` 在更正中不可变；更丰富的属性版本化属于 M2 的列扩展，而不是给每行加系统时间。
+另一个语义边界：GTVSeg v1 只存 `src / dst / valid_from / valid_to / edge_type` 五列，因此 after-image 唯一能变更的属性是 `edge_type`（重分类）。端点 `(src, dst)` 在更正中不可变；更丰富的属性版本化属于 M3 的列扩展，而不是给每行加系统时间。
+
+---
+
+## 13. M2 落地：控制面完备，读路径仍然零回归
+
+> 对应 `asymmetric-bitemporal-review.md` §7 的 M2 行、§8 的七类风险，以及 §6 的两类门禁。
+
+### 13.1 边界与落点
+
+M2 的六项能力**全部落在 `gtv-storage` 控制面与 `gtv-engine` SQL 面**；`crates/gtv-core/src/csr.rs`、`neighbors()` 热循环、GTVSeg v1 的五列格式从 M0 起一行未改。
+
+| 文件 | 作用 |
+|:--|:--|
+| `gtv-storage/src/observation.rs`（新） | 观测版本的 Arrow IPC 编解码、`ObservationEntry`、按 system 轴选版本 |
+| `gtv-storage/src/aggregate.rs`（新） | `LogicalEdge` / `EdgeInterval` / `AggregateView` / `RangeBucket`；区间合并去重 |
+| `gtv-storage/src/gc.rs`（新） | `GcPolicy` / `GcReport` / `ReadScope` / 安全 unlink |
+| `gtv-storage/src/store.rs` | 两阶段 compaction、GC、观测发布、聚合 API、`live_rows_from()` 重构与源点窄化 |
+| `gtv-engine/src/aggregate.rs`（新） | `gtv_active_edge_count()` / `gtv_range_agg()` 两个 UDTF |
+| `gtv-engine/src/context.rs` | 注册 UDTF；`register_segment_store()` 作为观测重放与聚合视图的单一同步点 |
+| `gtv-storage/examples/bench_correction.rs`（新） | 控制面回归门禁 |
+| `tests/m2_control_plane.rs` / `tests/m2_aggregate_sql.rs`（新） | 10 项集成验收 |
+
+### 13.2 两阶段后台 compaction（§8.2 位置空间失效）
+
+`live_rows_at()` 被重构为「取一个 `ReadScope` 票据 → 校验历史下限 → 调用自由函数 `live_rows_from()`」。该函数接受一个纯借用的 `LiveRowsView`（root / node_count / manifest / 已解码 deltas / 未 flush 记录），因此**同步查询零拷贝**，而 worker 只需 clone 一次 `CompactionInput` 就能调用**同一个**折叠函数——不存在第二套「可见」定义。
+
+- **prepare**：`spawn_compaction()` 把 owned input 移进 `std::thread::spawn`，worker 在后台完成 CSR 构造与 GTVSeg 编码，产出 `CompactionPlan`（含已编码段字节、行数、三个 base 游标）。**不写任何文件、不改 manifest**，崩溃/取消零磁盘副作用，也不用给 store 加锁。
+- **apply**：`apply_compaction()` 是短临界区，先校验 `system_ts / next_segment_id / checkpoint_txn` 与 prepare 时完全一致，否则直接报 `stale compaction plan`——这正是 §8.2「悬空位置必须报错」的实现；随后写段文件、原子发布 manifest、退休旧段与 Delta。
+- 同步 `materialize_at()` 也走 prepare→apply 两阶段，所以 dev 的强制物化与 prod 的 worker 路径不会分叉。
+
+### 13.3 延迟 GC（§8.3 旧快照依赖）
+
+- `GcPolicy::default()` = `retain_from: None` + `dry_run: true`，默认**永不回收**。要真删必须显式给 `retain_from`。
+- `keep_last_n` 保护最近 N 个已发布快照点；`cutoff = min(retain_from, 倒数第 N 个点)`。
+- `manifest.gc_floor` 记录已回收下限；`live_rows_at()` / `graph_at()` / `node_lifetime_at()` 对 `t < gc_floor` **明确报错**，不静默返回一个不同的图。
+- 保留规则不只是「无段引用」：节点寿命快照与每个观测表都要保留 `system_ts <= cutoff` 的**最新一份**，否则 `node_lifetime_at(t)` / `as_of(..., t)` 会退化到更早的错误版本（§8.3）。
+- **publish-before-unlink**：先原子写新 manifest 移除所有引用，再删文件；崩溃只留下未被引用的孤儿，下一次 GC 会连同 `.seg / .gtvd / .bin / .gtvobs` 一起清掉。
+- `ReadScope` 是共享原子计数：版本查询、聚合视图与 worker 持有票据，`gc()` 发现 `active_readers > 0` 直接拒绝，避免删掉正在 mmap 的文件。
+
+### 13.4 观测表落盘（评审 R3 的实活）
+
+`BitemporalStore` 的语义不用改，缺的是持久化：每个 `(table, system_ts)` 版本写成一个自带 schema 的 Arrow IPC 文件，由 `ObservationEntry` 登记进 **同一份 manifest**，因此图更正与观测修正共享一个原子发布点。`load_observations_into()` 用既有 `record()` 幂等重放，`register_segment_store()` 是显式同步点，`as_of('cpi', 50, 25)` 跨进程重启后仍可用。
+
+一个容易漏的细节：观测版本没有 WAL 帧，所以 commit 游标必须写进 manifest（`next_commit_id`）并在 `open()` 时与 WAL 尾、checkpoint、Delta 的 commit_id 取 max，否则重启后会重复分配 `commit_id`，破坏 `gtv_invalidations(cursor)` 的单调性。
+
+### 13.5 L2 聚合去重（§8.6 去重复口径）
+
+区间更正把一条逻辑边切成 `[A,start) / [start,end) / [end,B)`，直接 `sum(edge_count)` 会数成 3 条。`AggregateView::from_rows()` 在同步时按 `(src,dst,edge_type)` 排序并合并相邻/重叠的半开区间一次；此后：
+
+- `active_edge_count(t)` 因区间互不重叠，一次过滤天然就是 distinct；
+- `range_agg(t1,t2,bucket)` 每个桶再用 `HashSet<LogicalEdge>` 去重，一条逻辑边有多个不相连寿命也只算 1；
+- SQL 面为 `gtv_active_edge_count(t [, system_t])` 与 `gtv_range_agg(t1,t2,bucket [, system_t])`。可选的 `system_t` 是**守卫**：视图只覆盖一个快照，请求另一个会 plan error，而不是返回陈旧值。
+
+`SegmentStore::active_edge_count_at()` 另外返回 L2 段级 `Skip / FullHit / Scan` 判定（O(1) 每段、不打开段文件）。但**计数仍复用唯一折叠入口**：FullHit 段里可能有被 retract 的行，直接 `edge_count` 相加会双计——正确性优先于那个 O(1) 求和。
+
+### 13.6 段内源点窄化
+
+`live_rows_from()` 用紧 `src_id_min/max` 把 `for s in 0..node_count` 收窄到 `[lo, hi)`，行号从 `offsets[lo]` 起算，保证位置化 `(segment_id, row)` 与未窄化扫描**完全一致**；旧 manifest 缺该字段时 `lo = 0` 保守全扫。测试用「所有边都在 src=5」的段验证 retract 仍然精确命中中间那一行。
+
+### 13.7 验收与门禁
+
+| 门禁 | 结果 |
+|:--|:--|
+| 全量 `cargo test --workspace` | **466 passed / 0 failed / 1 ignored**，50 suites（M1 为 448，本轮 +18） |
+| `cargo check --workspace --all-targets` | 零 warning（rustfmt 组件未安装） |
+| 新集成测试 | `m2_control_plane` 7 项 + `m2_aggregate_sql` 3 项；三个新模块单测 8 项 |
+| 关键属性 | worker compaction == 同步 == 重开；stale plan 被拒且数据不损；GC 前后 head 逐条相等、旧历史明确报错；孤儿清理；reader guard；区间切分聚合不双计；观测版本跨重启可 `as_of` |
+| 读路径基准 | `bench_endpoint` 所有路径结果一致，行级双时间方案仍 2.18–2.42x；`csr.rs` diff 为空 |
+| 生成数据 | 仅 tempdir；`.gitignore` 与 CI guard 新增 `*.gtvobs`，tracked 生成数据为 0 |
+| CI | `Kernel + temporal graph tests` 新增 M2 测试与 release `bench_correction` 两步 |
+
+`bench_correction`（release，本机 Windows，N=512 / E=4,000 / 20 次发布 / 80 次查询）：
+
+| 指标 | 实测 |
+|:--|:--|
+| 单次更正发布 | p50 **19.5 ms**（≈50 ops/s，Windows fsync 主导） |
+| 强制物化（含一次 O(E) 折叠） | **48.4 ms** |
+| 版本查询 P99，depth=0 | **1.10 ms** |
+| 版本查询 P99，depth=1 | **2.85 ms（2.60x）** |
+| 版本查询 P99，已物化 | **1.70 ms（1.55x）** |
+
+这些是**控制面与文件系统**成本，不进入 `neighbors()`；depth=1 的 2.6x 是 K=1 overlay 的查询代价，也成为「K 不宜放宽、Materialize 要及时」的实测依据。数值受本机 fsync 与后台负载影响，跨机器不可直接比较，门禁的硬断言是 `Overlay == Materialized` 与所有路径结果一致。
+
+### 13.8 明确不做 / 留给 M3
+
+Parent+Diff Manifest、Branch/Tag、`ActiveNodeBitmap`（planner 按 `E_selected/V` 选）、常驻后台线程与自动 retention、GTVSeg 列扩展（更丰富的属性版本化）。dev 仍默认同步物化、关闭自动 GC，让每个崩溃点可复现；prod 才使用 `spawn_compaction()` + 显式 `GcPolicy::collect()`。
