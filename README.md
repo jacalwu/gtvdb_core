@@ -130,6 +130,7 @@ let ctx = GtvContext::with_extensions(
 
 | 文档 | 内容 |
 |:--|:--|
+| [docs/design-review-2026-11.md](docs/design-review-2026-11.md) | **第三方评审用设计文档**：架构、存储格式、读写路径、正确性策略、已知限制、评审问题清单 |
 | [docs/positioning.md](docs/positioning.md) | 为什么定位为 Temporal Graph Analytics Platform |
 | [docs/storage-mmap-design.md](docs/storage-mmap-design.md) | GTVSeg 格式、CPU cache 布局、P0 §8 / P1 §9 实现记录 |
 | [docs/oceanbase-storage-lessons.md](docs/oceanbase-storage-lessons.md) | OceanBase 压缩与 LSM 的可借鉴点及不适用处 |
