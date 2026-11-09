@@ -17,6 +17,7 @@
 //!   gtv_extensions()                  crypto/q: token signing, q parser
 //! ```
 
+pub mod accelerator;
 pub mod aggregate;
 pub mod ann;
 pub mod asof;
