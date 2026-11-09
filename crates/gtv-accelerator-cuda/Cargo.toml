@@ -1,0 +1,16 @@
+[package]
+name = "gtv-accelerator-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No new dependencies: the CUDA driver is loaded at runtime through
+# `libloading`-style calls to the OS (`LoadLibraryW` / `dlopen`), so building
+# this crate needs no CUDA toolkit, no `nvcc`, and no `-lcuda`.
+# `libc` is already in the workspace lock file via other crates.
+[dependencies]
+gtv-accelerator = { path = "../gtv-accelerator" }
+gtv-core = { path = "../gtv-core" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
