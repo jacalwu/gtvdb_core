@@ -13,6 +13,8 @@
 1. **GPU 在本项目的唯一可行形态是「设备常驻」，不是「每次查询传一次」。** 实测：1e7 边的图（153 MiB）单向上传 **13.3 ms**，而 CPU 全量 valid-time 扫描只要 **6.9 ms**。冷路径上 GPU 一定输，且 96% 的时间花在传输上。
 2. **因此 C0 的交付物不是 kernel，而是「驻留句柄 + 失效路径 + 容量预算」。** 没有这一层，后面每个 kernel 的加速比都会被传输吃掉。
 3. **评审给出的优先级我大部分接受，但有两处要下调**：批量 k-hop（P4）在 Q1 当前规模（N=32–128）上不成立；Compaction prepare（P7）在数据未常驻时同样不成立。两处都加了量化门禁，而不是直接排进里程碑。
+4. **容量比带宽更早成为墙，而容量可以靠"少传"买回来。** 8 GiB 卡上 budget 是 4.8 GiB；五列 23 B/edge 只装 224M 边，只传漫步要用的拓扑（5 B/edge）装 **1.03B 边**，上载同时快约 5×（§9.5，实测）。这一步不需要 kernel，已完成。
+5. **"超过显存就溢出到主机内存"在图上不自动成立。** 传一条边的 5 B（0.625 ns）与 CPU 扫一条边（0.69 ns）同价，而图漫步不像 LLM 的权重那样天然被复用；分层的全部前提是"搬过去的字节会被 reread"。所以 slab 换入换出排在 kernel 之后，并配一个 spill guard 决定何时降级（§9.6）。
 
 ---
 
@@ -491,6 +493,89 @@ GTVSeg mmap → Vec<LiveRow>(686 MiB) → Vec<EdgeRecord>(AoS) → TemporalCSR(S
 
 ---
 
+### 9.5 垂直分层：只把漫步要读的列放进显存（已实现）
+
+§9.2 和 §9.3 一直在问"怎么把 23 B/edge 传得更快"。这一节换问题：**为什么要传这 23 B**。
+
+23 B/edge 里 16 B 是 `valid_from` + `valid_to`，2 B 是 `edge_type`。一次图漫步（沿 `offsets` 取区间、读 `dst` 继续走）**一个字节都不读这三列**。列存数据库早就在做这件事（投影下推），GPU 侧只是把它从"扫描时少读"变成"根本不传"。
+
+#### 实现
+
+- `ColumnSet`：五个列名的位集合，带 `TOPOLOGY`（offsets+dst）、`TEMPORAL`、`LABELS`、`ALL` 四个命名组合，以及 `bytes(nodes, edges, layout)` ——**字节模型的唯一出处**，`SnapshotView::bytes`、容量判断、bench 三处都调它。
+- `SnapshotView::with_columns(set)`：投影是**算子的属性**，不是图的属性。投影里没有的列，`validate` 不要求数组存在——调用方不必为了传拓扑去借一份它故意留下的时间列。
+- `validate`：拓扑不是"某一列"，而是"这份拷贝是什么"。缺 `offsets`/`dst` 直接拒绝，因为 `edge_count` 从 `dst` 读，缺了就会把一份 offsets 价成 0 条边。
+- 缓存键变成 `(snapshot_id, ColumnSet)`。这一条是正确性，不是性能：只按 snapshot 做键，一次拓扑请求会命中一份没有时间列的拷贝，然后越界读——错答案，不是 miss。`ResidentGraph` 因此多了 `columns()` 与 `check_columns(required)`，读 `valid_from` 的算子会拿到"这份拷贝只有 offsets+dst"的错误，而不是一个越界指针。
+- `GraphLoadMetrics` 加 `projection` 与 `deferred_bytes`：**留着没传的部分要被记账**，否则"省了"和"还没传"分不清。`priced_bytes == uploaded_bytes` 这条 ratchet 保留，投影改变等式两边，不改变等式。
+- `Caps::admit(needed)`：上载前先问预算。`cuMemAlloc` 传到一半失败只给一个驱动码和一片碎片化的池子；预检给的是"23 B/edge × 1.2e9 装不进 4.8 GiB"——这句话才是查询规划器需要的（`Fallback::Cpu`，永远不是查询失败）。
+- `DeviceGraph.columns` 从 `Vec<u64>` 变成 `Vec<(Column, u64)>`：少传两列之后，指针表按下标推断列身份就不再成立了，kernel 必须按名字取。
+
+#### 实测（RTX 4060 Laptop 8 GiB，budget 4.8 GiB，1e7 边，out-degree 4，各自稳定值）
+
+`cargo run --release -p gtv-accelerator-cuda --example bench_residency -- 10000000 topology`
+
+| 列 | 列数 | 字节 | 留在主机 | B/edge | 上载 | 带宽 | 装得下的边 |
+|:--|--:|--:|--:|--:|--:|--:|--:|
+| 全部五列 | 5 | 230 000 004 | 0 | 23.00 | 29.2–31.1 ms | 7.5–8.1 GB/s | 224M |
+| 去掉 label | 4 | 210 000 004 | 20 000 000 | 21.00 | 25.4–26.4 ms | 8.1–8.5 GB/s | 245M |
+| 只有拓扑 | 2 | 50 000 004 | 180 000 000 | 5.00 | **5.9–6.4 ms** | 8.0–8.8 GB/s | **1.03B** |
+
+三次带宽都落在 7.5–8.8 GB/s 的同一档（差别在噪声内）：**省下的时间是省下的字节，不是传输效率变好了**。4.6× 的容量、约 5× 的上载，代价是零——这三列本来就躺在调用方的内存里。
+
+#### 代价，说清楚
+
+- 投影不是免费的午餐：`temporal` 单独占全量的 **69.6%**，反过来看就是"时间过滤拿不到任何投影收益"。一个既漫步又按 `t` 过滤的算子要么用全量拷贝，要么先投影走拓扑、再为时间列付第二次 16 B/edge。
+- 两份拷贝可以同时驻留（`(snapshot, projection)` 键），代价是 5 + 23 = 28 B/edge，比一份多 5 B/edge。只有两类算子都反复跑时才划算；只跑一类时，冷的那份会被 LRU 换出去，这是对的默认。
+
+---
+
+### 9.6 水平分层：数据大于显存时怎么办（设计，未实现）
+
+第二问是"超过 8 GB 之后还能不能留在 GPU 路径上"。参考 [Strata](https://github.com/Niko1221/Strata)（llama.cpp 分支的推理引擎：模型大于显存时，权重留在 mmap 文件/页缓存里，VRAM 只放当前层的热切片，CPU lane 兜底，并有 spill guard 监控是否真的在溢出）。它的做法能搬，但**先要有一个可以换入换出的单位**——今天这个单位是"整张快照"，而"整张快照放不下"正是问题本身。
+
+#### 一一对应的那几层
+
+| Strata（LLM） | 这里（时序图） | 现状 |
+|:--|:--|:--|
+| 权重 mmap 文件 + 页缓存 | `GTVSeg` 的 mmap 段（已经是 mmap） | 有 |
+| 主机侧 pinned staging | 段 → 主机 pinned slab 池 | pinned 已测（§9.3）：端到端慢 9%，**不做**，除非后面有异步流配合 |
+| VRAM 里"当前层的切片" | 按 `node_range` 切的列 slab | **缺** |
+| 层间预取（算第 k 层时拉第 k+1 层） | hop k 算完前把 hop k+1 的 frontier slab 入队 | **缺**（也缺 kernel） |
+| 量化（int4 权重） | `dst` u32、时间列 delta-u32、`edge_type` u8 | 部分（`dst` 已能 u32；时间列要在写段时窄化，§9.3 测过 10.3 ms/1e7） |
+| spill guard：溢出就换 lane | `Caps::admit` + 命中率/每 hop 时间在线判断，预测不划算就整条降级 CPU | 预检已有；在线判断**缺** |
+
+#### 一条冷水算术：PCIe 与 CPU 扫描同价
+
+本机实测的两条独立数字：
+
+- CPU 扫一边 `valid_time_filter`：1e7 边 6.86 ms → **0.69 ns/edge**。
+- PCIe：8.0 GB/s。拓扑投影 5 B/edge → 1e7 边 50 MB → **6.25 ms**。
+
+**传一条边的 5 B，和 CPU 扫一条边，是同一个数量级，而且 PCIe 略贵。** 这不奇怪：8 GB/s ÷ 5 B = 1.6e9 edge/s，CPU 是 1.45e9 edge/s。所以"数据放不下就搬到 GPU"这个思路在图上不成立——除非搬过去的字节**被复用**。Strata 之所以成立，是因为一层权重在生成几百个 token 时被反复读；图漫步里对应的是"同一批节点在多个 hop / 多次查询里被重复访问"。这就是分层的全部前提，也是 spill guard 要测的东西。
+
+#### 8 GiB 的实际墙在哪
+
+budget 是显存的 60%（4.8 GiB），剩下 3.2 GiB 给驱动、上下文、kernel 工作区和结果缓冲——不是保守，是 §3.1 量出来的：
+
+| 每边成本 | 形成方式 | 4.8 GiB 装得下 |
+|:--|:--|--:|
+| 23 B | 现状（u32 dst + 两个 i64 + u16） | 224M 边 |
+| 9 B | 写段时窄化（u32 dst + u32 delta×2 + u8） | 573M 边 |
+| 5 B | 拓扑投影 | 1.03B 边 |
+| 1 B | 只放 `dst`，`offsets` 按需从主机取 | 5.1B 边 |
+
+也就是说：**10 亿边以内，投影就够了，不需要分层**；10 亿边以上才需要 slab。这个顺序很重要——先做便宜的（投影，已完成），再谈复杂的（slab + 预取），因为 slab 化只能把"装不下"变成"换入换出"，而换入换出的价格刚刚算过：和 CPU 扫描同价。
+
+#### 要做的话，顺序是
+
+1. **P1 slab 化**：`ResidentSlab { snapshot, columns, node_range }`，键三元组，复用现有 `Lru`（它本来就是泛型的，`Arc` 就是 pin）。`load_slab` 只传 `offsets[node_range]` 覆盖的边区间——段内 CSR 已经是按 src 排好的，切一个节点区间是一段连续字节，不需要重排。
+2. **P2 两流预取**：hop k 的 kernel 在 stream A 上跑，hop k+1 的 slab 在 stream B 上 `cuMemcpyHtoDAsync`（驱动已接好这个入口），用 event 而不是 `cuCtxSynchronize` 做交接。§9.3 已经证明 pinned 单独用是亏的（fill 14.1 ms > DMA 省下的 11.4 ms），但**配合异步重叠**才有意义：被隐藏的是整个 hop 的延迟，不是一次拷贝。
+3. **P3 spill guard**：每个 slab 记 `(命中率, 每 hop 时间)`，与 CPU 的 `0.69 ns/edge` 比。预测不划算就整条查询降级——`ExecutionPolicy` 已经有 `OverBudget` / `AfterError` 两条通道，只缺"预测"这一路。
+4. **P4 窄化**：把时间列在**写段时**写成 u32 delta（写路径一次，读路径永远是 9 B/edge），这是 2.5× 容量，且和 slab 正交。
+
+前三条都要 kernel 才测得准（没有 kernel，slab 只是"更小的上载"）。**所以 §9.5 是现在能做的全部，§9.6 是 C2 之后的第一件事。**
+
+---
+
 ## 10. 风险
 
 | 风险 | 影响 | 缓解 |
@@ -521,6 +606,8 @@ C1 之后的阶段测量不需要 toolkit，只需驱动：
 cargo run --release -p gtv-accelerator-cuda --example bench_residency -- 10000000 narrow
 # pageable vs pinned 端到端 A/B
 cargo run --release -p gtv-accelerator-cuda --example bench_residency -- 10000000 pinned
+# 投影：五列 / 去 label / 只有拓扑，三种拷贝的字节、时间、容量
+cargo run --release -p gtv-accelerator-cuda --example bench_residency -- 10000000 topology
 # A–D 全链路：真实 SegmentStore → graph_at → view → upload
 cargo run --release -p gtv-engine --example bench_graph_load -- 10000000
 cargo run --release -p gtv-engine --example bench_graph_load --features cuda -- 10000000
@@ -565,7 +652,7 @@ cargo run --release -p gtv-engine --example bench_graph_load --features cuda -- 
 | §4 `DeviceUploadView` 构造必须 O(1) | **已是现状，并加了断言** | `SnapshotView::from_csr` 借用 `csr.columns()`；`bench_graph_load` 断言 < 1000 µs（实测 0.1–0.3 µs） |
 | §5 pinned 池 / 端到端 A/B | **A/B 已做，否决** | §9.3：pinned 纯拷贝快 59%，但 `fill` 14.10 ms 抵掉 DMA 收益，端到端 **慢 9%** |
 | §6 多 stream 并行上传 | **暂不做** | 评审自己给的保留意见（共享 PCIe）就是理由；且 `cuMemcpyHtoD` 在本机已跑满 7.5–8.0 GB/s，没有可重叠的空隙。等有 kernel 能与上载重叠时再测 |
-| §7 按算子上传最少列 | **接受，推迟到 C2** | 结构上已就绪（逐列独立分配），但 1e7 边里 `valid_from`/`valid_to` 占 69.6%，只传拓扑列会把 30.5 ms 降到 8 ms——前提仍是有 kernel 在用 |
+| §7 按算子上传最少列 | **已实现（§9.5）** | 不再"推迟到 C2"：投影是上载路径的决定，不是 kernel 的决定。`ColumnSet` + `(snapshot, projection)` 缓存键 + `Caps::admit` 预检。实测 1e7 边：29–31 → **5.9–6.4 ms**，容量 224M → **1.03B 边（4.6×）** |
 | §8 段级增量设备缓存 | **接受其顺序建议** | 与本文一致："先整图常驻与精确计时，再按更新频率决定"。本次测量把这一条的门槛量化了：materialize 修不好时，增量上载省下的 30 ms 毫无意义 |
 | §9 时间列 i64 → u32 delta、edge_type u16 → u8 | **接受，优先级上调** | 152 MiB → 76 MiB，按实测带宽折 **10.3 ms**，是 `dst` 窄化（5.07 ms）的两倍。仍须"写入段时窄化"，查询前转换是 §9.2 已经证伪的做法 |
 | §10 不要优先 Unified Memory / zero-copy | **接受** | 与 §6.4 一致，未纳入路线 |

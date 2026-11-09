@@ -788,6 +788,7 @@ E. Phase A 实施顺序
 | 2026-11-10 | 本次 | D（`dst` 宽度） | 577 | 7 实机通过 | 双宽度独立进程：u64 冷 45.9 ms / 稳态 34.8 ms（break-even 7.3 / 5.9 次），u32 冷 40.4 ms / 稳态 30.9 ms（6.4 / 4.9 次） | 22 B/edge 成立，但**只能由上游提供窄列**：上载时转换实测 9.5–11.2 ms 换 5.7 ms 传输，第一版实现因此删除。`ResidentGraph::dst_layout()` 是 kernel 必须读的宽度凭据 |
 
 | 2026-11-10 | 本次 | F（列式 materialize） | 592 | 8 实机通过 | `graph_at` 1e7 边：旧实现 1 508–1 579 ms → **393 ms**（3 个存活段，k 路归并）/ **176 ms**（压实后单段，原样拷贝）；行路径 oracle 同步 1 455 ms。探针拆解：只读 102 ms、+写列 175 ms、完整归并 390 ms，**选择器约 215 ms**（3 条 run 在 src 上交错，分支预测必错） | 不再经 AoS：段内 CSR 已按 `(src, valid_from, valid_to, dst)` 有序，flush 时付过的排序不再付第二次。`tests/graph_at_columnar.rs` 用行路径逐列比对并直接断言排序不变量（9 项）。端到端盈亏 255 → 69 次（未压实）/ 34 次（压实）；压实后已贴住本机拷贝上限（同 260 MiB 的 `fs::read` 78 ms） |
+| 2026-11-10 | 本次 | G（列投影 + 预算预检） | 604 | 10 实机通过 | `bench_residency … topology`：1e7 边窄列 23.00 B/edge / 29–31 ms → 拓扑投影 **5.00 B/edge / 5.9–6.4 ms**，三次带宽都在 7.5–8.8 GB/s 同一档（省下的是字节，不是效率）；4.8 GiB budget 的容量 224M → **1.03B 边（4.6×）**；去掉 label 一档 21.00 B/edge / 25–26 ms | `ColumnSet` 位集合承载投影，`(snapshot_id, projection)` 是缓存键（少这一半就是错答案而不是 miss），`ResidentGraph::check_columns` 让读 `valid_from` 的算子拿到具名错误，`Caps::admit` 在第一次 `cuMemAlloc` 之前用 `OutOfBudget`（`Fallback::Cpu`）拒绝装不下的拷贝。`tests/columns.rs` 11 项 + 设备侧 2 项 |
 **与规范的三处偏离，都有理由：**
 
 1. **没有 `EndpointMask`。** 草案里 `valid_time_filter(…, policy: EndpointMask)` 需要"节点在 t 是否存活"，而 v1 视图只有出边，判断 `DST` 侧存活要转置图。C1 的签名是 `valid_time_filter(&ResidentGraph, t) -> Sel`；端点策略推迟到确实需要它的那一步（C4），届时视图要加节点寿命列，而不是在签名里先放一个算不出来的参数。

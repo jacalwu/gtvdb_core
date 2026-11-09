@@ -163,7 +163,7 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 | M7 增量 frontier | 🧊 冻结 | 与 AML / CRM / LE 无关；仅 quantum state 有真实分支集需求时再评估 |
 | M8 crates.io、M9 pyo3、M10 canonical demo、M12 dylib loader | 🗑 主线下架 | 出现真实嵌入用户后按需；对速度零贡献，且会继续扩大接口面积 |
 | 任何新的非图算子 UDTF / 领域功能 | ⛔ 本轮禁止 | 领域一律进 `gtvdb_ext`；核心只保留注册接口 |
-| CUDA 加速（C2 起） | 🧊 C1 已交付；C2 待做（materialize 已解锁） | [`docs/cuda-acceleration-plan.md`](docs/cuda-acceleration-plan.md) §9.4：`graph_at` 已改成列式归并，1e7 边从 **1 579 ms** 降到 **393 ms**（3 个段，归并）/ **176 ms**（压实后单段，原样拷贝），与行路径逐列相等由 `tests/graph_at_columnar.rs` 守着。剩余成本分两块：未压实时是归并选择（约 215 ms）——压下去靠 compaction，不靠更快的归并；压实后已经贴住本机拷贝上限（同样 260 MiB 的 `fs::read` 是 78 ms）。端到端盈亏 **255 → 34–69 次/快照** |
+| CUDA 加速（C2 起） | 🧊 C1 已交付；C2 待做（materialize 已解锁） | [`docs/cuda-acceleration-plan.md`](docs/cuda-acceleration-plan.md) §9.4：`graph_at` 已改成列式归并，1e7 边从 **1 579 ms** 降到 **393 ms**（3 个段，归并）/ **176 ms**（压实后单段，原样拷贝），与行路径逐列相等由 `tests/graph_at_columnar.rs` 守着。剩余成本分两块：未压实时是归并选择（约 215 ms）——压下去靠 compaction，不靠更快的归并；压实后已经贴住本机拷贝上限（同样 260 MiB 的 `fs::read` 是 78 ms）。端到端盈亏 **255 → 34–69 次/快照**。§9.5 起**只把漫步要读的列放进显存**：拓扑投影 5 B/edge，1e7 边上载 29–31 → **5.9–6.4 ms**，4.8 GiB budget 的容量 224M → **1.03B 边**（4.6×）；超出显存后的 slab/预取/spill guard 设计见 §9.6，排在 kernel 之后 |
 
 **门禁索引**：触发条件与 go/no-go 结论以 [`docs/perf-first-roadmap-review.md`](docs/perf-first-roadmap-review.md) 为准；CI 已有「M6 batch graph operator」（step 17，逐条 parity）、「M6 admission gate」（step 18，目标查询延迟 + 段粒度）与「P1-4 motif SQL」（step 19，9 项 parity + Q1 准入基准）三道门禁，generated-data guard 与 core-boundary 保持不变。§3.2 的工程/文档欠账**不占里程碑**；§3.3 已被业主批准纳入 P1-4 并交付。
 
