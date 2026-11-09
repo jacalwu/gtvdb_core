@@ -8,9 +8,11 @@
 //! transfer costs more than the kernel it feeds (a 1e7-edge snapshot is 30 ms of
 //! PCIe against a 0.556 ms filter kernel), so until a snapshot stays resident,
 //! any kernel timing is a measurement of PCIe. Measured since: the transfer is
-//! 97% of the *load* but 2.5% of the *cold path*, because materialising the CSR
-//! costs 1.6 s. Both numbers are in `docs/cuda-acceleration-plan.md` §9.3, and
-//! [`GraphLoadMetrics`] is how a caller tells them apart.
+//! 97% of the *load* but was 2.5% of the *cold path*, because materialising the
+//! CSR used to cost 1.6 s; after §9.4 of `docs/cuda-acceleration-plan.md` it
+//! costs 176–393 ms, so the upload is 9–19% of the cold path and the rest is the
+//! copy that `graph_at`'s owned return type forces. [`GraphLoadMetrics`] is how
+//! a caller tells those two apart instead of guessing.
 //!
 //! So C1 delivers the part that every later stage depends on:
 //!

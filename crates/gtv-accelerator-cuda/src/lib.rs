@@ -14,14 +14,18 @@
 //! measured before residency exists measures PCIe, not arithmetic.
 //!
 //! The upload, though, is not the expensive part of going to the device. The CSR
-//! it consumes costs ~1.6 s to materialise at 1e7 edges (`SegmentStore::graph_at`
-//! walks the segments into `Vec<LiveRow>`, then into `Vec<EdgeRecord>`, then
-//! folds that into columns), so the end-to-end cold path is 1.6 s against the
-//! CPU's 6.86 ms — and 98% of it happens before this crate is called. See §9.3
-//! of `docs/cuda-acceleration-plan.md`. That is why the order is: measure, make
-//! materialisation cheap, and only then write kernels against a copy that is
-//! already resident — residency amortises the upload over 5 queries, but nothing
-//! amortises a rebuild that happens on every query.
+//! it consumes used to cost ~1.6 s to materialise at 1e7 edges (`graph_at` walked
+//! the segments into `Vec<LiveRow>`, then into `Vec<EdgeRecord>`, then folded that
+//! into columns), which put the cold path 236x above the CPU's 6.86 ms — 98% of
+//! it before this crate was ever called.
+//!
+//! That has since been fixed at the storage layer (§9.4): `graph_at` merges the
+//! segments' own sorted columns instead of rebuilding them, so the same snapshot
+//! costs 393 ms while uncompacted and 176 ms once compacted into one segment.
+//! The upload below (41 ms) is now 9–19% of the cold path rather than 2.5%. The
+//! order still holds — measure, make materialisation cheap, then write kernels
+//! against a copy that is already resident — because residency amortises a 41 ms
+//! upload over five queries, but nothing amortises a rebuild on every query.
 //!
 //! # The load receipt
 //!
