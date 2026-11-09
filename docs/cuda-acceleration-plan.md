@@ -363,6 +363,89 @@ C1 刻意**不**注册任何算子（`Caps::supports` 全 false），因此 `Exe
 
 还有一条比算术更硬的约束，顺手算出来写在这里，因为它决定 C2/C4 的 kernel 形状：**回传格式**。filter 的结果若以"边 id 列表"回到主机，30% 选择率下是 3e6 × 8 B = 24 MB，按 C0 实测的 D2H 10.2 GB/s 需要 **2.35 ms**，而 kernel 本身只跑 0.556 ms——省下的 6.30 ms 被吃掉一大半，break-even 反而升到 **7.8 次**，比不收窄还差。换成位图回传（1e7 bit = 1.25 MB）只要 **0.12 ms**，并且 `Sel::from_bitmap` 能直接接住，不用转稠密。所以 device 算子的输出必须是位图或仍驻留的句柄，不能是稠密 id 列表；这条比 block 开多大重要得多。
 
+### 9.3 阶段实测：瓶颈不在 H2D，在 materialize
+
+§9.1/§9.2 报的都是"上载要多久"。评审追问的是另一件事：**上载在整条冷路径里到底占多少**。这次把它拆成四段，每段单独计时。
+
+命令：`bench_residency 10000000 wide|narrow`（阶段表）、`bench_graph_load 10000000`（materialize）；RTX 4060 Laptop，2026-11-10。
+
+#### 上载内部：97% 是 PCIe，没有隐性复制
+
+`GraphLoadMetrics` 逐列记账，1e7 边窄列（`bench_residency 10000000 narrow`）：
+
+| 阶段 | 字节 | ms | 占比 | 带宽 |
+|:--|--:|--:|--:|--:|
+| offsets | 10 000 004 | 1.30 | 4.4% | 7.68 GB/s |
+| dst (u32) | 40 000 000 | 5.07 | 17.1% | 7.89 GB/s |
+| valid_from | 80 000 000 | 10.23 | 34.5% | 7.82 GB/s |
+| valid_to | 80 000 000 | 10.24 | 34.5% | 7.81 GB/s |
+| edge_type | 20 000 000 | 2.84 | 9.6% | 7.03 GB/s |
+| host pack / transform / staging | **0** | **0.00** | 0% | — |
+| device sync | — | 0.088 | — | — |
+| 上载合计 | 230 000 004 | 29.68 | | 7.75 GB/s |
+| 设备分配 | — | 0.71 | | |
+| 整次 load | 230 000 004 | 30.49 | 97.3% 是 PCIe | |
+
+宽列（`dst` u64）同构，1e7 边 33.84 ms / 7.98 GB/s，各行带宽 7.5–8.1 GB/s 一致——没有哪一列异常，**没有 AoS 中间态、没有逐边转换、没有 staging 缓冲**。这三项在结构里是字段而不是"不存在"，所以只要有人加进来，`is_copy_free()` 立刻变 false，`the_upload_reports_where_its_milliseconds_went` 立刻红。这是对评审"检查是否存在隐性多次复制"的回答：**上载路径里没有，一条都没有**。
+
+顺带确认 `cuMemcpyHtoD` 确实是同步的：之后显式 `cuCtxSynchronize` 只花 0.088 ms，说明逐列数字是传输时间而不是排队时间。
+
+#### pinned 端到端 A/B：**9% 更慢**，否决
+
+评审说 pinned 只快 12%，C0 说快 58%（12.0 vs 7.6 GB/s）。两边都对了一半——差在测的是哪一段。端到端 A/B（219.3 MiB，五列各一块 pinned，缓冲复用）：
+
+| 路径 | 第 1 次 | 第 3 次 | 稳态带宽 |
+|:--|--:|--:|--:|
+| pageable `cuMemcpyHtoD` | 40.53 ms | **30.64 ms** | 7.51 GB/s |
+| pinned `fill`（主机搬进固定页） | 14.10 | 14.10 | 16.31 |
+| pinned `cuMemcpyHtoDAsync` | 19.03 | 19.25 | **11.95** |
+| pinned 合计 `fill + copy` | 33.13 | **33.35 ms** | 6.90 GB/s |
+
+纯拷贝 pinned 是 **11.95 GB/s，比 pageable 快 59%**——C0 的 12.0 是这一段，没错。但 pinned 必须先 `fill`：14.10 ms 的主机拷贝 > 11.4 ms 的 DMA 收益，**净亏 2.7 ms**。评审的判断对，理由也对（"如果 B 的总时间包含 CPU staging copy，可能并不优于 A"），只是快慢比例不是 12%。
+
+另有一条只在本机出现的成本：五列 pinned 一次性分配要 **33.44 ms**，等于一整次上载。所以 pinned 池不是"免费加速"，它的回本周期要单独算；在 `fill` 仍存在的前提下，任何周期都回不了本。
+
+结论：**上载保持 pageable**。唯一能让 pinned 成立的做法是让生产方直接把 CSR 列建在固定页里（评审的方案 C），省掉 `fill`：那会得到 19.25 ms（−11.4 ms，break-even 4.8 → 3.4 次），代价是每快照 219 MiB 不可换出内存。记账上不划算，等下面 materialize 的问题解决后再复议。
+
+#### 上载之前：materialize 是上载的 51 倍
+
+`graph_at(T)` 的实测（真实 `SegmentStore`，磁盘上的 GTVSeg，1e7 边）：
+
+| 规模 | `live_rows_at` | `graph_at` 合计 | ns/edge | LiveRow 峰值 |
+|:--|--:|--:|--:|--:|
+| 1e6 | 40.05 ms | 88.92 ms | 88.9 | 68 MiB |
+| 2e6 | 79.16 | 174.70 | 87.3 | 137 MiB |
+| 4e6 | 165.24 | 375.45 | 93.9 | 274 MiB |
+| **1e7** | **497.83** | **1 579.06** | **157.9** | **686 MiB** |
+
+1e7 与 4e6 之间斜率变大，因为 1e7 边被 `ingest` 自动切成 10 个段，版本遍历要跨段。冷/暖几乎一样（1570 vs 1579 ms），所以**这不是缺页，是重算**。
+
+拆开看，1e7 的 1579 ms 里：
+- **498 ms** `live_rows_at`：扫段 + 版本折叠，产出一个 `Vec<LiveRow>`；
+- **1081 ms** 其余：`Vec<EdgeRecord>`（AoS，686 MiB）再折成五列 SoA（257 MiB）。
+
+也就是说，评审担心的那条链 **确实存在，只是在 materialize 里，不在上载里**：
+
+```
+GTVSeg mmap → Vec<LiveRow>(686 MiB) → Vec<EdgeRecord>(AoS) → TemporalCSR(SoA, 257 MiB) → 各列直传
+                                └─ 1081 ms，2.7× 内存放大 ─┘
+```
+
+于是 1e7 边的冷路径是 **1 579 + 41 = 1 620 ms**，其中上载占 **2.5%**。对照 CPU 路径的 6.86 ms 全扫：
+
+| | CPU 每查询 | GPU 冷路径 | GPU 稳态（kernel 0.556 ms） |
+|:--|--:|--:|--:|
+| 1e7 边 | 6.86 ms | **1 620 ms（236×）** | 0.556 ms |
+
+**上载内盈亏 4.8 次是上载内部的账；端到端盈亏是 255 次。** 两个都对，把前者当结论就错了——这是本次测量推翻的第三个数（前两个是 26 B/edge 和 pinned 12 GB/s）。
+
+#### 对 C2 的影响：先修 materialize，再写 kernel
+
+1. **C2 的门禁从"能上载"改成"能常驻且不被重建"。** 设备路径的前提是同一 `snapshot_id` 的 CSR 被构造一次、`Arc` 住、复用到底（`GtvContext::register_neighbors` 已经是这个形状）。若每次查询都 `graph_at`，GPU 永远不可能赢。
+2. **`graph_at` 的 AoS 往返必须消掉，这是存储层的事。** 逐列从段里读出来直接追加进 SoA，省掉 686 MiB 中间态和 1081 ms 折叠；上限是把 1579 压到接近 `live_rows_at` 的 500 ms，但**这是待测的，不是承诺**。它同时也让 CPU 侧的 pattern/khop 变快，所以不依赖 CUDA 也值得做。
+3. **`snapshot_materialize_ns` 留在 `GraphLoadMetrics` 里，由调用方填。** 后端无法知道自己输入的构造耗时；留 `None` 是"没测"，填 0 是撒谎。
+4. **时间列窄化（评审 §9）现在的优先级高于 `dst` 窄化。** 1e7 边里两列时间占 **69.6%** 的线（152 MiB），按实测 7.75 GB/s 折算是 **10.3 ms**，而 `dst` 收窄只省 5.07 ms。但注意：这只在 materialize 修好之后才有意义——现在省 10 ms 和亏 1500 ms 是同一句话里的两个数。
+
 ---
 
 ## 10. 风险
@@ -388,7 +471,19 @@ nvcc -O3 --use_fast_math -Xcompiler "/O2 /arch:AVX2" -arch=sm_89 -o probe.exe pr
 
 Windows 上若 `cl.exe` 不在 PATH，先 `vcvars64.bat`，或给 `nvcc` 传 `-ccbin <MSVC bin dir>` 并设置 `INCLUDE` / `LIB`。
 
-三类数字都要落在报表里：**传输 / kernel-only / 端到端**，缺任何一项的结论不接受。
+C1 之后的阶段测量不需要 toolkit，只需驱动：
+
+```bash
+# 上载内部：逐列阶段表（wide / narrow / stage）
+cargo run --release -p gtv-accelerator-cuda --example bench_residency -- 10000000 narrow
+# pageable vs pinned 端到端 A/B
+cargo run --release -p gtv-accelerator-cuda --example bench_residency -- 10000000 pinned
+# A–D 全链路：真实 SegmentStore → graph_at → view → upload
+cargo run --release -p gtv-engine --example bench_graph_load -- 10000000
+cargo run --release -p gtv-engine --example bench_graph_load --features cuda -- 10000000
+```
+
+三类数字都要落在报表里：**传输 / kernel-only / 端到端**，缺任何一项的结论不接受。第四条从本次起加进去：**materialize**——端到端里不含它，报出来的永远是"传输占 97%"，而那个 97% 只对整条路径的 2.5% 成立。
 
 ---
 
@@ -411,6 +506,26 @@ Windows 上若 `cl.exe` 不在 PATH，先 `vcvars64.bat`，或给 `nvcc` 传 `-c
 | §4 Rust host + CUDA C++ | **接受，补落地方式** | §7：`xtask` 预编译 PTX + `cudarc` 加载，避免默认构建依赖 toolkit；CUB 可用，但不进 NVRTC |
 | §5 C0–C6 路线图 | **接受，调整为 C0–C7** | §9：C1 由「设备抽象」细化为「常驻句柄 + 失效路径」，并把 compaction 拆到 C7 |
 | §6 十条准入规则 | **接受，补四条** | §8 第 11–14 条：失效测试、显存预算、回传字节数、CPU-only 对照 |
+
+### 第二轮评审（12 条：阶段计时 / 缓存键 / SoA / pinned / 增量）
+
+| 评审条目 | 结论 | 落在哪 |
+|:--|:--|:--|
+| §1 给 `load_graph` 加 `GraphLoadMetrics`，测 A–G 七段 | **接受并已执行** | `gtv-accelerator/src/metrics.rs` 的 `GraphLoadMetrics`（逐列 + 九类字节计数）；`bench_residency` 打阶段表；`bench_graph_load` 打 A–D。**结论与评审的猜测一致：H2D 不是最大单项**（§9.3） |
+| §1 检查隐性多次复制 | **接受，已证伪上载侧、证实 materialize 侧** | 上载侧 `host_pack_ns`/`layout_transform_ns`/`staging_bytes` 三项结构上为 0 并有测试守护；materialize 侧确有 AoS 往返，1081 ms / 686 MiB（§9.3） |
+| §1 "SoA → AoS → SoA 是危险实现" | **接受，正是 `graph_at` 的实现** | `store.rs:1503`：`live_rows_at` → `Vec<EdgeRecord>` → `to_csr`。列为 C2 前置项 |
+| §2 不按 `business_t` 重传 | **已是现状** | `ResidentGraph` 只绑 `snapshot_id`（§4.1）；`residency.rs` 有测试断言 `business_t` 不入键 |
+| §2 `ActiveEdgeKey(snapshot, t, endpoint_mask)` | **部分接受** | `Sel` 已携带 `snapshot_id` 并跨快照报 `SnapshotMismatch`；`endpoint_mask` 待 C4（C1 视图只有出边） |
+| §3 GPU 侧保持 SoA，不要 `DeviceEdge` | **已是现状** | 全仓无 AoS 设备结构；`load_graph` 五列逐列 `alloc` + `memcpy` |
+| §4 `DeviceUploadView` 构造必须 O(1) | **已是现状，并加了断言** | `SnapshotView::from_csr` 借用 `csr.columns()`；`bench_graph_load` 断言 < 1000 µs（实测 0.1–0.3 µs） |
+| §5 pinned 池 / 端到端 A/B | **A/B 已做，否决** | §9.3：pinned 纯拷贝快 59%，但 `fill` 14.10 ms 抵掉 DMA 收益，端到端 **慢 9%** |
+| §6 多 stream 并行上传 | **暂不做** | 评审自己给的保留意见（共享 PCIe）就是理由；且 `cuMemcpyHtoD` 在本机已跑满 7.5–8.0 GB/s，没有可重叠的空隙。等有 kernel 能与上载重叠时再测 |
+| §7 按算子上传最少列 | **接受，推迟到 C2** | 结构上已就绪（逐列独立分配），但 1e7 边里 `valid_from`/`valid_to` 占 69.6%，只传拓扑列会把 30.5 ms 降到 8 ms——前提仍是有 kernel 在用 |
+| §8 段级增量设备缓存 | **接受其顺序建议** | 与本文一致："先整图常驻与精确计时，再按更新频率决定"。本次测量把这一条的门槛量化了：materialize 修不好时，增量上载省下的 30 ms 毫无意义 |
+| §9 时间列 i64 → u32 delta、edge_type u16 → u8 | **接受，优先级上调** | 152 MiB → 76 MiB，按实测带宽折 **10.3 ms**，是 `dst` 窄化（5.07 ms）的两倍。仍须"写入段时窄化"，查询前转换是 §9.2 已经证伪的做法 |
+| §10 不要优先 Unified Memory / zero-copy | **接受** | 与 §6.4 一致，未纳入路线 |
+| §11 P0–P4 实施顺序 | **接受，插入一条 P0.5** | 顺序改为：P0 测量 → **P0.5 修 materialize（AoS 往返）** → P1 消除查询级重复 → P2 重叠 → P3 减字节 → P4 增量 |
+| §12 阶段 C1 Profiling 的硬断言 | **大部分已落地** | 同快照不重传、`business_t` 不触发重传、快照变更失效、CUDA 失败回落 CPU 均有测试；"不得按 edge_count 分配 Vec"由 `from_csr` 的 O(1) 借用 + 断言保证 |
 
 ### 评审未提、但本文新增的一条
 

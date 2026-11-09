@@ -784,6 +784,7 @@ E. Phase A 实施顺序
 | 2026-11-10 | `7220bfd` `942e844` | A（CPU reference + 抽象） | 571 | N/A | 无回归（未改查询路径） | `Accelerator` / `SnapshotView` / `CpuAccelerator` / `ExecutionPolicy` / `AcceleratorRegistry` 落地；CPU 实现直接复用 `FlatIndex` 与 `gtv-array::window`，所以"参考实现"就是既有 kernel 本身 |
 | 2026-11-10 | `7220bfd` | B（空后端 + 能力发现） | 571 | 4（无 GPU 时全部跳过） | `accel_state`：默认 `feature_disabled`、`--features cuda` 下 `device_ready` 且四算子均 `unsupported` | 驱动运行期加载（`LoadLibraryW` / `dlopen`），**无链接期 CUDA 依赖、无 build.rs、无 nvcc**；`FeatureDisabled` / `DeviceUnavailable` / `Unsupported` 三种原因可分辨，无 panic |
 | 2026-11-10 | `7220bfd` | C（驻留 + 预算 + 失效） | 571 | 6 实机通过（RTX 4060 Laptop） | 1e7 边 257.5 MiB：冷 46.3 ms / 暖 35.7 ms（5.6–7.6 GB/s）；break-even 7.6 次 | 同快照命中 1 次上载；`business_t` 不入键；快照变更/显式失效不返回旧结果；驱逐跳过 pinned 且查询照常回答；延迟释放不悬空；2 MiB 显存粒度已实测记录 |
+| 2026-11-10 | 本次 | E（阶段计时 + pinned A/B） | 583 | 8 实机通过 | `GraphLoadMetrics` 逐列：1e7 边窄列上载 29.68 ms / 7.75 GB/s，**97.3% 是 PCIe**；pack/transform/staging 三项恒 0。pinned 端到端 33.35 ms vs pageable 30.64 ms（慢 9%）。`graph_at` 1e7 边 **1 579 ms**，占冷路径 98% | 隐性复制在 materialize 而不在上载：`live_rows_at` 498 ms + `Vec<EdgeRecord>`（686 MiB AoS）折成 SoA 1 081 ms。端到端盈亏 **255 次**，上载内盈亏 4.8 次；C2 之前必须先修 `graph_at` |
 | 2026-11-10 | 本次 | D（`dst` 宽度） | 577 | 7 实机通过 | 双宽度独立进程：u64 冷 45.9 ms / 稳态 34.8 ms（break-even 7.3 / 5.9 次），u32 冷 40.4 ms / 稳态 30.9 ms（6.4 / 4.9 次） | 22 B/edge 成立，但**只能由上游提供窄列**：上载时转换实测 9.5–11.2 ms 换 5.7 ms 传输，第一版实现因此删除。`ResidentGraph::dst_layout()` 是 kernel 必须读的宽度凭据 |
 
 **与规范的三处偏离，都有理由：**
