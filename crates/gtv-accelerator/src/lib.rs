@@ -4,11 +4,13 @@
 //! # Scope (C1)
 //!
 //! This crate is the *contract*: one trait, one cache, one policy, one error
-//! type. It contains no kernel. That ordering is deliberate and measured — the
-//! C0 probe put a 153 MiB pinned upload at 12 GB/s, so a transfer costs more
-//! than the kernel it feeds; break-even for the valid-time filter was 2.1
-//! invocations, and its cold path spent 96% of its time moving bytes. Until a
-//! snapshot stays resident, any kernel timing is a measurement of PCIe.
+//! type. It contains no kernel. That ordering is deliberate and measured: a
+//! transfer costs more than the kernel it feeds (a 1e7-edge snapshot is 30 ms of
+//! PCIe against a 0.556 ms filter kernel), so until a snapshot stays resident,
+//! any kernel timing is a measurement of PCIe. Measured since: the transfer is
+//! 97% of the *load* but 2.5% of the *cold path*, because materialising the CSR
+//! costs 1.6 s. Both numbers are in `docs/cuda-acceleration-plan.md` §9.3, and
+//! [`GraphLoadMetrics`] is how a caller tells them apart.
 //!
 //! So C1 delivers the part that every later stage depends on:
 //!
@@ -76,7 +78,7 @@ pub use api::{
 };
 pub use cpu::{live_at, CpuAccelerator};
 pub use error::{AcceleratorError, Fallback};
-pub use metrics::{AcceleratorMetrics, OpRecord};
+pub use metrics::{AcceleratorMetrics, Column, ColumnLoad, GraphLoadMetrics, OpRecord};
 pub use policy::{BackendDecision, DecisionInputs, DecisionReason, ExecutionPolicy};
 pub use registry::AcceleratorRegistry;
 pub use resident::{CacheStats, Resident, ResidentCache, VectorCache};

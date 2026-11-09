@@ -78,6 +78,11 @@ type FnMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> CuResult;
 type FnMemFree = unsafe extern "C" fn(u64) -> CuResult;
 type FnMemcpyHtoD = unsafe extern "C" fn(u64, *const std::ffi::c_void, usize) -> CuResult;
 type FnMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CuResult;
+type FnCtxSynchronize = unsafe extern "C" fn() -> CuResult;
+type FnMemHostAlloc = unsafe extern "C" fn(*mut *mut std::ffi::c_void, usize, u32) -> CuResult;
+type FnMemFreeHost = unsafe extern "C" fn(*mut std::ffi::c_void) -> CuResult;
+type FnMemcpyHtoDAsync =
+    unsafe extern "C" fn(u64, *const std::ffi::c_void, usize, *mut std::ffi::c_void) -> CuResult;
 type FnErrorString = unsafe extern "C" fn(CuResult, *mut *const std::ffi::c_char) -> CuResult;
 
 struct Fns {
@@ -94,6 +99,10 @@ struct Fns {
     mem_free: FnMemFree,
     memcpy_htod: FnMemcpyHtoD,
     mem_get_info: FnMemGetInfo,
+    ctx_synchronize: FnCtxSynchronize,
+    mem_host_alloc: FnMemHostAlloc,
+    mem_free_host: FnMemFreeHost,
+    memcpy_htod_async: FnMemcpyHtoDAsync,
     error_string: Option<FnErrorString>,
 }
 
@@ -260,6 +269,74 @@ impl Driver {
         }
     }
 
+    /// Allocate a page-locked host buffer.
+    ///
+    /// Pinned memory is what lets an H2D copy be a DMA instead of a staged
+    /// bounce through a driver-internal buffer, at the cost of a host copy into
+    /// it and of pages the OS can never swap. Whether that trade wins is a
+    /// measurement, not an assumption: see `examples/bench_residency.rs`, which
+    /// prices `fill + async copy` against the pageable `cuMemcpyHtoD` rather
+    /// than comparing the copy calls alone.
+    ///
+    /// Takes `&'static self` because the buffer outlives the call and has to be
+    /// able to free itself; every driver handle in this crate comes from
+    /// [`driver`], which is a process-wide `OnceLock`.
+    pub fn host_alloc(&'static self, bytes: usize) -> Result<PinnedBuffer, String> {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        // Flags 0 = default (pinned, not portable, not write-combined). Portable
+        // only matters across contexts and write-combined trades read speed for
+        // a much slower CPU write, which is the wrong side of this trade.
+        let rc = unsafe { (self.fns.mem_host_alloc)(&mut ptr, bytes, 0) };
+        if rc != CUDA_SUCCESS || ptr.is_null() {
+            return Err(self.error(&format!("cuMemHostAlloc({bytes})"), rc));
+        }
+        Ok(PinnedBuffer {
+            ptr,
+            len: bytes,
+            driver: self,
+        })
+    }
+
+    /// Host-to-device copy from page-locked memory. Completion is signalled
+    /// through the context, so the caller must [`Driver::sync`] before reading
+    /// anything that depends on it.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be a live device allocation of at least `len` bytes and `buf`
+    /// must be pinned memory of at least `len` bytes from [`Driver::host_alloc`].
+    pub unsafe fn copy_htod_async(&self, dst: u64, buf: &PinnedBuffer) -> Result<(), String> {
+        if buf.len == 0 {
+            return Ok(());
+        }
+        // The NULL stream is the legacy default stream: it orders against the
+        // context's synchronising calls, which `cuCtxSynchronize` waits on.
+        let rc = (self.fns.memcpy_htod_async)(
+            dst,
+            buf.ptr as *const std::ffi::c_void,
+            buf.len,
+            std::ptr::null_mut(),
+        );
+        if rc != CUDA_SUCCESS {
+            return Err(self.error(&format!("cuMemcpyHtoDAsync({})", buf.len), rc));
+        }
+        Ok(())
+    }
+
+    /// Block until every prior call on this context has completed.
+    ///
+    /// `cuMemcpyHtoD` already blocks, so in the current path this measures
+    /// nothing — which is exactly the point: it is the control that proves the
+    /// per-column timings are transfer time and not queued work. If a copy is
+    /// ever made asynchronous, this is where its unaccounted remainder appears.
+    pub fn sync(&self) -> Result<(), String> {
+        let rc = unsafe { (self.fns.ctx_synchronize)() };
+        if rc != CUDA_SUCCESS {
+            return Err(self.error("cuCtxSynchronize", rc));
+        }
+        Ok(())
+    }
+
     /// # Safety
     ///
     /// `dst` must be a device pointer from [`Driver::alloc`] with at least
@@ -291,6 +368,60 @@ impl Driver {
         format!("{what}: {detail}")
     }
 }
+
+/// A page-locked host buffer owned by the driver.
+///
+/// Held by value so the freeing cannot be forgotten, and never handed out as a
+/// bare pointer: the only ways to touch its bytes are [`PinnedBuffer::fill`] and
+/// [`Driver::copy_htod_async`], both of which bound-check against `len`.
+pub struct PinnedBuffer {
+    ptr: *mut std::ffi::c_void,
+    len: usize,
+    driver: &'static Driver,
+}
+
+impl PinnedBuffer {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Stage `len` bytes into the pinned buffer.
+    ///
+    /// This is the cost an asynchronous upload pays instead of the driver's
+    /// hidden bounce copy — the reason a pinned path has to be measured
+    /// end-to-end and not by timing `cuMemcpyHtoDAsync` alone.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be readable for `len` bytes, and `len` must be at most
+    /// [`PinnedBuffer::len`].
+    pub unsafe fn fill(&mut self, src: *const u8, len: usize) -> Result<(), String> {
+        if len > self.len {
+            return Err(format!("fill {len} into a {} byte buffer", self.len));
+        }
+        std::ptr::copy_nonoverlapping(src, self.ptr as *mut u8, len);
+        Ok(())
+    }
+}
+
+impl Drop for PinnedBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                (self.driver.fns.mem_free_host)(self.ptr);
+            }
+        }
+        self.ptr = std::ptr::null_mut();
+    }
+}
+
+// SAFETY: the buffer owns its allocation for its own lifetime and is not shared
+// between threads by anything in this module.
+unsafe impl Send for PinnedBuffer {}
 
 impl Fns {
     fn load(lib: &Library) -> Result<Fns, String> {
@@ -328,6 +459,11 @@ impl Fns {
                 .ok_or_else(|| "driver is missing cuMemcpyHtoD".to_string())?,
             mem_get_info: optional(lib, &["cuMemGetInfo_v2", "cuMemGetInfo"])
                 .ok_or_else(|| "driver is missing cuMemGetInfo".to_string())?,
+            ctx_synchronize: need(lib, "cuCtxSynchronize")?,
+            mem_host_alloc: need(lib, "cuMemHostAlloc")?,
+            mem_free_host: need(lib, "cuMemFreeHost")?,
+            memcpy_htod_async: optional(lib, &["cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync"])
+                .ok_or_else(|| "driver is missing cuMemcpyHtoDAsync".to_string())?,
             error_string: optional(lib, &["cuGetErrorString"]),
         })
     }

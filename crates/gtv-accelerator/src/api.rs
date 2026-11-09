@@ -17,6 +17,7 @@
 use gtv_core::{CsrColumns, Metric, Sel, TemporalCSR, VectorHit};
 
 use crate::error::AcceleratorError;
+use crate::metrics::GraphLoadMetrics;
 
 /// Identifies one immutable version of the whole database.
 ///
@@ -591,6 +592,17 @@ pub trait Accelerator: Send + Sync {
     /// Drop a resident copy. Called by the cache on eviction, invalidation and
     /// drop; idempotent for unknown tokens.
     fn release_graph(&self, _handle: &ResidentGraph) {}
+
+    /// What this backend's last [`Accelerator::load_graph`] cost, stage by
+    /// stage.
+    ///
+    /// Out of band rather than in the return value: `load_graph` answers "is it
+    /// resident", and every caller that does not care about timing should not
+    /// have to destructure a second field to find out. `None` means the backend
+    /// did not upload anything (CPU) or did not measure.
+    fn last_load_metrics(&self) -> Option<GraphLoadMetrics> {
+        None
+    }
 
     fn load_vectors(&self, _view: VectorView<'_>) -> Result<Option<ResidentVectors>, AcceleratorError> {
         Ok(None)

@@ -12,8 +12,8 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use gtv_accelerator::{
-    Accelerator, CpuAccelerator, DecisionInputs, DstLayout, ExecutionPolicy, Op, ResidentCache,
-    SnapshotView,
+    Accelerator, Column, CpuAccelerator, DecisionInputs, DstLayout, ExecutionPolicy, Op,
+    ResidentCache, SnapshotView,
 };
 use gtv_accelerator_cuda::CudaAccelerator;
 
@@ -193,7 +193,8 @@ fn a_prebuilt_u32_column_costs_four_bytes_less_per_edge() {
 }
 
 #[test]
-fn releasing_twice_and_releasing_a_stranger_are_no_ops() {    let _serial = exclusive();
+fn releasing_twice_and_releasing_a_stranger_are_no_ops() {
+    let _serial = exclusive();
     let acc = device_or_skip!();
     let (o, dst, vf, vt, et) = chain(64);
     let h = acc.load_graph(view(1, 64, &o, &dst, &vf, &vt, &et)).unwrap().unwrap();
@@ -204,6 +205,77 @@ fn releasing_twice_and_releasing_a_stranger_are_no_ops() {    let _serial = excl
     let forged = gtv_accelerator::ResidentGraph::new(u64::MAX, 1, 64, 63, 1234);
     acc.release_graph(&forged);
     assert_eq!(acc.resident_bytes(), 0);
+}
+
+/// The stage receipt: every millisecond of an upload has to belong to a named
+/// stage, and the stages that are supposed to be zero have to *be* zero.
+///
+/// This is the test that answers "is the bottleneck the copy or the work around
+/// it" without a profiler, and the one that goes red the day someone adds an
+/// AoS re-pack, a u64->u32 conversion or a staging buffer — each of which would
+/// otherwise hide inside "upload time".
+#[test]
+fn the_upload_reports_where_its_milliseconds_went() {
+    let _serial = exclusive();
+    let acc = device_or_skip!();
+    assert!(
+        acc.last_load_metrics().is_none(),
+        "a backend that has not uploaded has nothing to report"
+    );
+
+    let (o, dst, vf, vt, et) = chain(200_000);
+    let dst32: Vec<u32> = dst.iter().map(|&d| d as u32).collect();
+    let v = view(1, 200_000, &o, &dst, &vf, &vt, &et).with_dst32(&dst32);
+    let h = acc.load_graph(v).unwrap().expect("device does residency");
+    let m = acc.last_load_metrics().expect("a load leaves a receipt");
+
+    assert_eq!(m.snapshot_id, 1);
+    assert_eq!(m.edges, v.edge_count());
+    assert_eq!(m.dst_layout, DstLayout::U32);
+    assert_eq!(m.priced_bytes, v.bytes());
+    // The budget charges what the device actually holds.
+    assert!(m.accounting_holds());
+    // Nothing on the host touched the columns.
+    assert!(m.is_copy_free(), "{m:?}");
+    assert_eq!(m.staging_bytes, 0);
+    assert_eq!(m.input_bytes, m.uploaded_bytes, "bytes added or dropped");
+    assert_eq!(m.column(Column::Dst).bytes, v.edge_count() * 4);
+    let sum: usize = m.columns.iter().map(|c| c.bytes).sum();
+    assert_eq!(sum, h.bytes(), "a column is missing from the receipt");
+
+    // The stages bracket the upload and are inside the total.
+    assert!(m.upload_ns() > 0);
+    assert!(m.upload_ns() <= m.total_ns, "{} > {}", m.upload_ns(), m.total_ns);
+    assert!(m.device_alloc_ns <= m.total_ns);
+    // `cuMemcpyHtoD` is synchronous, so an explicit synchronise afterwards must
+    // be nearly free. If it ever is not, the per-column numbers stopped being
+    // transfer time and every conclusion drawn from them is wrong.
+    assert!(
+        m.device_sync_ns * 10 < m.upload_ns(),
+        "sync {} ns vs upload {} ns: the copies are not blocking",
+        m.device_sync_ns,
+        m.upload_ns()
+    );
+
+    eprintln!(
+        "load: {} edges, total {:.2} ms = upload {:.2} ms ({:.1}% of it) + alloc {:.2} ms + sync {:.3} ms",
+        m.edges,
+        m.total_ns as f64 / 1e6,
+        m.upload_ns() as f64 / 1e6,
+        m.upload_share() * 100.0,
+        m.device_alloc_ns as f64 / 1e6,
+        m.device_sync_ns as f64 / 1e6
+    );
+    eprintln!(
+        "      {:.1} B/edge at {:.2} GB/s",
+        m.uploaded_bytes_per_edge(),
+        m.upload_gbps()
+    );
+
+    // Releasing leaves the receipt alone; it describes an upload, not a
+    // resident copy, and the benchmark reads it after dropping the handle.
+    acc.release_graph(&h);
+    assert!(acc.last_load_metrics().is_some());
 }
 
 #[test]

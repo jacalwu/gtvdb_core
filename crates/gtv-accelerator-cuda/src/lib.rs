@@ -9,13 +9,28 @@
 //! work to the CPU.
 //!
 //! That is not an unfinished C1; it is C1. Measured on this machine: pageable
-//! H2D runs at 7.3–7.9 GB/s, so one upload of a 1e7-edge snapshot costs 40–46 ms
-//! against a 6.9 ms CPU scan of the same graph — the cold path loses by 6×, and
-//! residency needs 4.9–5.9 queries on one snapshot to break even. A kernel
-//! measured before residency exists measures PCIe, not arithmetic. So the order
-//! is: prove the device can hold a snapshot and give it back — including under
-//! eviction, a snapshot change, and a driver that is not there — then write
-//! kernels against a copy that is already resident.
+//! H2D runs at 7.5–8.0 GB/s and is 97% of the load, so one upload of a 1e7-edge
+//! snapshot costs 30–41 ms against a 6.9 ms CPU scan of the same graph. A kernel
+//! measured before residency exists measures PCIe, not arithmetic.
+//!
+//! The upload, though, is not the expensive part of going to the device. The CSR
+//! it consumes costs ~1.6 s to materialise at 1e7 edges (`SegmentStore::graph_at`
+//! walks the segments into `Vec<LiveRow>`, then into `Vec<EdgeRecord>`, then
+//! folds that into columns), so the end-to-end cold path is 1.6 s against the
+//! CPU's 6.86 ms — and 98% of it happens before this crate is called. See §9.3
+//! of `docs/cuda-acceleration-plan.md`. That is why the order is: measure, make
+//! materialisation cheap, and only then write kernels against a copy that is
+//! already resident — residency amortises the upload over 5 queries, but nothing
+//! amortises a rebuild that happens on every query.
+//!
+//! # The load receipt
+//!
+//! Every upload records [`gtv_accelerator::GraphLoadMetrics`]: per column bytes,
+//! allocation and copy time, plus the stages that are supposed to cost nothing
+//! (host pack, layout transform, staging). The zero-cost stages are fields rather
+//! than absences so that a regression is a number rather than a mystery, and
+//! `tests/device.rs` asserts them. A loader that reports only "upload took 31 ms"
+//! cannot tell a PCIe bottleneck from a re-pack, and will optimise the wrong one.
 //!
 //! # Why `Caps` advertises nothing
 //!
@@ -36,9 +51,11 @@ pub mod driver;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use gtv_accelerator::{
-    Accelerator, AcceleratorError, BackendKind, Caps, ResidentGraph, SnapshotView,
+    Accelerator, AcceleratorError, BackendKind, Caps, Column, GraphLoadMetrics, ResidentGraph,
+    SnapshotView,
 };
 
 use driver::{Context, DeviceInfo, Driver};
@@ -64,6 +81,10 @@ pub struct CudaAccelerator {
     context: Context,
     budget: usize,
     graphs: Mutex<HashMap<u64, DeviceGraph>>,
+    /// Receipt for the most recent upload, kept so a benchmark can read the
+    /// stage breakdown after the fact instead of being handed a second return
+    /// value it does not want.
+    last_load: Mutex<Option<GraphLoadMetrics>>,
 }
 
 impl CudaAccelerator {
@@ -107,6 +128,7 @@ impl CudaAccelerator {
             context,
             budget,
             graphs: Mutex::new(HashMap::new()),
+            last_load: Mutex::new(None),
         })
     }
 
@@ -170,12 +192,26 @@ impl CudaAccelerator {
         v
     }
 
+    /// The stage breakdown of the last upload on this backend.
+    ///
+    /// `None` before the first upload. Cleared on a failed upload so a caller
+    /// cannot read the previous snapshot's numbers and believe them.
+    pub fn last_load_metrics(&self) -> Option<GraphLoadMetrics> {
+        self.last_load.lock().ok().and_then(|m| m.clone())
+    }
+
     fn backend_error(&self, op: &'static str, reason: String) -> AcceleratorError {
         AcceleratorError::Backend {
             backend: "cuda",
             op,
             code: -1,
             message: reason,
+        }
+    }
+
+    fn forget_metrics(&self) {
+        if let Ok(mut slot) = self.last_load.lock() {
+            *slot = None;
         }
     }
 
@@ -220,11 +256,26 @@ impl Accelerator for CudaAccelerator {
     }
 
     fn load_graph(&self, view: SnapshotView<'_>) -> Result<Option<ResidentGraph>, AcceleratorError> {
+        let started = Instant::now();
         view.validate()?;
         let bytes = view.bytes();
+        let mut m = GraphLoadMetrics::new(
+            view.snapshot_id,
+            view.node_count,
+            view.edge_count(),
+            view.dst_layout(),
+        );
+        m.priced_bytes = bytes;
+        // A failed upload must not leave the previous snapshot's receipt in
+        // place: a caller reading `last_load_metrics` would attribute one
+        // snapshot's cost to another.
+        self.forget_metrics();
+
+        let t = Instant::now();
         self.driver
             .bind(self.context)
             .map_err(|reason| self.backend_error("cuCtxSetCurrent", reason))?;
+        m.bind_ns = nanos(t.elapsed());
 
         // `dst` goes up at whatever width the view carries. Nothing is converted
         // here: a narrowing pass costs 9.5–11 ms at 1e7 edges to save 5.7 ms of
@@ -242,34 +293,38 @@ impl Accelerator for CudaAccelerator {
         // One allocation per column rather than one arena: an eviction frees
         // exactly what was allocated, and a partial failure frees exactly what
         // it already got. Four of the five uploads are straight memcpys of the
-        // CSR's own order, so nothing is repacked on the host.
-        let cols: [(&'static str, *const u8, usize); 5] = [
+        // CSR's own order, so nothing is repacked on the host — and `input_bytes`
+        // below is what makes that claim checkable rather than a comment.
+        let cols: [(Column, *const u8, usize); 5] = [
             (
-                "offsets",
+                Column::Offsets,
                 view.offsets.as_ptr() as *const u8,
                 std::mem::size_of_val(view.offsets),
             ),
-            ("dst", dst_src.0, dst_src.1),
+            (Column::Dst, dst_src.0, dst_src.1),
             (
-                "valid_from",
+                Column::ValidFrom,
                 view.valid_from.as_ptr() as *const u8,
                 std::mem::size_of_val(view.valid_from),
             ),
             (
-                "valid_to",
+                Column::ValidTo,
                 view.valid_to.as_ptr() as *const u8,
                 std::mem::size_of_val(view.valid_to),
             ),
             (
-                "edge_type",
+                Column::EdgeType,
                 view.edge_type.as_ptr() as *const u8,
                 std::mem::size_of_val(view.edge_type),
             ),
         ];
+        m.input_bytes = cols.iter().map(|(_, _, len)| *len).sum();
 
         let mut columns: Vec<u64> = Vec::with_capacity(cols.len());
         let mut allocated = 0usize;
-        for (name, src, len) in cols {
+        for (col, src, len) in cols {
+            let name = col.name();
+            let t = Instant::now();
             let ptr = match self.driver.alloc(len) {
                 Ok(p) => p,
                 Err(reason) => {
@@ -280,9 +335,11 @@ impl Accelerator for CudaAccelerator {
                     ));
                 }
             };
+            let alloc_ns = nanos(t.elapsed());
             // SAFETY: `ptr` came from `alloc(len)` in the line above and `src`
             // points at `len` readable bytes of the borrowed view — or of the
             // caller's `dst32` slice, which the view borrows for as long.
+            let t = Instant::now();
             if let Err(reason) = unsafe { self.driver.copy_htod(ptr, src, len) } {
                 self.driver.free(ptr);
                 self.free_all(&mut columns);
@@ -293,6 +350,7 @@ impl Accelerator for CudaAccelerator {
             }
             columns.push(ptr);
             allocated += len;
+            m.record_column(col, len, alloc_ns, nanos(t.elapsed()));
         }
 
         // The ratchet on the budget: whatever a later change does to a column
@@ -304,6 +362,20 @@ impl Accelerator for CudaAccelerator {
                 "upload allocated {allocated} bytes but the view priced {bytes}"
             )));
         }
+
+        // `cuMemcpyHtoD` is documented as synchronous, so this should measure
+        // nothing. It is here to prove that: if a copy ever returned before its
+        // bytes landed, the remainder shows up as sync time and the per-column
+        // table stops being a transfer measurement.
+        let t = Instant::now();
+        if let Err(reason) = self.driver.sync() {
+            self.free_all(&mut columns);
+            return Err(self.backend_error("cuCtxSynchronize", reason));
+        }
+        m.device_sync_ns = nanos(t.elapsed());
+        m.uploaded_bytes = allocated;
+        m.total_ns = nanos(started.elapsed());
+
         let token = next_token();
         let handle = ResidentGraph::new(
             token,
@@ -321,7 +393,16 @@ impl Accelerator for CudaAccelerator {
                 bytes,
             },
         );
+        if let Ok(mut slot) = self.last_load.lock() {
+            *slot = Some(m);
+        }
         Ok(Some(handle))
+    }
+
+    fn last_load_metrics(&self) -> Option<GraphLoadMetrics> {
+        // Explicitly the inherent method: the trait's default returns `None`,
+        // and a silent self-recursion here would be a stack overflow in a test.
+        CudaAccelerator::last_load_metrics(self)
     }
 
     fn release_graph(&self, handle: &ResidentGraph) {
@@ -368,6 +449,12 @@ impl std::fmt::Debug for CudaAccelerator {
             .field("budget_bytes", &self.budget)
             .finish()
     }
+}
+
+/// A stage time as whole nanoseconds, saturating rather than wrapping: a load
+/// long enough to overflow 584 years is not one worth reporting on.
+fn nanos(d: std::time::Duration) -> u64 {
+    d.as_nanos().min(u64::MAX as u128) as u64
 }
 
 fn next_token() -> u64 {
