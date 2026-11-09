@@ -7,7 +7,10 @@
 //! the reference time `valid_at`, and enforces the event-time (edge
 //! `valid_from`) ordering constraints.
 
-use gtv_core::{BudgetTracker, CancelToken, Result, TemporalCSR, TraversalBudget};
+use gtv_core::{
+    BudgetTracker, CancelToken, Result, Sel, TemporalCSR, TraversalBudget, TraversalStats,
+    TriState, Truncation, UNBOUND_SNAPSHOT,
+};
 
 /// A pattern edge from variable `from` to variable `to`.
 ///
@@ -69,14 +72,36 @@ impl Pattern {
         Self {
             num_vars: 4,
             edges: vec![
-                PatternEdge { from: 0, to: 1, edge_type: None },
-                PatternEdge { from: 0, to: 2, edge_type: None },
-                PatternEdge { from: 1, to: 3, edge_type: None },
-                PatternEdge { from: 2, to: 3, edge_type: None },
+                PatternEdge {
+                    from: 0,
+                    to: 1,
+                    edge_type: None,
+                },
+                PatternEdge {
+                    from: 0,
+                    to: 2,
+                    edge_type: None,
+                },
+                PatternEdge {
+                    from: 1,
+                    to: 3,
+                    edge_type: None,
+                },
+                PatternEdge {
+                    from: 2,
+                    to: 3,
+                    edge_type: None,
+                },
             ],
             event_orders: vec![
-                EventOrder { before: 0, after: 2 },
-                EventOrder { before: 1, after: 3 },
+                EventOrder {
+                    before: 0,
+                    after: 2,
+                },
+                EventOrder {
+                    before: 1,
+                    after: 3,
+                },
             ],
         }
     }
@@ -186,6 +211,14 @@ pub struct MatchedEdge {
     pub edge_type: u16,
     pub valid_from: i64,
     pub valid_to: i64,
+    /// Slot of this edge in the CSR's edge arrays — the handle back to the
+    /// storage row (attributes, provenance, lineage).
+    ///
+    /// Without it the result only carries `(src, dst, type, time)`, so two
+    /// equal transfers on the same day are indistinguishable and no row can be
+    /// cited as evidence. `u32::MAX` means "not recoverable here" (only the
+    /// pull direction of a k-hop loses it; pattern matching always has it).
+    pub edge_idx: u32,
 }
 
 /// A complete pattern match: node bindings per variable plus the matched edges.
@@ -368,6 +401,7 @@ fn ring3_from(
                             edge_type: eta[i],
                             valid_from: t0,
                             valid_to: vta[i],
+                            edge_idx: i as u32,
                         },
                         MatchedEdge {
                             src: b,
@@ -375,6 +409,7 @@ fn ring3_from(
                             edge_type: etb[j],
                             valid_from: t1,
                             valid_to: vtb[j],
+                            edge_idx: j as u32,
                         },
                         MatchedEdge {
                             src: c,
@@ -382,6 +417,7 @@ fn ring3_from(
                             edge_type: etc_[k],
                             valid_from: t2,
                             valid_to: vtc[k],
+                            edge_idx: k as u32,
                         },
                     ],
                 });
@@ -420,15 +456,7 @@ pub fn find(
         }
         state.nodes[0] = start;
         dfs(
-            csr,
-            pattern,
-            valid_at,
-            0,
-            &mut state,
-            &mut out,
-            limit,
-            None,
-            None,
+            csr, pattern, valid_at, 0, &mut state, &mut out, limit, None, None,
         )?;
     }
     Ok(out)
@@ -470,35 +498,74 @@ pub fn find_windowed(
     Ok(out)
 }
 
-/// Resource-bounded variant of [`find`] (B1-3).
+/// A bounded pattern search: the matches that were found, what the search cost,
+/// and whether it finished.
+#[derive(Debug, Clone)]
+pub struct MatchSet {
+    pub matches: Vec<Match>,
+    pub stats: TraversalStats,
+    /// `Some` when a budget cap stopped the search early. The matches are then
+    /// a *prefix*, not an answer: absence of a match proves nothing.
+    pub truncation: Option<Truncation>,
+}
+
+impl MatchSet {
+    pub fn is_complete(&self) -> bool {
+        self.truncation.is_none()
+    }
+
+    pub fn tri_state(&self) -> TriState {
+        match (self.matches.is_empty(), self.truncation.is_some()) {
+            (_, true) => TriState::Incomplete,
+            (false, false) => TriState::Found,
+            (true, false) => TriState::NoMatch,
+        }
+    }
+}
+
+/// Resource-bounded variant of [`find`] (B1-3 / M1).
 ///
-/// Enforces the traversal [`TraversalBudget`] (edges / rows / deadline) and
-/// cooperatively honours a [`CancelToken`]. The optimized parallel 3-cycle
+/// Enforces the traversal [`TraversalBudget`] (edges / nodes / rows / deadline)
+/// and cooperatively honours a [`CancelToken`]. The optimized parallel 3-cycle
 /// matcher is intentionally bypassed here so that every scanned edge is
 /// accounted for; use [`find`] when no budget is needed.
 ///
-/// Results are produced in the same order as [`find`] for the generic path.
+/// `candidates` restricts which nodes may bind variable 0. It is validated
+/// against the graph's declared snapshot, so a set built for one snapshot
+/// cannot silently seed a query on another.
+///
+/// Exceeding the budget is **not** an error: the matches found so far come back
+/// with [`MatchSet::truncation`] set, so a caller can distinguish "no pattern"
+/// from "did not finish".
 pub fn find_bounded(
     csr: &TemporalCSR,
     pattern: &Pattern,
     valid_at: i64,
     limit: usize,
+    candidates: &Sel,
     budget: &TraversalBudget,
     cancel: Option<&CancelToken>,
-) -> Result<Vec<Match>> {
-    if limit == 0 || pattern.num_vars == 0 {
-        return Ok(Vec::new());
+) -> Result<MatchSet> {
+    if let Some(id) = csr.snapshot_id() {
+        candidates.check_against(id)?;
     }
     let tracker = BudgetTracker::new(budget.clone(), cancel.cloned());
     let mut out = Vec::new();
+    if limit == 0 || pattern.num_vars == 0 {
+        return Ok(MatchSet {
+            matches: out,
+            stats: tracker.stats(0),
+            truncation: None,
+        });
+    }
     let mut state = DfsState::new(pattern);
-    for start in 0..csr.node_count() as u64 {
-        tracker.check_time()?;
-        if out.len() >= limit {
+    for start in candidates.iter() {
+        if !tracker.check_time()? || out.len() >= limit {
             break;
         }
+        tracker.set_hop(1);
         state.nodes[0] = start;
-        dfs(
+        let keep = dfs(
             csr,
             pattern,
             valid_at,
@@ -509,9 +576,32 @@ pub fn find_bounded(
             Some(&tracker),
             None,
         )?;
-        tracker.add_rows(out.len() as u64)?;
+        if !keep {
+            break;
+        }
     }
-    Ok(out)
+    // Row accounting is done once, at the end: counting `out.len()` inside the
+    // loop counted the same rows again on every start node.
+    tracker.add_rows(out.len() as u64);
+    let stats = tracker.stats(0);
+    Ok(MatchSet {
+        matches: out,
+        stats,
+        truncation: tracker.truncation(),
+    })
+}
+
+/// [`find_bounded`] over every node, for callers with no candidate set.
+pub fn find_bounded_all(
+    csr: &TemporalCSR,
+    pattern: &Pattern,
+    valid_at: i64,
+    limit: usize,
+    budget: &TraversalBudget,
+    cancel: Option<&CancelToken>,
+) -> Result<MatchSet> {
+    let all = Sel::all(UNBOUND_SNAPSHOT, csr.node_count() as u64);
+    find_bounded(csr, pattern, valid_at, limit, &all, budget, cancel)
 }
 
 struct DfsState {
@@ -519,6 +609,7 @@ struct DfsState {
     valid_from: Vec<i64>,
     valid_to: Vec<i64>,
     edge_type: Vec<u16>,
+    edge_idx: Vec<u32>,
 }
 
 impl DfsState {
@@ -528,6 +619,7 @@ impl DfsState {
             valid_from: vec![0; pattern.edges.len()],
             valid_to: vec![0; pattern.edges.len()],
             edge_type: vec![0; pattern.edges.len()],
+            edge_idx: vec![u32::MAX; pattern.edges.len()],
         }
     }
 
@@ -542,6 +634,7 @@ impl DfsState {
                 edge_type: self.edge_type[i],
                 valid_from: self.valid_from[i],
                 valid_to: self.valid_to[i],
+                edge_idx: self.edge_idx[i],
             })
             .collect();
         Match {
@@ -558,6 +651,10 @@ impl DfsState {
     }
 }
 
+/// Returns `Ok(false)` when a budget cap tripped and the walk was abandoned.
+///
+/// The partial `matches` stay in the caller's buffer: a truncated search is a
+/// partial answer, not an error.
 #[allow(clippy::too_many_arguments)]
 fn dfs(
     csr: &TemporalCSR,
@@ -569,23 +666,21 @@ fn dfs(
     limit: usize,
     tracker: Option<&BudgetTracker>,
     motif: Option<&WindowedMotif>,
-) -> Result<()> {
+) -> Result<bool> {
     if matches.len() >= limit {
-        return Ok(());
+        return Ok(true);
     }
     if ei == pattern.edges.len() {
-        if state.event_orders_satisfied(pattern)
-            && motif.is_none_or(|m| m.accepts(state))
-        {
+        if state.event_orders_satisfied(pattern) && motif.is_none_or(|m| m.accepts(state)) {
             matches.push(state.to_match(pattern));
         }
-        return Ok(());
+        return Ok(true);
     }
 
     let e = pattern.edges[ei];
     let from_node = state.nodes[e.from];
     if from_node == u64::MAX {
-        return Ok(());
+        return Ok(true);
     }
 
     let to_bound = state.nodes[e.to] != u64::MAX;
@@ -595,9 +690,13 @@ fn dfs(
     let (dst, vf, vt, et) = csr.edge_slices(from_node)?;
     for idx in 0..dst.len() {
         if let Some(t) = tracker {
-            t.add_edges(1)?;
-            if idx & 0x3ff == 0 {
-                t.check_time()?;
+            // A tripped cap unwinds one frame at a time; `false` propagates all
+            // the way up so the caller sees a truncated (not empty) result.
+            if !t.add_edges(1) {
+                return Ok(false);
+            }
+            if idx & 0x3ff == 0 && !t.check_time()? {
+                return Ok(false);
             }
         }
         // Active at `valid_at`: `valid_from <= valid_at < valid_to`.
@@ -619,7 +718,8 @@ fn dfs(
             state.valid_from[ei] = vf_i;
             state.valid_to[ei] = vt[idx];
             state.edge_type[ei] = et[idx];
-            dfs(
+            state.edge_idx[ei] = idx as u32;
+            let keep = dfs(
                 csr,
                 pattern,
                 valid_at,
@@ -630,6 +730,9 @@ fn dfs(
                 tracker,
                 motif,
             )?;
+            if !keep {
+                return Ok(false);
+            }
         } else {
             // Bind a fresh variable: keep node assignments distinct.
             let mut dup = false;
@@ -646,7 +749,8 @@ fn dfs(
             state.valid_from[ei] = vf_i;
             state.valid_to[ei] = vt[idx];
             state.edge_type[ei] = et[idx];
-            dfs(
+            state.edge_idx[ei] = idx as u32;
+            let keep = dfs(
                 csr,
                 pattern,
                 valid_at,
@@ -658,18 +762,21 @@ fn dfs(
                 motif,
             )?;
             state.nodes[e.to] = u64::MAX;
+            if !keep {
+                return Ok(false);
+            }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{Float64Array, UInt64Array};
-    use gtv_core::{EdgeTable, NodeTable, TemporalGraph};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use gtv_core::{EdgeTable, NodeTable, TemporalGraph, TruncReason};
     use std::sync::Arc;
 
     /// Transfer graph with distinct event times:
@@ -760,40 +867,100 @@ mod tests {
         assert!(m.is_empty());
     }
 
+    /// Two transfers with the same counterparty, type and interval are
+    /// indistinguishable through `(src, dst, type, time)`. `edge_idx` is the
+    /// only thing that separates them, and it must resolve back to the CSR.
     #[test]
-    fn find_bounded_matches_find_and_enforces_budget() {
+    fn parallel_edges_are_distinguishable_by_edge_idx() {
+        let nodes = NodeTable::new(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
+                vec![Arc::new(UInt64Array::from(vec![0u64, 1])) as _],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let edges = EdgeTable::from_vecs(
+            vec![0, 0],
+            vec![1, 1],
+            vec![5u16, 5],
+            vec![10, 10],
+            vec![1000, 1000],
+        )
+        .unwrap();
+        let g = TemporalGraph::new(nodes, edges).unwrap();
+
+        let m = find_from(g.csr(), &Pattern::temporal_path(1), 0, 500, 10).unwrap();
+        assert_eq!(m.len(), 2, "both parallel edges must be reported");
+
+        let slots: Vec<u32> = m.iter().map(|x| x.edges[0].edge_idx).collect();
+        assert_eq!(slots, vec![0, 1], "each match must carry its own slot");
+        // And the slot still resolves to the edge the match describes.
+        let (dst, vf, _vt, _et) = g.csr().edge_slices(0).unwrap();
+        for (i, edge) in m.iter().map(|x| x.edges[0]).enumerate() {
+            let slot = edge.edge_idx;
+            assert_eq!(dst[slot as usize], edge.dst);
+            assert_eq!(vf[slot as usize], edge.valid_from);
+            assert_eq!(slot, slots[i]);
+        }
+    }
+
+    #[test]
+    fn find_bounded_matches_find_and_reports_truncation() {
         let g = transfer_graph();
         let pat = Pattern::temporal_path(3);
+        let all = Sel::all(UNBOUND_SNAPSHOT, g.csr().node_count() as u64);
         let unbounded = find(g.csr(), &pat, 500, 10).unwrap();
-        let bounded =
-            find_bounded(g.csr(), &pat, 500, 10, &TraversalBudget::unlimited(), None).unwrap();
-        assert_eq!(unbounded.len(), bounded.len());
-
-        let err = find_bounded(
+        let bounded = find_bounded(
             g.csr(),
             &pat,
             500,
             10,
+            &all,
+            &TraversalBudget::unlimited(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(unbounded, bounded.matches);
+        assert!(bounded.is_complete());
+        assert_eq!(bounded.tri_state(), TriState::Found);
+
+        // An edge cap of 1 trips before the chain is found. The old contract
+        // returned `Err` and threw the partial result away; the search must now
+        // say "did not finish" so the caller cannot report it as "no match".
+        let t = find_bounded(
+            g.csr(),
+            &pat,
+            500,
+            10,
+            &all,
             &TraversalBudget::unlimited().with_max_edges(1),
             None,
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            gtv_core::GtvError::BudgetExceeded { stage: "edges", .. }
-        ));
+        .unwrap();
+        let tr = t
+            .truncation
+            .as_ref()
+            .expect("edge cap must be reported")
+            .clone();
+        assert_eq!(tr.reason, TruncReason::Edges);
+        assert_eq!(t.tri_state(), TriState::Incomplete);
     }
 
     #[test]
     fn find_bounded_honours_cancel() {
         let g = transfer_graph();
         let pat = Pattern::temporal_path(3);
+        let all = Sel::all(UNBOUND_SNAPSHOT, g.csr().node_count() as u64);
         let token: CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Cancellation is a hard stop (the caller abandoned the query), unlike
+        // a budget cap which returns partial rows.
         let got = find_bounded(
             g.csr(),
             &pat,
             500,
             10,
+            &all,
             &TraversalBudget::unlimited(),
             Some(&token),
         );
@@ -848,7 +1015,12 @@ mod tests {
         let base = Pattern::temporal_path(3);
         // span = 30 - 10 = 20
         let wide = WindowedMotif::new(base.clone()).with_window(20);
-        assert_eq!(find_windowed_from(g.csr(), &wide, 0, 500, 10).unwrap().len(), 2);
+        assert_eq!(
+            find_windowed_from(g.csr(), &wide, 0, 500, 10)
+                .unwrap()
+                .len(),
+            2
+        );
         let tight = WindowedMotif::new(base).with_window(15);
         assert!(find_windowed_from(g.csr(), &tight, 0, 500, 10)
             .unwrap()
