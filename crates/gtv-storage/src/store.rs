@@ -50,8 +50,9 @@ use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::record_batch::RecordBatch;
-use gtv_core::csr::TemporalCSR;
+use gtv_core::csr::{CsrColumns, TemporalCSR, CHUNK_SIZE};
 use gtv_core::endpoint::NodeLifetime;
+use gtv_core::GtvError;
 use serde::{Deserialize, Serialize};
 
 use crate::aggregate::{AggregateView, LogicalEdge};
@@ -1500,10 +1501,18 @@ impl SegmentStore {
     /// folded here, once per version query — never inside `neighbor_iter`.
     /// The returned CSR is owned; for zero-copy traversal of a single baseline
     /// use `open_entry`.
+    ///
+    /// Materialisation is columnar: each live segment's CSR is already sorted
+    /// by the documented key `(src, valid_from, valid_to, dst)`, so the whole
+    /// graph is a k-way merge between those sorted runs, written straight into
+    /// the five output columns. It does **not** go through
+    /// [`SegmentStore::live_rows_at`]: that path builds one 72 B `LiveRow` per
+    /// edge and then re-sorts them, which measured 1.5 s at 1e7 edges against
+    /// 489 ms for the sweep alone. See `docs/cuda-acceleration-plan.md` §9.4.
     pub fn graph_at(&self, t: i64) -> Result<TemporalCSR> {
-        let rows = self.live_rows_at(t)?;
-        let edges: Vec<EdgeRecord> = rows.iter().map(|r| r.edge).collect();
-        MemSegment::to_csr(&edges, self.node_count)
+        let _scope = ReadScope::new(&self.readers);
+        self.check_history(t)?;
+        live_csr_from(self.view(), t)
     }
 
     /// Full integrity check over every published segment (offline / tests).
@@ -1984,6 +1993,484 @@ fn live_rows_from(v: LiveRowsView<'_>, t: i64) -> Result<Vec<LiveRow>> {
         });
     }
     Ok(out)
+}
+
+// -- columnar materialisation ----------------------------------------------
+
+/// `offsets`, filled in as the merge runs.
+///
+/// The output is sorted by `src`, so a source is finished the moment the merge
+/// moves past it and `offsets[s + 1]` is known right then. Counting degrees
+/// first and prefix-summing afterwards would cost a second pass over
+/// `node_count` plus an array that nothing else needs.
+struct Offsets {
+    counts: Vec<u32>,
+    /// Index of the source currently being filled.
+    open: usize,
+}
+
+impl Offsets {
+    fn new(node_count: usize) -> Self {
+        Self {
+            counts: vec![0u32; node_count + 1],
+            open: 0,
+        }
+    }
+
+    /// Close every source below `src`. `at` is the number of rows written so far.
+    #[inline]
+    fn close_below(&mut self, src: usize, at: usize) {
+        for k in self.open + 1..=src {
+            self.counts[k] = at as u32;
+        }
+        self.open = src;
+    }
+
+    /// Close the tail once the runs are drained.
+    fn finish(mut self, at: usize) -> Vec<u32> {
+        let last = self.counts.len() - 1;
+        for k in self.open + 1..=last {
+            self.counts[k] = at as u32;
+        }
+        self.counts
+    }
+}
+
+/// The next edge a run offers, already retract-filtered.
+#[derive(Debug, Clone, Copy)]
+struct Head {
+    src: u64,
+    dst: u64,
+    valid_from: i64,
+    valid_to: i64,
+    edge_type: u16,
+}
+
+impl Head {
+    /// The CSR's documented sort key: `(src, valid_from, valid_to, dst)`.
+    ///
+    /// `edge_type` is deliberately absent. Two versions of one edge can share
+    /// every other field, and the index only ever promised this order.
+    #[inline]
+    fn key(&self) -> (u64, i64, i64, u64) {
+        (self.src, self.valid_from, self.valid_to, self.dst)
+    }
+}
+
+/// One sorted run feeding [`live_csr_from`].
+///
+/// A run is either a published segment — whose columns are already in
+/// [`Head::key`] order, so it is walked in place with no copy at all — or a row
+/// list (a delta's puts, the unflushed WAL) that had to be sorted first. Both
+/// yield [`Head`]s at the same key, which is the point: the merge never learns
+/// which kind it is looking at.
+enum Cursor<'a> {
+    /// A segment's own columns, narrowed to the `src` box its L2 metadata
+    /// claims and walked in row-id order so retracts stay positional.
+    Columns {
+        cols: &'a CsrColumns<'a>,
+        retracts: &'a RetractSet,
+        /// Segment id — the high half of a [`RowPos`].
+        entry_id: u64,
+        /// Exclusive bound on `src`.
+        hi: usize,
+        src: usize,
+        /// Index of the next edge within the segment.
+        edge: usize,
+        /// Row id of `edge`, kept in lockstep with it: a retract position is
+        /// `(segment, row)`, and deriving it per edge would mean a search.
+        row: u32,
+    },
+    /// A materialised row list.
+    Rows {
+        rows: &'a [EdgeRecord],
+        retracts: &'a RetractSet,
+        /// `Some(put_segment_id)` when the positions are retractable, `None`
+        /// for the WAL namespace, which is never a retract target.
+        namespace: Option<u64>,
+        next: usize,
+    },
+}
+
+impl Cursor<'_> {
+    fn next(&mut self) -> Option<Head> {
+        match self {
+            Cursor::Columns {
+                cols,
+                retracts,
+                entry_id,
+                hi,
+                src,
+                edge,
+                row,
+            } => loop {
+                // A source with no edges left has `edge == offsets[src]`, so
+                // `offsets[src + 1]` is where the next non-empty one begins.
+                while *src < *hi && *edge == cols.offsets[*src + 1] as usize {
+                    *src += 1;
+                }
+                if *src >= *hi {
+                    return None;
+                }
+                let head = Head {
+                    src: *src as u64,
+                    dst: cols.dst[*edge],
+                    valid_from: cols.valid_from[*edge],
+                    valid_to: cols.valid_to[*edge],
+                    edge_type: cols.edge_type[*edge],
+                };
+                let pos = RowPos::new(*entry_id, *row);
+                *row += 1;
+                *edge += 1;
+                if !retracts.contains(pos) {
+                    return Some(head);
+                }
+            },
+            Cursor::Rows {
+                rows,
+                retracts,
+                namespace,
+                next,
+            } => loop {
+                let i = *next;
+                if i >= rows.len() {
+                    return None;
+                }
+                *next = i + 1;
+                if namespace.is_some_and(|ns| retracts.contains(RowPos::new(ns, i as u32))) {
+                    continue;
+                }
+                let e = rows[i];
+                return Some(Head {
+                    src: e.src,
+                    dst: e.dst,
+                    valid_from: e.valid_from,
+                    valid_to: e.valid_to,
+                    edge_type: e.edge_type,
+                });
+            },
+        }
+    }
+}
+
+impl Cursor<'_> {
+    /// This run's own CSR, when the run *is* the whole answer.
+    ///
+    /// True for a single segment that covers every source node and that no
+    /// retract touches: its columns already are the visible graph, so copying
+    /// them is the only work left, and building it edge by edge would reproduce
+    /// 257 MiB of bytes it already has. `Ok(None)` means "not this shape", never
+    /// "failed" — the structural checks still run inside `from_columns` so the
+    /// shortcut cannot skip them.
+    fn verbatim(&self, node_count: usize) -> Result<Option<TemporalCSR>> {
+        let Cursor::Columns {
+            cols,
+            retracts,
+            hi,
+            src,
+            edge,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        if !retracts.is_empty() || *src != 0 || *edge != 0 || *hi != node_count {
+            return Ok(None);
+        }
+        if cols.node_count != node_count || cols.offsets.len() != node_count + 1 {
+            return Ok(None);
+        }
+        TemporalCSR::from_columns(
+            cols.node_count,
+            cols.offsets.to_vec().into(),
+            cols.dst.to_vec().into(),
+            cols.valid_from.to_vec().into(),
+            cols.valid_to.to_vec().into(),
+            cols.edge_type.to_vec().into(),
+            cols.max_valid_from,
+            cols.min_valid_to,
+            cols.chunk_size,
+            cols.chunk_index.to_vec().into(),
+            cols.chunk_max_valid_to.to_vec().into(),
+        )
+        .map(Some)
+        .map_err(|e| err(format!("invalid delta CSR: {e}")))
+    }
+}
+
+/// The five CSR columns, plus the two scalars derived while writing them.
+///
+/// A sink rather than five loose `Vec`s so the merge and the single-run fast
+/// path below write through exactly one `push`: if a column is ever added or
+/// reordered, it is one place, and the fast path cannot silently disagree with
+/// the general one.
+struct ColumnSink {
+    offsets: Offsets,
+    dst: Vec<u64>,
+    valid_from: Vec<i64>,
+    valid_to: Vec<i64>,
+    edge_type: Vec<u16>,
+    node_count: usize,
+    max_valid_from: i64,
+    min_valid_to: i64,
+}
+
+impl ColumnSink {
+    fn new(node_count: usize, capacity: usize) -> Self {
+        Self {
+            offsets: Offsets::new(node_count),
+            dst: Vec::with_capacity(capacity),
+            valid_from: Vec::with_capacity(capacity),
+            valid_to: Vec::with_capacity(capacity),
+            edge_type: Vec::with_capacity(capacity),
+            node_count,
+            // The same identity values `from_edge_columns` uses, so an empty
+            // graph gets the same bounding box from both paths.
+            max_valid_from: i64::MIN,
+            min_valid_to: i64::MAX,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, h: Head) -> Result<()> {
+        let src = h.src as usize;
+        if src >= self.node_count {
+            // The row path reports this out of `from_edge_columns`; the column
+            // path has to say it itself, because nothing downstream re-sorts.
+            return Err(err(format!(
+                "invalid delta CSR: {}",
+                GtvError::NodeOutOfRange(h.src)
+            )));
+        }
+        self.offsets.close_below(src, self.dst.len());
+        self.dst.push(h.dst);
+        self.valid_from.push(h.valid_from);
+        self.valid_to.push(h.valid_to);
+        self.edge_type.push(h.edge_type);
+        self.max_valid_from = self.max_valid_from.max(h.valid_from);
+        self.min_valid_to = self.min_valid_to.min(h.valid_to);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<TemporalCSR> {
+        let offsets = self.offsets.finish(self.dst.len());
+
+        // Zone maps, identical to `from_edge_columns`: one `max(valid_to)` per
+        // CHUNK_SIZE edges of each source run.
+        let chunk_size = CHUNK_SIZE;
+        let mut chunk_index = Vec::with_capacity(self.node_count + 1);
+        let mut chunk_max_valid_to = Vec::new();
+        chunk_index.push(0u32);
+        for s in 0..self.node_count {
+            let mut c = offsets[s] as usize;
+            let end = offsets[s + 1] as usize;
+            while c < end {
+                let ce = (c + chunk_size).min(end);
+                chunk_max_valid_to.push(
+                    self.valid_to[c..ce]
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(i64::MIN),
+                );
+                c = ce;
+            }
+            chunk_index.push(chunk_max_valid_to.len() as u32);
+        }
+
+        TemporalCSR::from_columns(
+            self.node_count,
+            offsets.into(),
+            self.dst.into(),
+            self.valid_from.into(),
+            self.valid_to.into(),
+            self.edge_type.into(),
+            self.max_valid_from,
+            self.min_valid_to,
+            chunk_size,
+            chunk_index.into(),
+            chunk_max_valid_to.into(),
+        )
+        .map_err(|e| err(format!("invalid delta CSR: {e}")))
+    }
+}
+
+/// The column form of [`live_rows_from`].
+///
+/// Both functions answer "which edges are visible at `t`" and must agree
+/// exactly, which is why they sit next to each other and share the fold's
+/// shape: the same live-set predicate, the same retract namespaces, the same
+/// [`RowPos`] numbering. Only the shape of the answer differs — rows for the
+/// Arrow surface, columns for the CSR — and that difference is a second of CPU
+/// per query at 1e7 edges.
+///
+/// It is a merge because a published segment's CSR is already sorted by
+/// `(src, valid_from, valid_to, dst)`: the order was paid for at flush time, and
+/// collecting the edges into 72 B rows only to sort them again pays for it
+/// twice. Each segment is a sorted run, the answer is their k-way merge written
+/// straight into the output columns, and peak host memory is the output itself.
+fn live_csr_from(v: LiveRowsView<'_>, t: i64) -> Result<TemporalCSR> {
+    let live_deltas: Vec<&DeltaEntry> = v
+        .manifest
+        .deltas
+        .iter()
+        .filter(|d| d.system_ts <= t && d.superseded_at.is_none_or(|m| m > t))
+        .collect();
+    let retracts = RetractSet::merge(
+        &live_deltas
+            .iter()
+            .map(|de| decoded_delta_from(v.deltas, de.id).map(|d| d.retracts()))
+            .collect::<Result<Vec<_>>>()?,
+    );
+
+    let entries: Vec<&SegmentEntry> = v
+        .manifest
+        .segments
+        .iter()
+        .filter(|e| e.system_ts <= t && e.superseded_at.is_none_or(|m| m > t))
+        .collect();
+
+    // Opened first, borrowed second: `CsrColumns` borrows its `Segment`, so the
+    // owned segments have to outlive the column list. Nothing mutates them
+    // afterwards, which is what lets the borrow survive the merge — and why the
+    // columns cost one mmap each instead of one copy per edge.
+    let mut segments = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        segments.push(open_entry_from(v.root, entry)?);
+    }
+    let cols: Vec<CsrColumns<'_>> = segments.iter().map(|s| s.csr().columns()).collect();
+
+    let mut cursors: Vec<Cursor<'_>> = Vec::with_capacity(entries.len() + live_deltas.len() + 1);
+    // Upper bound on the output row count, summed from the sources before
+    // anything is allocated. Retracts only ever shrink it.
+    let mut bound = 0usize;
+
+    for (i, entry) in entries.iter().enumerate() {
+        let c = &cols[i];
+        if c.node_count != v.node_count {
+            return Err(err(format!(
+                "segment {} has node_count {} but store expects {}",
+                entry.id, c.node_count, v.node_count
+            )));
+        }
+        if c.dst.len() > u32::MAX as usize {
+            return Err(err(format!(
+                "segment {} has {} rows; positional retract uses u32 row ids",
+                entry.id,
+                c.dst.len()
+            )));
+        }
+        if c.node_count == 0 {
+            continue;
+        }
+        let last = (c.node_count - 1) as u64;
+        let lo = entry.src_id_min.unwrap_or(0).min(last) as usize;
+        let hi = entry.src_id_max.unwrap_or(u64::MAX).min(last) as usize + 1;
+        bound += c.offsets[hi] as usize - c.offsets[lo] as usize;
+        cursors.push(Cursor::Columns {
+            cols: c,
+            retracts: &retracts,
+            entry_id: entry.id,
+            hi,
+            src: lo,
+            edge: c.offsets[lo] as usize,
+            row: c.offsets[lo],
+        });
+    }
+
+    // Delta puts and WAL rows arrive as row lists in no particular order, so
+    // each gets one sort before joining. They are copied because the stored
+    // delta and the WAL are immutable here: sorting them in place would reorder
+    // records another reader holds. Both are bounded — the overlay depth by
+    // `MAX_DELTA_DEPTH`, the WAL by the flush threshold.
+    let mut delta_runs: Vec<(u64, Vec<EdgeRecord>)> = Vec::with_capacity(live_deltas.len());
+    for de in &live_deltas {
+        let d = decoded_delta_from(v.deltas, de.id)?;
+        let mut puts = d.puts.clone();
+        puts.sort_unstable_by_key(|e| (e.src, e.valid_from, e.valid_to, e.dst));
+        bound += puts.len();
+        delta_runs.push((d.put_segment_id, puts));
+    }
+    let mut wal: Vec<EdgeRecord> = v
+        .mem_records
+        .iter()
+        .filter(|r| r.edge.system_ts <= t)
+        .map(|r| r.edge)
+        .collect();
+    wal.sort_unstable_by_key(|e| (e.src, e.valid_from, e.valid_to, e.dst));
+    bound += wal.len();
+
+    if bound > u32::MAX as usize {
+        return Err(err(format!(
+            "{} live edges exceed the u32 address space ({} edges)",
+            bound,
+            u32::MAX
+        )));
+    }
+
+    for (ns, puts) in &delta_runs {
+        cursors.push(Cursor::Rows {
+            rows: puts,
+            retracts: &retracts,
+            namespace: Some(*ns),
+            next: 0,
+        });
+    }
+    if !wal.is_empty() {
+        cursors.push(Cursor::Rows {
+            rows: &wal,
+            retracts: &retracts,
+            namespace: None,
+            next: 0,
+        });
+    }
+
+    // Fast path: exactly one run. This is the shape that matters — a compacted
+    // store has one baseline segment, no live delta and an empty WAL — and then
+    // there is nothing to merge and, if no retract touches it, nothing to
+    // rewrite: the answer *is* the segment's own columns.
+    if cursors.len() <= 1 {
+        let Some(mut only) = cursors.pop() else {
+            return ColumnSink::new(v.node_count, 0).finish();
+        };
+        if let Some(csr) = only.verbatim(v.node_count)? {
+            return Ok(csr);
+        }
+        let mut sink = ColumnSink::new(v.node_count, bound);
+        while let Some(h) = only.next() {
+            sink.push(h)?;
+        }
+        return sink.finish();
+    }
+
+    let mut sink = ColumnSink::new(v.node_count, bound);
+    let mut heads: Vec<Option<Head>> = cursors.iter_mut().map(|c| c.next()).collect();
+    loop {
+        // Smallest head wins. Linear over the runs on purpose: a store holds a
+        // handful (compaction merges them away), so a heap would add a
+        // logarithmic term per edge to save a handful of comparisons and a
+        // pointer chase. Ties go to the earliest run, which keeps the output
+        // deterministic for rows that share a key.
+        let mut pick: Option<usize> = None;
+        for (i, head) in heads.iter().enumerate() {
+            let Some(h) = head else { continue };
+            pick = match pick {
+                None => Some(i),
+                Some(j) => {
+                    let held = heads[j].as_ref().expect("picked heads are set");
+                    if h.key() < held.key() {
+                        Some(i)
+                    } else {
+                        Some(j)
+                    }
+                }
+            };
+        }
+        let Some(i) = pick else { break };
+        sink.push(heads[i].expect("picked heads are set"))?;
+        heads[i] = cursors[i].next();
+    }
+    sink.finish()
 }
 
 /// Phase 1 of compaction, shared by the synchronous and worker paths.
