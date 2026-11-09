@@ -121,6 +121,10 @@ jobs:
           cargo test -p gtv-engine --test m3_tags_sql
       - name: M3 admission gate (evidence for go/no-go decisions)
         run: cargo run --release -p gtv-storage --example bench_m3_gate
+      - name: M6 batch graph operator (row-for-row parity with pointwise UDTFs)
+        run: cargo test -p gtv-engine --test m6_batch_graph
+      - name: M6 admission gate (target query latency + segment granularity)
+        run: cargo run --release -p gtv-engine --example bench_m6_gate
 
   full-tests:
     name: Full workspace regression

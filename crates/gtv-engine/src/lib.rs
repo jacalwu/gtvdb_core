@@ -20,6 +20,7 @@
 pub mod aggregate;
 pub mod ann;
 pub mod asof;
+pub mod batch_graph;
 pub mod bitemporal;
 pub mod catalog_meta;
 pub mod cbo;
@@ -45,6 +46,7 @@ pub mod expr_util;
 pub use aggregate::{
     empty_aggregate_slot, ActiveEdgeCountTableFunction, AggregateSlot, RangeAggTableFunction,
 };
+pub use batch_graph::{BatchKhopTable, BatchNeighborsTable, khop_schema, neighbors_schema};
 pub use context::{ExecutionOptions, GtvContext};
 pub use catalog_meta::{CatalogSlot, FilesTableFunction, SnapshotsTableFunction, TablesTableFunction};
 pub use dq::{

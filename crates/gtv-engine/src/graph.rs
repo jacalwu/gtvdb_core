@@ -23,9 +23,14 @@ pub struct NeighborsTableFunction {
 
 impl NeighborsTableFunction {
     pub fn new(csr: &TemporalCSR) -> Self {
-        Self {
-            csr: Arc::new(csr.clone()),
-        }
+        Self::from_arc(Arc::new(csr.clone()))
+    }
+
+    /// Share one graph image with the other pointwise UDTF. `register_neighbors`
+    /// used to clone the whole CSR twice (once per table function); this keeps
+    /// a single `Arc` while leaving the public `new(&TemporalCSR)` unchanged.
+    pub fn from_arc(csr: Arc<TemporalCSR>) -> Self {
+        Self { csr }
     }
 
     fn schema() -> SchemaRef {
@@ -95,9 +100,12 @@ pub struct KhopTableFunction {
 
 impl KhopTableFunction {
     pub fn new(csr: &TemporalCSR) -> Self {
-        Self {
-            csr: Arc::new(csr.clone()),
-        }
+        Self::from_arc(Arc::new(csr.clone()))
+    }
+
+    /// See `NeighborsTableFunction::from_arc`.
+    pub fn from_arc(csr: Arc<TemporalCSR>) -> Self {
+        Self { csr }
     }
 
     fn schema() -> SchemaRef {

@@ -811,15 +811,64 @@ impl GtvContext {
     }
 
     /// Register the `neighbors(src, valid_at)` graph table function.
+    ///
+    /// M6: both UDTFs now share a single `Arc<TemporalCSR>`. The previous code
+    /// cloned the entire graph twice at registration time.
     pub fn register_neighbors(&self, csr: &TemporalCSR) {
+        let shared = Arc::new(csr.clone());
         self.ctx.register_udtf(
             "neighbors",
-            Arc::new(crate::graph::NeighborsTableFunction::new(csr)),
+            Arc::new(crate::graph::NeighborsTableFunction::from_arc(shared.clone())),
         );
         self.ctx.register_udtf(
             "khop",
-            Arc::new(crate::graph::KhopTableFunction::new(csr)),
+            Arc::new(crate::graph::KhopTableFunction::from_arc(shared)),
         );
+    }
+
+    /// Register batched graph tables for a set of seeds (M6 perf line).
+    ///
+    /// Unlike `neighbors(src,t)` / `khop(src,k,t)`, which accept literals only,
+    /// these are ordinary tables and can be joined with any SQL relation:
+    ///
+    /// ```sql
+    /// SELECT c.case_id, b.dst FROM cases c
+    /// JOIN gtv_batch_neighbors b ON b.src = c.account_id;
+    /// SELECT * FROM gtv_batch_khop WHERE hop <= 2;
+    /// ```
+    ///
+    /// One graph image, one planning cycle per SQL statement, one batch. Re-
+    /// registering replaces the previous tables, so a new alert list is cheap.
+    pub fn register_batch_graph(
+        &self,
+        csr: &TemporalCSR,
+        seeds: &[u64],
+        valid_at: i64,
+        k: usize,
+    ) -> Result<()> {
+        self.register_batch_graph_shared(&Arc::new(csr.clone()), seeds, valid_at, k)
+    }
+
+    /// Same as [`Self::register_batch_graph`] but reuses an existing graph
+    /// image. Seed sets change far more often than the graph does, so a caller
+    /// that keeps an `Arc<TemporalCSR>` avoids copying the whole CSR on every
+    /// alert batch — `bench_m6_gate` measures this as a fixed ~1.4 ms cost.
+    pub fn register_batch_graph_shared(
+        &self,
+        csr: &Arc<TemporalCSR>,
+        seeds: &[u64],
+        valid_at: i64,
+        k: usize,
+    ) -> Result<()> {
+        let neighbors =
+            crate::batch_graph::BatchNeighborsTable::new(csr, seeds.iter().copied(), valid_at)?;
+        let khop =
+            crate::batch_graph::BatchKhopTable::new(csr, seeds.iter().copied(), k, valid_at)?;
+        let _ = self.ctx.deregister_table("gtv_batch_neighbors");
+        let _ = self.ctx.deregister_table("gtv_batch_khop");
+        self.ctx.register_table("gtv_batch_neighbors", Arc::new(neighbors))?;
+        self.ctx.register_table("gtv_batch_khop", Arc::new(khop))?;
+        Ok(())
     }
 
     /// Register the `asof_join(t0, t1, ...)` table function against a
