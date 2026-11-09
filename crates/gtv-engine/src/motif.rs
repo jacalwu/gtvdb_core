@@ -201,20 +201,10 @@ pub fn find_matches(
                 }
                 let remaining = spec.limit - out.len();
                 let mut one = match &motif {
-                    Some(m) => gtv_pattern::find_windowed_from(
-                        csr,
-                        m,
-                        start,
-                        spec.valid_at,
-                        remaining,
-                    ),
-                    None => gtv_pattern::find_from(
-                        csr,
-                        &pattern,
-                        start,
-                        spec.valid_at,
-                        remaining,
-                    ),
+                    Some(m) => {
+                        gtv_pattern::find_windowed_from(csr, m, start, spec.valid_at, remaining)
+                    }
+                    None => gtv_pattern::find_from(csr, &pattern, start, spec.valid_at, remaining),
                 }
                 .map_err(kernel_err)?;
                 out.append(&mut one);
@@ -244,9 +234,16 @@ pub fn match_schema(num_vars: usize) -> SchemaRef {
 }
 
 /// One row per matched edge, keyed back to its match.
+///
+/// `edge_pos` is the edge's position within the match (0, 1, 2, …) and orders
+/// the evidence path. `edge_idx` is the edge's slot in the snapshot's CSR
+/// arrays — the handle a caller needs to fetch attributes or join back to the
+/// source record. They are different numbers and must not be conflated:
+/// `edge_pos` was previously (and wrongly) published as `edge_idx`.
 pub fn edge_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("match_id", DataType::UInt64, false),
+        Field::new("edge_pos", DataType::UInt32, false),
         Field::new("edge_idx", DataType::UInt32, false),
         Field::new("src", DataType::UInt64, false),
         Field::new("dst", DataType::UInt64, false),
@@ -284,6 +281,7 @@ pub fn build_match_batch(matches: &[Match], num_vars: usize) -> Result<RecordBat
 pub fn build_edge_batch(matches: &[Match]) -> Result<RecordBatch> {
     let rows: usize = matches.iter().map(|m| m.edges.len()).sum();
     let mut ids = Vec::with_capacity(rows);
+    let mut pos = Vec::with_capacity(rows);
     let mut idx = Vec::with_capacity(rows);
     let mut src = Vec::with_capacity(rows);
     let mut dst = Vec::with_capacity(rows);
@@ -294,7 +292,8 @@ pub fn build_edge_batch(matches: &[Match]) -> Result<RecordBatch> {
     for (i, m) in matches.iter().enumerate() {
         for (j, e) in m.edges.iter().enumerate() {
             ids.push(i as u64);
-            idx.push(j as u32);
+            pos.push(j as u32);
+            idx.push(e.edge_idx);
             src.push(e.src);
             dst.push(e.dst);
             et.push(e.edge_type);
@@ -307,6 +306,7 @@ pub fn build_edge_batch(matches: &[Match]) -> Result<RecordBatch> {
         edge_schema(),
         vec![
             Arc::new(UInt64Array::from(ids)) as ArrayRef,
+            Arc::new(UInt32Array::from(pos)) as ArrayRef,
             Arc::new(UInt32Array::from(idx)) as ArrayRef,
             Arc::new(UInt64Array::from(src)) as ArrayRef,
             Arc::new(UInt64Array::from(dst)) as ArrayRef,
@@ -478,8 +478,8 @@ fn spec_from_args(
             .get(time_at)
             .ok_or_else(|| arg_err(signature, "valid_at"))?,
     )?;
-    let mut spec = MotifSpec::new(shape, valid_at)
-        .with_limit(parse_optional_limit(exprs, opts_at)?);
+    let mut spec =
+        MotifSpec::new(shape, valid_at).with_limit(parse_optional_limit(exprs, opts_at)?);
     if let Some(span) = parse_optional_window(exprs, opts_at + 1)? {
         spec = spec.with_window(span);
     }
@@ -517,7 +517,13 @@ impl MotifTableFunction {
 impl TableFunctionImpl for MotifTableFunction {
     fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
         let exprs = args.exprs();
-        let spec = spec_from_args(exprs, 0, 1, 2, "motif(shape, valid_at [, limit [, window]])")?;
+        let spec = spec_from_args(
+            exprs,
+            0,
+            1,
+            2,
+            "motif(shape, valid_at [, limit [, window]])",
+        )?;
         emit(&self.csr, &spec, None)
     }
 }

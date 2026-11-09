@@ -16,9 +16,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use gtv_core::TemporalCSR;
-use gtv_engine::{
-    find_matches, match_schema, GtvContext, MotifShape, MotifSpec,
-};
+use gtv_engine::{find_matches, match_schema, GtvContext, MotifShape, MotifSpec};
 use gtv_pattern::{Match, Pattern, WindowedMotif};
 
 const T: i64 = 100;
@@ -133,7 +131,12 @@ async fn sql(ctx: &GtvContext, query: &str) -> Vec<RecordBatch> {
     ctx.sql(query).await.unwrap()
 }
 
-async fn pointwise_motif_from(ctx: &GtvContext, shape: &str, seeds: &[u64], limit: usize) -> Vec<MatchRow> {
+async fn pointwise_motif_from(
+    ctx: &GtvContext,
+    shape: &str,
+    seeds: &[u64],
+    limit: usize,
+) -> Vec<MatchRow> {
     let nv = MotifShape::parse(shape).unwrap().num_vars();
     let mut out = Vec::new();
     for &s in seeds {
@@ -177,8 +180,14 @@ async fn full_scan_udtf_matches_rust_find() {
     let ctx = GtvContext::new();
     ctx.register_motif(&csr);
 
-    let got = match_rows(&sql(&ctx, "SELECT * FROM motif('ring3', 100, 500)").await, 3);
-    let expected = rust_rows(&gtv_pattern::find(&csr, &Pattern::ring(3), T, 500).unwrap(), 3);
+    let got = match_rows(
+        &sql(&ctx, "SELECT * FROM motif('ring3', 100, 500)").await,
+        3,
+    );
+    let expected = rust_rows(
+        &gtv_pattern::find(&csr, &Pattern::ring(3), T, 500).unwrap(),
+        3,
+    );
     assert!(!got.is_empty());
     assert_eq!(got, expected, "find() ring3 fast path must agree with SQL");
 }
@@ -210,20 +219,25 @@ async fn edge_table_reconstructs_every_matched_edge() {
     let matches = find_matches(&csr, &spec, Some(SEEDS)).unwrap();
     let edge_batches = sql(&ctx, "SELECT * FROM gtv_motif_edges").await;
 
-    let mut rebuilt: Vec<Vec<(u64, u32, u64, u64, u16, i64, i64)>> =
+    // Columns: match_id, edge_pos, edge_idx, src, dst, edge_type, valid_from,
+    // valid_to. `edge_pos` orders the path; `edge_idx` is the CSR slot the edge
+    // came from, so the row can be traced back to storage.
+    let mut rebuilt: Vec<Vec<(u64, u32, u32, u64, u64, u16, i64, i64)>> =
         vec![Vec::new(); matches.len()];
     for b in &edge_batches {
-        let (id, idx, src, dst, et, vf, vt) = (
+        let (id, pos, slot, src, dst, et, vf, vt) = (
             col_u64(b, 0),
             col_u32(b, 1),
-            col_u64(b, 2),
+            col_u32(b, 2),
             col_u64(b, 3),
-            col_u16(b, 4),
-            col_i64(b, 5),
+            col_u64(b, 4),
+            col_u16(b, 5),
             col_i64(b, 6),
+            col_i64(b, 7),
         );
         for i in 0..b.num_rows() {
-            rebuilt[id[i] as usize].push((id[i], idx[i], src[i], dst[i], et[i], vf[i], vt[i]));
+            rebuilt[id[i] as usize]
+                .push((id[i], pos[i], slot[i], src[i], dst[i], et[i], vf[i], vt[i]));
         }
     }
     for group in &mut rebuilt {
@@ -240,6 +254,7 @@ async fn edge_table_reconstructs_every_matched_edge() {
                 (
                     i as u64,
                     j as u32,
+                    e.edge_idx,
                     e.src,
                     e.dst,
                     e.edge_type,
@@ -249,6 +264,13 @@ async fn edge_table_reconstructs_every_matched_edge() {
             })
             .collect();
         assert_eq!(rebuilt[i], expected, "match {i} edge projection");
+        // The slot must actually address this edge in the snapshot.
+        for e in &m.edges {
+            let (dst, vf, _vt, _et) = csr.edge_slices(e.src).unwrap();
+            let s = e.edge_idx as usize;
+            assert_eq!(dst[s], e.dst, "edge_idx {s} does not name this edge");
+            assert_eq!(vf[s], e.valid_from);
+        }
     }
 }
 
@@ -304,7 +326,10 @@ async fn edge_type_sequence_and_shape_variants() {
         .with_sequence(vec![1, 2, 3]);
     ctx.register_motif_batch(&csr, &ok, SEEDS).unwrap();
     let rows = match_rows(&sql(&ctx, "SELECT * FROM gtv_motif_matches").await, 3);
-    assert_eq!(rows, rust_rows(&find_matches(&csr, &ok, Some(SEEDS)).unwrap(), 3));
+    assert_eq!(
+        rows,
+        rust_rows(&find_matches(&csr, &ok, Some(SEEDS)).unwrap(), 3)
+    );
     assert!(!rows.is_empty(), "type sequence 1,2,3 must match");
 
     let rejected = ok.clone().with_sequence(vec![9, 9, 9]);
@@ -359,7 +384,10 @@ async fn batch_table_joins_projects_and_filters() {
             rows.push((cid[i], n1[i], n2[i]));
         }
     }
-    assert!(!rows.is_empty(), "seed 0 has a ring within the 25-unit span");
+    assert!(
+        !rows.is_empty(),
+        "seed 0 has a ring within the 25-unit span"
+    );
     assert!(rows.iter().all(|r| r.0 == 101));
 }
 
@@ -373,7 +401,10 @@ async fn empty_seeds_zero_limit_and_reregistration() {
     for table in ["gtv_motif_matches", "gtv_motif_edges"] {
         let out = sql(&ctx, &format!("SELECT * FROM {table}")).await;
         assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
-        let expected = if table == "gtv_motif_matches" { 6 } else { 7 };
+        // matches: match_id, n0..n2, event_min, event_max = 6
+        // edges:   match_id, edge_pos, edge_idx, src, dst, edge_type,
+        //          valid_from, valid_to = 8
+        let expected = if table == "gtv_motif_matches" { 6 } else { 8 };
         assert_eq!(out[0].num_columns(), expected, "{table} typed empty");
     }
 
@@ -381,13 +412,15 @@ async fn empty_seeds_zero_limit_and_reregistration() {
     let before = match_rows(&sql(&ctx, "SELECT * FROM gtv_motif_matches").await, 3);
     assert!(!before.is_empty());
 
-    ctx.register_motif_batch(&csr, &spec.clone().with_limit(0), SEEDS).unwrap();
+    ctx.register_motif_batch(&csr, &spec.clone().with_limit(0), SEEDS)
+        .unwrap();
     let after = sql(&ctx, "SELECT * FROM gtv_motif_matches").await;
     assert_eq!(after.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
 
     // A shared graph image gives the same answer as the owned path.
     let shared = Arc::new(csr);
-    ctx.register_motif_batch_shared(&shared, &spec, SEEDS).unwrap();
+    ctx.register_motif_batch_shared(&shared, &spec, SEEDS)
+        .unwrap();
     let again = match_rows(&sql(&ctx, "SELECT * FROM gtv_motif_matches").await, 3);
     assert_eq!(again, before);
 }

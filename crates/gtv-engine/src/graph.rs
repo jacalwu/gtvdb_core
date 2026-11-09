@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result};
-use gtv_core::{TemporalCSR, TraversalBudget};
+use gtv_core::{Sel, TemporalCSR, TraversalBudget, UNBOUND_SNAPSHOT};
 
 use crate::expr_util::{expr_to_i64, expr_to_u64};
 
@@ -47,16 +47,12 @@ impl NeighborsTableFunction {
 impl TableFunctionImpl for NeighborsTableFunction {
     fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
         let exprs = args.exprs();
-        let src = expr_to_u64(
-            exprs
-                .first()
-                .ok_or_else(|| DataFusionError::Execution("neighbors(src, valid_at): missing `src`".into()))?,
-        )?;
-        let valid_at = expr_to_i64(
-            exprs
-                .get(1)
-                .ok_or_else(|| DataFusionError::Execution("neighbors(src, valid_at): missing `valid_at`".into()))?,
-        )?;
+        let src = expr_to_u64(exprs.first().ok_or_else(|| {
+            DataFusionError::Execution("neighbors(src, valid_at): missing `src`".into())
+        })?)?;
+        let valid_at = expr_to_i64(exprs.get(1).ok_or_else(|| {
+            DataFusionError::Execution("neighbors(src, valid_at): missing `valid_at`".into())
+        })?)?;
 
         let mut src_out = Vec::new();
         let mut dst_out = Vec::new();
@@ -86,7 +82,10 @@ impl TableFunctionImpl for NeighborsTableFunction {
             ],
         )?;
 
-        Ok(Arc::new(MemTable::try_new(Self::schema(), vec![vec![batch]])?))
+        Ok(Arc::new(MemTable::try_new(
+            Self::schema(),
+            vec![vec![batch]],
+        )?))
     }
 }
 
@@ -119,21 +118,15 @@ impl KhopTableFunction {
 impl TableFunctionImpl for KhopTableFunction {
     fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
         let exprs = args.exprs();
-        let src = expr_to_u64(
-            exprs.first().ok_or_else(|| {
-                DataFusionError::Execution("khop(src, k, valid_at): missing `src`".into())
-            })?,
-        )?;
-        let k = expr_to_i64(
-            exprs.get(1).ok_or_else(|| {
-                DataFusionError::Execution("khop(src, k, valid_at): missing `k`".into())
-            })?,
-        )? as usize;
-        let valid_at = expr_to_i64(
-            exprs.get(2).ok_or_else(|| {
-                DataFusionError::Execution("khop(src, k, valid_at): missing `valid_at`".into())
-            })?,
-        )?;
+        let src = expr_to_u64(exprs.first().ok_or_else(|| {
+            DataFusionError::Execution("khop(src, k, valid_at): missing `src`".into())
+        })?)?;
+        let k = expr_to_i64(exprs.get(1).ok_or_else(|| {
+            DataFusionError::Execution("khop(src, k, valid_at): missing `k`".into())
+        })?)? as usize;
+        let valid_at = expr_to_i64(exprs.get(2).ok_or_else(|| {
+            DataFusionError::Execution("khop(src, k, valid_at): missing `valid_at`".into())
+        })?)?;
 
         let mut budget = TraversalBudget::unlimited();
         if let Some(e) = exprs.get(3) {
@@ -143,10 +136,39 @@ impl TableFunctionImpl for KhopTableFunction {
             budget.max_edges = expr_to_i64(e)?.max(0) as u64;
         }
 
+        // In SQL `max_hops` is an optional cap on the depth, and `k` is the
+        // depth actually asked for: clamp here so a query never comes back
+        // labelled "partial" for a bound it chose itself.
+        let k = k.min(budget.max_hops);
+
+        // A SQL scalar seed becomes a one-element candidate set, so the k-hop
+        // entry point has exactly one input type whether the seed comes from a
+        // literal or from a vector KNN.
+        let seeds = Sel::from_ids(
+            UNBOUND_SNAPSHOT,
+            self.csr.node_count() as u64,
+            std::iter::once(src),
+        )
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
         let result = self
             .csr
-            .khop_bounded(&UInt64Array::from(vec![src]), k, valid_at, &budget, None, None)
+            .khop_bounded(&seeds, k, valid_at, &budget, None, None)
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+        // SQL has no channel for "partial result", and an empty rowset would be
+        // read as "nothing reachable" — the one conclusion a capped traversal
+        // cannot support. Fail loudly instead; Rust callers use the same
+        // `truncation` field to report three-state outcomes.
+        if let Some(t) = &result.truncation {
+            return Err(DataFusionError::Execution(format!(
+                "khop stopped early by {} (limit {}, observed {}): \
+                 result is partial, raise the budget or add a predicate",
+                t.reason.as_str(),
+                t.limit,
+                t.observed
+            )));
+        }
 
         let mut hops: Vec<u64> = Vec::new();
         let mut dst: Vec<u64> = Vec::new();
@@ -163,6 +185,9 @@ impl TableFunctionImpl for KhopTableFunction {
                 Arc::new(UInt64Array::from(dst)) as ArrayRef,
             ],
         )?;
-        Ok(Arc::new(MemTable::try_new(Self::schema(), vec![vec![batch]])?))
+        Ok(Arc::new(MemTable::try_new(
+            Self::schema(),
+            vec![vec![batch]],
+        )?))
     }
 }
