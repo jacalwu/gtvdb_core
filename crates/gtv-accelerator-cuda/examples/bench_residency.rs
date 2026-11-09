@@ -23,7 +23,7 @@
 
 use std::time::Instant;
 
-use gtv_accelerator::{Accelerator, Column, GraphLoadMetrics, SnapshotView};
+use gtv_accelerator::{Accelerator, Column, ColumnSet, GraphLoadMetrics, SnapshotView};
 use gtv_accelerator_cuda::{driver, CudaAccelerator};
 
 fn main() {
@@ -97,11 +97,97 @@ fn main() {
         return;
     }
 
+    if mode == "topology" {
+        projection_table(&acc, narrow);
+        return;
+    }
+
     if mode != "narrow" {
         stage_table(&acc, wide, "wide, dst u64");
     }
     if mode != "wide" {
         stage_table(&acc, narrow, "narrow, dst u32");
+    }
+}
+
+/// What a projection buys, and what it costs to keep five columns instead.
+///
+/// Three copies of the same graph — complete, complete-minus-labels, and
+/// topology only — each uploaded three times so the printed number is the steady
+/// one and not the context's first-touch. The last column of the table is the one
+/// that decides a design: how many edges of each projection fit in this device's
+/// budget, which is the wall an 8 GB card hits long before PCIe does.
+fn projection_table(acc: &CudaAccelerator, narrow: SnapshotView<'_>) {
+    let with_time = ColumnSet::ALL.without(ColumnSet::LABELS);
+    let rows = [
+        ("all 5", narrow),
+        ("no labels", narrow.with_columns(with_time)),
+        ("topology", narrow.with_columns(ColumnSet::TOPOLOGY)),
+    ];
+
+    println!("== projection ==");
+    println!(
+        "  {:<10} {:>10} {:>13} {:>13} {:>7} {:>7} {:>9} {:>12}",
+        "columns", "cols", "bytes", "deferred", "B/edge", "ms", "GB/s", "edges @budget"
+    );
+    let budget = acc.budget_bytes();
+    for (label, view) in rows {
+        let mut steady = 0.0;
+        let mut m = None;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let h = acc.load_graph(view).unwrap().expect("residency supported");
+            steady = ms(t.elapsed());
+            acc.release_graph(&h);
+            m = acc.last_load_metrics();
+        }
+        let Some(m) = m else { continue };
+        let per_edge = view.bytes() as f64 / view.edge_count().max(1) as f64;
+        println!(
+            "  {:<10} {:>10} {:>13} {:>13} {:>7.2} {:>7.2} {:>9.2} {:>12}",
+            label,
+            view.columns.len(),
+            view.bytes(),
+            view.deferred_bytes(),
+            per_edge,
+            steady,
+            m.upload_gbps(),
+            fmt_edges((budget as f64 / per_edge) as u64)
+        );
+    }
+
+    // The same arithmetic stated once, because it is the argument for the whole
+    // feature: the five-column copy is what overflows the card, and dropping the
+    // two arrays a walk never reads is a bigger capacity win than any narrowing.
+    let per_edge_all = narrow.bytes() as f64 / narrow.edge_count().max(1) as f64;
+    let per_edge_topo = {
+        let v = narrow.with_columns(ColumnSet::TOPOLOGY);
+        v.bytes() as f64 / v.edge_count().max(1) as f64
+    };
+    println!(
+        "\n  budget {:.2} GiB | full copy {:.2} B/edge -> {} edges | topology {:.2} B/edge -> {} edges ({:.1}x)",
+        budget as f64 / (1u64 << 30) as f64,
+        per_edge_all,
+        fmt_edges((budget as f64 / per_edge_all) as u64),
+        per_edge_topo,
+        fmt_edges((budget as f64 / per_edge_topo) as u64),
+        per_edge_all / per_edge_topo
+    );
+    let temporal_bytes =
+        ColumnSet::TEMPORAL.bytes(narrow.node_count, narrow.edge_count(), narrow.dst_layout());
+    let temporal_share = temporal_bytes as f64 / narrow.bytes() as f64 * 100.0;
+    println!("  temporal columns alone: {temporal_share:.1}% of the full copy\n");
+}
+
+fn fmt_edges(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.2}B", n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.0}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1e3)
+    } else {
+        format!("{n}")
     }
 }
 

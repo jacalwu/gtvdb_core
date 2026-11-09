@@ -67,6 +67,129 @@ impl Column {
     }
 }
 
+/// A projection: which of the five columns a copy actually carries.
+///
+/// A device copy is not one object, it is five arrays that happen to share a
+/// snapshot id. Uploading all five when a walk only reads topology costs 23
+/// B/edge for 5 — the two time columns alone are 16 of those bytes, and a
+/// neighbour scan never touches them. The projection is how a caller says
+/// "topology only" without a second view type, and it is also the second half
+/// of a cache key: a topology-only copy must never answer a request that needs
+/// `valid_from`.
+///
+/// Ordering and hashing come from the bit pattern, so a set is usable as a map
+/// key next to the snapshot id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ColumnSet(u8);
+
+impl ColumnSet {
+    pub const EMPTY: Self = Self(0);
+    /// What a neighbour scan reads: where a node's edges begin, and where they
+    /// point. Nothing else is on the walk's critical path.
+    pub const TOPOLOGY: Self = Self(0b00011);
+    /// When each edge is live. Read only by a time-filtered walk, and it is the
+    /// largest part of an upload: 16 of the 23 B/edge.
+    pub const TEMPORAL: Self = Self(0b01100);
+    /// The edge label, for a typed walk.
+    pub const LABELS: Self = Self(0b10000);
+    pub const ALL: Self = Self(0b11111);
+
+    pub fn single(column: Column) -> Self {
+        Self(1 << column.index())
+    }
+
+    pub fn contains(self, column: Column) -> bool {
+        self.0 & (1 << column.index()) != 0
+    }
+
+    pub fn insert(&mut self, column: Column) {
+        self.0 |= 1 << column.index();
+    }
+
+    pub fn remove(&mut self, column: Column) {
+        self.0 &= !(1 << column.index());
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// This set minus `other`.
+    pub fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// Columns in `required` that this set does not carry.
+    ///
+    /// This is the one predicate that stands between a projection and a wrong
+    /// answer: an operator asks for what it reads, and a copy that lacks it
+    /// must be re-uploaded rather than read out of bounds.
+    pub fn missing(self, required: Self) -> Self {
+        Self(required.0 & !self.0)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    /// Present columns, in [`Column::ALL`] order so a print site is stable.
+    pub fn iter(self) -> impl Iterator<Item = Column> {
+        Column::ALL.into_iter().filter(move |c| self.contains(*c))
+    }
+
+    /// A stable label for logs and error messages (`"offsets+dst"`).
+    pub fn names(self) -> String {
+        let mut out = String::new();
+        for c in self.iter() {
+            if !out.is_empty() {
+                out.push('+');
+            }
+            out.push_str(c.name());
+        }
+        if out.is_empty() {
+            out.push_str("none");
+        }
+        out
+    }
+
+    /// Bytes these columns occupy on the device.
+    ///
+    /// The one place the byte model lives. [`crate::SnapshotView::bytes`] calls
+    /// it, the capacity check calls it, and a benchmark prints it — three
+    /// callers that must never disagree about what 4 GB of VRAM holds.
+    pub fn bytes(self, nodes: usize, edges: usize, dst: DstLayout) -> usize {
+        let mut total = 0;
+        for c in self.iter() {
+            total += match c {
+                // One entry per node boundary, not per edge.
+                Column::Offsets => (nodes + 1) * std::mem::size_of::<u32>(),
+                _ => edges * c.bytes_per_edge(dst),
+            };
+        }
+        total
+    }
+}
+
+impl From<Column> for ColumnSet {
+    fn from(column: Column) -> Self {
+        Self::single(column)
+    }
+}
+
+impl FromIterator<Column> for ColumnSet {
+    fn from_iter<T: IntoIterator<Item = Column>>(iter: T) -> Self {
+        let mut set = Self::EMPTY;
+        for c in iter {
+            set.insert(c);
+        }
+        set
+    }
+}
+
 /// What one column cost to place on the device.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ColumnLoad {
@@ -96,6 +219,8 @@ pub struct GraphLoadMetrics {
     pub nodes: usize,
     pub edges: usize,
     pub dst_layout: DstLayout,
+    /// The projection this upload was asked for.
+    pub projection: ColumnSet,
 
     /// Caller-side cost of producing the CSR this upload consumed. `None` when
     /// the caller did not measure it — a backend cannot know how long its own
@@ -128,6 +253,10 @@ pub struct GraphLoadMetrics {
     pub staging_bytes: usize,
     /// Bytes that crossed PCIe.
     pub uploaded_bytes: usize,
+    /// Bytes the projection left on the host. Not an error and not a saving to
+    /// celebrate: it is the part of the graph a kernel cannot read yet, so it is
+    /// the size of the eventual second upload if a later operator needs it.
+    pub deferred_bytes: usize,
     /// What [`crate::SnapshotView::bytes`] priced for this upload. Must equal
     /// `uploaded_bytes`, or the budget is being charged for something other than
     /// what is resident.
@@ -141,6 +270,7 @@ impl GraphLoadMetrics {
             nodes,
             edges,
             dst_layout,
+            projection: ColumnSet::ALL,
             snapshot_materialize_ns: None,
             bind_ns: 0,
             host_alloc_ns: 0,
@@ -153,6 +283,7 @@ impl GraphLoadMetrics {
             input_bytes: 0,
             staging_bytes: 0,
             uploaded_bytes: 0,
+            deferred_bytes: 0,
             priced_bytes: 0,
         }
     }
@@ -211,6 +342,24 @@ impl GraphLoadMetrics {
     /// over- or under-commits.
     pub fn accounting_holds(&self) -> bool {
         self.priced_bytes == self.uploaded_bytes
+    }
+
+    /// True when the upload carried fewer than five columns.
+    ///
+    /// A projected copy is not a partial load waiting to be completed: it is the
+    /// answer to "what does this operator read?" — and it is the number that
+    /// decides whether the graph fits in the device at all.
+    pub fn is_projected(&self) -> bool {
+        self.deferred_bytes > 0
+    }
+
+    /// Share of the graph left on the host, 0.0–1.0.
+    pub fn deferred_share(&self) -> f64 {
+        let total = self.uploaded_bytes + self.deferred_bytes;
+        if total == 0 {
+            return 0.0;
+        }
+        self.deferred_bytes as f64 / total as f64
     }
 
     /// Share of the load that was PCIe transfer, 0.0–1.0. The number that

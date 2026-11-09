@@ -10,10 +10,13 @@
 //!
 //! # The three invariants
 //!
-//! 1. **Keyed by snapshot only.** `business_t` is not part of the key. A graph
-//!    copy is a function of the snapshot; the time predicate is an argument to
-//!    each operator. Including `t` would re-upload the whole graph for every
-//!    query — the exact opposite of the reason to have a device copy.
+//! 1. **Keyed by snapshot and projection.** `business_t` is not part of the key.
+//!    A graph copy is a function of the snapshot *and of which columns were
+//!    asked for*; the time predicate is an argument to each operator. Including
+//!    `t` would re-upload the whole graph for every query — the exact opposite
+//!    of the reason to have a device copy. Including the projection does the
+//!    opposite: it lets a topology-only copy and a temporal copy coexist, at
+//!    6 and 23 bytes per edge, instead of one of them evicting the other.
 //! 2. **Pinning is reference counting.** A handle handed to a query is an
 //!    `Arc<ResidentGraph>` clone; the cache holds one reference itself. An entry
 //!    whose count is above one cannot be freed, so it is not evicted — the
@@ -39,6 +42,7 @@ use crate::api::{
     Accelerator, ResidentGraph, ResidentVectors, SnapshotId, SnapshotView, VectorView,
 };
 use crate::error::AcceleratorError;
+use crate::metrics::ColumnSet;
 
 /// A handle the cache can account for.
 pub trait Resident: Send + Sync {
@@ -251,10 +255,18 @@ impl<K: Ord + Copy + std::fmt::Debug, H: Resident> Lru<K, H> {
     }
 }
 
-/// Resident copies of graphs, one per snapshot.
+/// What identifies a graph copy: the snapshot *and* the columns in it.
+///
+/// The projection belongs in the key for the same reason the snapshot id does —
+/// two copies that answer different questions are different objects. Keying on
+/// the snapshot alone would hand a topology-only copy to an operator that reads
+/// `valid_from`, and the failure would be a wrong answer rather than a miss.
+pub type GraphKey = (SnapshotId, ColumnSet);
+
+/// Resident copies of graphs, one per (snapshot, projection).
 pub struct ResidentCache {
     backend: Arc<dyn Accelerator>,
-    lru: Lru<SnapshotId, ResidentGraph>,
+    lru: Lru<GraphKey, ResidentGraph>,
 }
 
 impl ResidentCache {
@@ -278,11 +290,15 @@ impl ResidentCache {
         view: SnapshotView<'_>,
     ) -> Result<Option<Arc<ResidentGraph>>, AcceleratorError> {
         self.lru.drain_releasable(&mut |h| self.backend.release_graph(h));
-        if let Some(h) = self.lru.get(&view.snapshot_id) {
+        let key: GraphKey = (view.snapshot_id, view.required_columns());
+        if let Some(h) = self.lru.get(&key) {
             self.lru.stats.hits += 1;
-            // A hit must never disagree about the snapshot; if it did, the key
-            // would be wrong and every answer after it would be too.
+            // A hit must never disagree about the snapshot or the projection; if
+            // it did, the key would be wrong and every answer after it would be
+            // too. Checked rather than assumed because a backend is free to
+            // return a *wider* copy than asked for, and that stays a hit.
             debug_assert_eq!(h.snapshot_id(), view.snapshot_id);
+            debug_assert!(h.check_columns(key.1).is_ok());
             return Ok(Some(h));
         }
         self.lru.stats.misses += 1;
@@ -293,7 +309,7 @@ impl ResidentCache {
         };
         self.lru.stats.loads += 1;
         let arc = Arc::new(handle);
-        self.lru.insert(view.snapshot_id, Arc::clone(&arc));
+        self.lru.insert(key, Arc::clone(&arc));
         // `insert` may have evicted an unpinned entry; hand it back now rather
         // than waiting for the next call, so `stats().releases` reflects the
         // eviction that just happened.
@@ -313,10 +329,10 @@ impl ResidentCache {
     /// Forget everything. Used when a segment is collected or a test wants a
     /// cold cache.
     pub fn invalidate_all(&mut self) -> usize {
-        let keys: Vec<SnapshotId> = self.lru.map.keys().copied().collect();
+        let snapshots: Vec<SnapshotId> = self.lru.map.keys().map(|k| k.0).collect();
         let mut n = 0;
-        for k in keys {
-            n += self.lru.remove_snapshot(k);
+        for s in snapshots {
+            n += self.lru.remove_snapshot(s);
         }
         self.lru
             .drain_releasable(&mut |h| self.backend.release_graph(h));
@@ -339,8 +355,9 @@ impl ResidentCache {
                 .drain_releasable(&mut |h| self.backend.release_graph(h))
     }
 
+    /// Whether *any* projection of this snapshot is resident.
     pub fn is_resident(&self, snapshot_id: SnapshotId) -> bool {
-        self.lru.map.contains_key(&snapshot_id)
+        self.lru.map.keys().any(|k| k.0 == snapshot_id)
     }
 
     pub fn len(&self) -> usize {

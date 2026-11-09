@@ -17,7 +17,7 @@
 use gtv_core::{CsrColumns, Metric, Sel, TemporalCSR, VectorHit};
 
 use crate::error::AcceleratorError;
-use crate::metrics::GraphLoadMetrics;
+use crate::metrics::{Column, ColumnSet, GraphLoadMetrics};
 
 /// Identifies one immutable version of the whole database.
 ///
@@ -124,6 +124,25 @@ impl Caps {
     pub fn supports(&self, op: Op) -> bool {
         self.supported & op.bit() != 0
     }
+
+    /// Refuse a copy that cannot fit, before a byte is allocated.
+    ///
+    /// The budget is the *only* number that says "this graph is too big", and it
+    /// has to be consulted first: `cuMemAlloc` failing halfway through an upload
+    /// leaves the pool fragmented, reports a driver code instead of a size, and
+    /// tells the caller nothing about which columns were too expensive. A
+    /// pre-flight turns "OOM, somewhere" into "23 B/edge x 1.2e9 does not fit
+    /// 4.8 GiB", which is the sentence a query planner needs to choose the CPU
+    /// — or, later, a smaller chunk.
+    ///
+    /// `Fallback::Cpu` is what makes this safe to return: nothing was allocated,
+    /// nothing was lost, and the answer is still computable.
+    pub fn admit(&self, needed: usize) -> Result<(), AcceleratorError> {
+        match self.max_device_bytes {
+            Some(limit) if needed > limit => Err(AcceleratorError::OutOfBudget { needed, limit }),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Device width of the `dst` column.
@@ -187,6 +206,12 @@ pub struct SnapshotView<'a> {
     /// instead. Built by whichever producer can afford the pass once — at build
     /// time, where it is free, not at upload time, where it is not.
     pub dst32: Option<&'a [u32]>,
+    /// Which columns to upload. [`ColumnSet::ALL`] unless the caller projects.
+    ///
+    /// The arrays above are always borrowed; this says which of them the device
+    /// copy must contain. A walk that only follows edges asks for
+    /// [`ColumnSet::TOPOLOGY`] and leaves 16 of 23 bytes per edge on the host.
+    pub columns: ColumnSet,
 }
 
 impl<'a> SnapshotView<'a> {
@@ -209,6 +234,7 @@ impl<'a> SnapshotView<'a> {
             valid_to,
             edge_type,
             dst32: None,
+            columns: ColumnSet::ALL,
         }
     }
 
@@ -235,7 +261,31 @@ impl<'a> SnapshotView<'a> {
             valid_to: c.valid_to,
             edge_type: c.edge_type,
             dst32: None,
+            columns: ColumnSet::ALL,
         }
+    }
+
+    /// Upload only these columns.
+    ///
+    /// The choice is a property of the *operator*, not of the graph: a neighbour
+    /// scan never reads `valid_from`, a temporal as-of filter reads nothing else
+    /// but it and `valid_to`. Two operators therefore want two copies, and the
+    /// cache keys them separately — see [`crate::ResidentCache`].
+    ///
+    /// Topology (`offsets` + `dst`) is not optional: a copy without it is not a
+    /// graph, and [`SnapshotView::validate`] rejects it rather than letting a
+    /// kernel find out.
+    pub fn with_columns(mut self, columns: ColumnSet) -> Self {
+        self.columns = columns;
+        self
+    }
+
+    /// Columns this request needs from a resident copy.
+    ///
+    /// Kept as a method rather than a field read so the name states the
+    /// invariant: the projection *is* the requirement.
+    pub fn required_columns(&self) -> ColumnSet {
+        self.columns
     }
 
     /// From a CSR that declares its snapshot.
@@ -277,19 +327,38 @@ impl<'a> SnapshotView<'a> {
     /// This is the number the resident cache charges against
     /// `Caps::max_device_bytes`, so it has to be the number the backend really
     /// allocates — 22 B/edge with a `u32` column, 26 B/edge with the source
-    /// `u64` one. A backend that allocates differently must fail rather than
-    /// disagree; see `CudaAccelerator::load_graph`, which compares its column
-    /// total with this figure before returning a handle.
+    /// `u64` one, plus the offsets. It prices the *projection*, not the CSR: an
+    /// upload asked for topology only is charged for topology only. A backend
+    /// that allocates differently must fail rather than disagree; see
+    /// `CudaAccelerator::load_graph`, which compares its column total with this
+    /// figure before returning a handle.
     pub fn bytes(&self) -> usize {
-        let offsets = (self.node_count + 1) * std::mem::size_of::<u32>();
-        let per_edge = self.dst_layout().bytes_per_edge()  // dst
-            + 2 * std::mem::size_of::<i64>()             // valid_from, valid_to
-            + std::mem::size_of::<u16>(); // edge_type
-        offsets + self.edge_count() * per_edge
+        self.columns
+            .bytes(self.node_count, self.edge_count(), self.dst_layout())
+    }
+
+    /// Bytes this projection leaves on the host.
+    ///
+    /// The part of the graph the device cannot answer from, which is also the
+    /// size of the second upload if a later operator asks for it.
+    pub fn deferred_bytes(&self) -> usize {
+        let deferred = self.columns.missing(ColumnSet::ALL);
+        deferred.bytes(self.node_count, self.edge_count(), self.dst_layout())
     }
 
     /// Shape checks shared by every backend.
     pub fn validate(&self) -> Result<(), AcceleratorError> {
+        // Topology is the definition of the copy, not a column in it: `edge_count`
+        // is read from `dst`/`dst32`, and every other check is phrased in edges.
+        // A projection that drops it would price itself at zero edges and let a
+        // kernel walk an array of offsets with nothing behind it.
+        let topology = self.columns.missing(ColumnSet::TOPOLOGY);
+        if !topology.is_empty() {
+            return Err(AcceleratorError::InvalidArgument(format!(
+                "a graph copy needs {}, the projection omits them",
+                topology.names()
+            )));
+        }
         let e = self.edge_count();
         // Two widths of the same column may both be present, but not disagree:
         // a backend uploads one of them and prices the edge count from it.
@@ -309,14 +378,23 @@ impl<'a> SnapshotView<'a> {
                 self.node_count
             )));
         }
-        for (name, len) in [
-            ("valid_from", self.valid_from.len()),
-            ("valid_to", self.valid_to.len()),
-            ("edge_type", self.edge_type.len()),
+        // Only the columns this upload will carry are checked. A projected view
+        // is not required to hold arrays it will not transfer — that is the
+        // point of the projection, and demanding them would force the caller to
+        // borrow data it deliberately left behind.
+        for (column, len) in [
+            (Column::Dst, e),
+            (Column::ValidFrom, self.valid_from.len()),
+            (Column::ValidTo, self.valid_to.len()),
+            (Column::EdgeType, self.edge_type.len()),
         ] {
+            if !self.columns.contains(column) {
+                continue;
+            }
             if len != e {
                 return Err(AcceleratorError::InvalidArgument(format!(
-                    "{name} has {len} entries for {e} edges"
+                    "{} has {len} entries for {e} edges",
+                    column.name()
                 )));
             }
         }
@@ -402,6 +480,7 @@ pub struct ResidentGraph {
     edge_count: usize,
     bytes: usize,
     dst_layout: DstLayout,
+    columns: ColumnSet,
 }
 
 impl ResidentGraph {
@@ -421,6 +500,39 @@ impl ResidentGraph {
             // The source width, so a receipt built by hand describes the graph
             // it was built from. A backend that narrowed its copy must say so.
             dst_layout: DstLayout::U64,
+            // A receipt built by hand is assumed to describe a complete copy;
+            // a backend that projected must say so, for the same reason.
+            columns: ColumnSet::ALL,
+        }
+    }
+
+    /// Record which columns the copy actually carries.
+    ///
+    /// Not decoration: [`ResidentGraph::check_columns`] is how an operator that
+    /// reads `valid_from` refuses a topology-only copy instead of reading past
+    /// the end of five device arrays.
+    pub fn with_columns(mut self, columns: ColumnSet) -> Self {
+        self.columns = columns;
+        self
+    }
+
+    /// The columns this copy is guaranteed to carry.
+    pub fn columns(&self) -> ColumnSet {
+        self.columns
+    }
+
+    /// Fail unless the copy carries everything the operator reads.
+    pub fn check_columns(&self, required: ColumnSet) -> Result<(), AcceleratorError> {
+        let missing = self.columns.missing(required);
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(AcceleratorError::InvalidArgument(format!(
+                "resident copy of snapshot {} carries {}, but this operator reads {}",
+                self.snapshot_id,
+                self.columns.names(),
+                missing.names()
+            )))
         }
     }
 

@@ -80,7 +80,7 @@ pub use api::{
 };
 pub use cpu::{live_at, CpuAccelerator};
 pub use error::{AcceleratorError, Fallback};
-pub use metrics::{AcceleratorMetrics, Column, ColumnLoad, GraphLoadMetrics, OpRecord};
+pub use metrics::{AcceleratorMetrics, Column, ColumnLoad, ColumnSet, GraphLoadMetrics, OpRecord};
 pub use policy::{BackendDecision, DecisionInputs, DecisionReason, ExecutionPolicy};
 pub use registry::AcceleratorRegistry;
-pub use resident::{CacheStats, Resident, ResidentCache, VectorCache};
+pub use resident::{CacheStats, GraphKey, Resident, ResidentCache, VectorCache};

@@ -74,7 +74,10 @@ const DEFAULT_BUDGET_FRACTION: f64 = 0.60;
 /// One resident snapshot, as device pointers.
 struct DeviceGraph {
     snapshot_id: u64,
-    columns: Vec<u64>,
+    /// One entry per uploaded column. The projection decides how many there
+    /// are, so a pointer's position no longer says which column it is — a
+    /// kernel must look the column up by name.
+    columns: Vec<(Column, u64)>,
     bytes: usize,
 }
 
@@ -219,8 +222,8 @@ impl CudaAccelerator {
         }
     }
 
-    fn free_all(&self, columns: &mut Vec<u64>) {
-        for p in columns.drain(..) {
+    fn free_all(&self, columns: &mut Vec<(Column, u64)>) {
+        for (_, p) in columns.drain(..) {
             self.driver.free(p);
         }
     }
@@ -275,6 +278,12 @@ impl Accelerator for CudaAccelerator {
         // snapshot's cost to another.
         self.forget_metrics();
 
+        // Too big is a scheduling fact, not a backend failure: say so before
+        // binding, so the caller gets the two numbers instead of a `cuMemAlloc`
+        // code from a half-populated pool. With a projection this check is what
+        // makes "topology fits, the time columns do not" an answerable question.
+        self.caps().admit(bytes)?;
+
         let t = Instant::now();
         self.driver
             .bind(self.context)
@@ -299,32 +308,38 @@ impl Accelerator for CudaAccelerator {
         // it already got. Four of the five uploads are straight memcpys of the
         // CSR's own order, so nothing is repacked on the host — and `input_bytes`
         // below is what makes that claim checkable rather than a comment.
-        let cols: [(Column, *const u8, usize); 5] = [
-            (
-                Column::Offsets,
-                view.offsets.as_ptr() as *const u8,
-                std::mem::size_of_val(view.offsets),
-            ),
-            (Column::Dst, dst_src.0, dst_src.1),
-            (
-                Column::ValidFrom,
-                view.valid_from.as_ptr() as *const u8,
-                std::mem::size_of_val(view.valid_from),
-            ),
-            (
-                Column::ValidTo,
-                view.valid_to.as_ptr() as *const u8,
-                std::mem::size_of_val(view.valid_to),
-            ),
-            (
-                Column::EdgeType,
-                view.edge_type.as_ptr() as *const u8,
-                std::mem::size_of_val(view.edge_type),
-            ),
-        ];
+        // The projection decides the list, so a topology-only upload allocates
+        // two buffers and touches no time column at all. `validate` has already
+        // refused a projection without topology, which is what lets the match
+        // below assume `offsets` is present when it is asked for.
+        let mut cols: Vec<(Column, *const u8, usize)> = Vec::with_capacity(view.columns.len());
+        for col in view.columns.iter() {
+            let (src, len) = match col {
+                Column::Offsets => (
+                    view.offsets.as_ptr() as *const u8,
+                    std::mem::size_of_val(view.offsets),
+                ),
+                Column::Dst => dst_src,
+                Column::ValidFrom => (
+                    view.valid_from.as_ptr() as *const u8,
+                    std::mem::size_of_val(view.valid_from),
+                ),
+                Column::ValidTo => (
+                    view.valid_to.as_ptr() as *const u8,
+                    std::mem::size_of_val(view.valid_to),
+                ),
+                Column::EdgeType => (
+                    view.edge_type.as_ptr() as *const u8,
+                    std::mem::size_of_val(view.edge_type),
+                ),
+            };
+            cols.push((col, src, len));
+        }
         m.input_bytes = cols.iter().map(|(_, _, len)| *len).sum();
+        m.projection = view.columns;
+        m.deferred_bytes = view.deferred_bytes();
 
-        let mut columns: Vec<u64> = Vec::with_capacity(cols.len());
+        let mut columns: Vec<(Column, u64)> = Vec::with_capacity(cols.len());
         let mut allocated = 0usize;
         for (col, src, len) in cols {
             let name = col.name();
@@ -352,7 +367,7 @@ impl Accelerator for CudaAccelerator {
                     format!("{name} ({len} bytes): {reason}"),
                 ));
             }
-            columns.push(ptr);
+            columns.push((col, ptr));
             allocated += len;
             m.record_column(col, len, alloc_ns, nanos(t.elapsed()));
         }
@@ -388,7 +403,8 @@ impl Accelerator for CudaAccelerator {
             view.edge_count(),
             bytes,
         )
-        .with_dst_layout(view.dst_layout());
+        .with_dst_layout(view.dst_layout())
+        .with_columns(view.columns);
         self.graphs()?.insert(
             token,
             DeviceGraph {
@@ -423,7 +439,7 @@ impl Accelerator for CudaAccelerator {
             // entry is the best that can be done and leaks nothing else.
             return;
         }
-        for p in entry.columns {
+        for (_, p) in entry.columns {
             self.driver.free(p);
         }
     }
@@ -434,7 +450,7 @@ impl Drop for CudaAccelerator {
         if self.driver.bind(self.context).is_ok() {
             if let Ok(mut g) = self.graphs.lock() {
                 for (_, entry) in g.drain() {
-                    for p in entry.columns {
+                    for (_, p) in entry.columns {
                         self.driver.free(p);
                     }
                 }

@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use gtv_accelerator::{
-    Accelerator, Column, CpuAccelerator, DecisionInputs, DstLayout, ExecutionPolicy, Op,
+    Accelerator, Column, ColumnSet, CpuAccelerator, DecisionInputs, DstLayout, ExecutionPolicy, Op,
     ResidentCache, SnapshotView,
 };
 use gtv_accelerator_cuda::CudaAccelerator;
@@ -190,6 +190,77 @@ fn a_prebuilt_u32_column_costs_four_bytes_less_per_edge() {
     assert_eq!(acc.resident_bytes(), narrow.bytes());
     acc.release_graph(&h);
     assert_eq!(acc.resident_bytes(), 0);
+}
+
+/// A projected upload puts two buffers on the device instead of five, and the
+/// budget is charged for two. The assertion that matters is the physical one:
+/// `resident_bytes` after the release returns to zero, so nothing was allocated
+/// behind the receipt's back.
+#[test]
+fn a_topology_only_upload_never_touches_the_time_columns() {
+    let _serial = exclusive();
+    let acc = device_or_skip!();
+    let (o, dst, vf, vt, et) = chain(1_000_000);
+    let dst32: Vec<u32> = dst.iter().map(|&d| d as u32).collect();
+
+    let full = view(1, 1_000_000, &o, &dst, &vf, &vt, &et).with_dst32(&dst32);
+    let topo = full.with_columns(ColumnSet::TOPOLOGY);
+
+    let h = acc
+        .load_graph(topo)
+        .unwrap()
+        .expect("device does residency");
+    let m = acc.last_load_metrics().expect("a load leaves a receipt");
+
+    assert_eq!(h.columns(), ColumnSet::TOPOLOGY);
+    assert_eq!(m.projection, ColumnSet::TOPOLOGY);
+    assert_eq!(m.uploaded_bytes, topo.bytes());
+    assert_eq!(m.deferred_bytes, topo.deferred_bytes());
+    assert_eq!(m.uploaded_bytes + m.deferred_bytes, full.bytes());
+    // 16 of the 23 B/edge are the two time columns; the label is the other 2.
+    assert_eq!(m.column(Column::ValidFrom).bytes, 0);
+    assert_eq!(m.column(Column::ValidTo).bytes, 0);
+    assert_eq!(m.column(Column::EdgeType).bytes, 0);
+    assert_eq!(m.column(Column::Dst).bytes, 4 * 999_999);
+    assert_eq!(acc.resident_bytes(), topo.bytes());
+    assert!(m.accounting_holds());
+
+    acc.release_graph(&h);
+    assert_eq!(acc.resident_bytes(), 0);
+}
+
+/// The wall an 8 GB card hits: a full copy that does not fit is refused with
+/// both numbers, before `cuMemAlloc` is asked for anything.
+///
+/// The refusal is a `Fallback::Cpu` error, not a query failure — which is the
+/// contract that lets a planner answer on the CPU instead of returning OOM.
+#[test]
+fn a_graph_larger_than_the_budget_is_refused_not_attempted() {
+    let _serial = exclusive();
+    let acc = device_or_skip!();
+    let (o, dst, vf, vt, et) = chain(64);
+    let v = view(1, 64, &o, &dst, &vf, &vt, &et);
+
+    // The real budget is a fraction of the card, far above this graph; ask the
+    // same question the upload will ask, with a budget one byte too small.
+    let needed = v.bytes();
+    let err = gtv_accelerator::Caps::new(
+        gtv_accelerator::BackendKind::Cuda,
+        "probe",
+        Some(needed - 1),
+    )
+    .admit(needed)
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        gtv_accelerator::AcceleratorError::OutOfBudget { .. }
+    ));
+
+    // And the real backend admits what does fit, so the check is not a wall in
+    // front of every upload.
+    acc.caps().admit(needed).unwrap();
+    let h = acc.load_graph(v).unwrap().unwrap();
+    acc.release_graph(&h);
 }
 
 #[test]

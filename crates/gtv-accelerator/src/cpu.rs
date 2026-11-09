@@ -144,7 +144,8 @@ impl Accelerator for CpuAccelerator {
             view.node_count,
             view.edge_count(),
             bytes,
-        );
+        )
+        .with_columns(view.columns);
         let host = HostGraph {
             snapshot_id: view.snapshot_id,
             node_count: view.node_count,
