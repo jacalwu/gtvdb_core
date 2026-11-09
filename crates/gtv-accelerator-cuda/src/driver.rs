@@ -49,6 +49,15 @@ const ATTR_CC_MAJOR: i32 = 75;
 const ATTR_CC_MINOR: i32 = 76;
 const ATTR_MULTIPROCESSORS: i32 = 16;
 
+// `CUjit_option` values for the JIT error log: the buffer, and its size in
+// bytes. Both are passed the same way — the size is a `size_t` riding in a
+// `void*` slot, which is what the header's `void** optionValues` means.
+const CU_JIT_ERROR_LOG_BUFFER: i32 = 5;
+const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: i32 = 6;
+/// Enough for a line number and a sentence; the JIT truncates rather than
+/// failing if a message does not fit.
+const JIT_LOG_BYTES: usize = 4096;
+
 /// `nvcuda.dll` on Windows, `libcuda.so.1` elsewhere.
 #[cfg(windows)]
 const LIB_NAMES: &[&str] = &["nvcuda.dll"];
@@ -84,6 +93,38 @@ type FnMemFreeHost = unsafe extern "C" fn(*mut std::ffi::c_void) -> CuResult;
 type FnMemcpyHtoDAsync =
     unsafe extern "C" fn(u64, *const std::ffi::c_void, usize, *mut std::ffi::c_void) -> CuResult;
 type FnErrorString = unsafe extern "C" fn(CuResult, *mut *const std::ffi::c_char) -> CuResult;
+type FnMemcpyDtoH = unsafe extern "C" fn(*mut std::ffi::c_void, u64, usize) -> CuResult;
+type FnModuleLoad = unsafe extern "C" fn(
+    *mut *mut std::ffi::c_void,
+    *const std::ffi::c_void,
+    u32,
+    *mut i32,
+    *mut *mut std::ffi::c_void,
+) -> CuResult;
+type FnModuleFunction = unsafe extern "C" fn(
+    *mut *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *const std::ffi::c_char,
+) -> CuResult;
+type FnModuleUnload = unsafe extern "C" fn(*mut std::ffi::c_void) -> CuResult;
+type FnLaunch = unsafe extern "C" fn(
+    *mut std::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut std::ffi::c_void,
+    *mut *mut std::ffi::c_void,
+    *mut *mut std::ffi::c_void,
+) -> CuResult;
+type FnEventCreate = unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32) -> CuResult;
+type FnEventRecord = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> CuResult;
+type FnEventSync = unsafe extern "C" fn(*mut std::ffi::c_void) -> CuResult;
+type FnEventElapsed = unsafe extern "C" fn(*mut f32, *mut std::ffi::c_void, *mut std::ffi::c_void) -> CuResult;
+type FnEventDestroy = unsafe extern "C" fn(*mut std::ffi::c_void) -> CuResult;
 
 struct Fns {
     init: FnInit,
@@ -103,6 +144,16 @@ struct Fns {
     mem_host_alloc: FnMemHostAlloc,
     mem_free_host: FnMemFreeHost,
     memcpy_htod_async: FnMemcpyHtoDAsync,
+    memcpy_dtoh: FnMemcpyDtoH,
+    module_load_ex: FnModuleLoad,
+    module_function: FnModuleFunction,
+    module_unload: FnModuleUnload,
+    launch: FnLaunch,
+    event_create: FnEventCreate,
+    event_record: FnEventRecord,
+    event_sync: FnEventSync,
+    event_elapsed: FnEventElapsed,
+    event_destroy: FnEventDestroy,
     error_string: Option<FnErrorString>,
 }
 
@@ -352,6 +403,87 @@ impl Driver {
         Ok(())
     }
 
+    /// Device-to-host copy. Blocking, like its H2D counterpart: it returns after
+    /// the bytes are in host memory, which is also what makes it a barrier for a
+    /// kernel queued before it on the same stream.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be a device pointer with at least `len` readable bytes, and
+    /// `dst` must be writable for `len` bytes.
+    pub unsafe fn copy_dtoh(&self, dst: *mut u8, src: u64, len: usize) -> Result<(), String> {
+        if len == 0 {
+            return Ok(());
+        }
+        let rc = (self.fns.memcpy_dtoh)(dst as *mut std::ffi::c_void, src, len);
+        if rc != CUDA_SUCCESS {
+            return Err(self.error(&format!("cuMemcpyDtoH({len})"), rc));
+        }
+        Ok(())
+    }
+
+    // -- modules and kernels ------------------------------------------------
+
+    /// Load PTX text into the current context.
+    ///
+    /// The PTX arrives as text because that is what the driver JITs: one
+    /// `compute_80` image covers every card from Ampere onward, which a
+    /// machine-code cubin would not. There is no toolkit dependency at either
+    /// build or run time — the image is a file in this repository.
+    pub fn load_ptx(&'static self, ptx: &str) -> Result<Module, String> {
+        let image = CString::new(ptx)
+            .map_err(|_| "PTX contains a NUL byte".to_string())?;
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        // `cuModuleLoadDataEx` rather than `cuModuleLoadData` for one reason:
+        // the JIT's error log. A plain load reports `CUDA_ERROR_INVALID_PTX` and
+        // nothing else — "compilation failed" with no line number. The log has
+        // the line and the reason, which is the difference between a five-minute
+        // fix and a bisect.
+        let mut log = vec![0u8; JIT_LOG_BYTES];
+        let mut options: [i32; 2] = [CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES];
+        let mut values: [*mut std::ffi::c_void; 2] = [
+            log.as_mut_ptr() as *mut std::ffi::c_void,
+            JIT_LOG_BYTES as *mut std::ffi::c_void,
+        ];
+        let rc = unsafe {
+            (self.fns.module_load_ex)(
+                &mut handle,
+                image.as_ptr() as *const std::ffi::c_void,
+                options.len() as u32,
+                options.as_mut_ptr(),
+                values.as_mut_ptr(),
+            )
+        };
+        if rc != CUDA_SUCCESS || handle.is_null() {
+            let detail = unsafe { std::ffi::CStr::from_ptr(log.as_ptr() as *const std::ffi::c_char) }
+                .to_string_lossy()
+                .trim()
+                .to_string();
+            let mut msg = self.error("cuModuleLoadDataEx", rc);
+            if !detail.is_empty() {
+                msg.push_str(": ");
+                msg.push_str(&detail);
+            }
+            return Err(msg);
+        }
+        Ok(Module { handle, driver: self })
+    }
+
+    // -- timing -------------------------------------------------------------
+
+    /// A recorded instant on the current stream.
+    pub fn event(&'static self) -> Result<Event, String> {
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe { (self.fns.event_create)(&mut handle, 0) };
+        if rc != CUDA_SUCCESS || handle.is_null() {
+            return Err(self.error("cuEventCreate", rc));
+        }
+        Ok(Event {
+            handle,
+            driver: self,
+        })
+    }
+
     fn error(&self, what: &str, rc: CuResult) -> String {
         let detail = self
             .fns
@@ -423,6 +555,159 @@ impl Drop for PinnedBuffer {
 // between threads by anything in this module.
 unsafe impl Send for PinnedBuffer {}
 
+/// A loaded PTX module. Owns the handle, so the unload cannot be forgotten.
+pub struct Module {
+    handle: *mut std::ffi::c_void,
+    driver: &'static Driver,
+}
+
+impl Module {
+    /// Look up a `__global__` entry point. The returned [`Function`] borrows the
+    /// module: unloading the module invalidates every function in it, and the
+    /// borrow is what prevents that from being expressible.
+    pub fn function(&self, name: &str) -> Result<Function<'_>, String> {
+        let c = CString::new(name).map_err(|_| format!("{name} contains a NUL"))?;
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe { (self.driver.fns.module_function)(&mut handle, self.handle, c.as_ptr()) };
+        if rc != CUDA_SUCCESS || handle.is_null() {
+            return Err(self.driver.error(&format!("cuModuleGetFunction({name})"), rc));
+        }
+        Ok(Function {
+            handle,
+            module: self,
+        })
+    }
+}
+
+impl Drop for Module {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // `cuModuleUnload` needs the context the module was loaded in to be
+            // current. If it is not, the call fails and the module leaks with
+            // the context — which is why the kernel module is a process-wide
+            // `OnceLock` and never dropped in practice.
+            unsafe {
+                (self.driver.fns.module_unload)(self.handle);
+            }
+        }
+        self.handle = std::ptr::null_mut();
+    }
+}
+
+// SAFETY: a CUmodule is a context-scoped handle, not a pointer this code ever
+// dereferences; the driver API is thread-safe and every launch below re-binds
+// the context on the calling thread first.
+unsafe impl Send for Module {}
+unsafe impl Sync for Module {}
+
+/// A kernel entry point, borrowed from its module.
+pub struct Function<'a> {
+    handle: *mut std::ffi::c_void,
+    module: &'a Module,
+}
+
+// SAFETY: a CUfunction is an opaque handle scoped to a context, not a pointer
+// this code ever dereferences. Launching from a thread whose current context is
+// not the module's returns a driver error rather than misbehaving, and the
+// driver API is thread-safe.
+unsafe impl Send for Function<'_> {}
+unsafe impl Sync for Function<'_> {}
+
+impl Function<'_> {
+    /// Launch on the legacy default stream.
+    ///
+    /// `args` is the kernel's parameter list, one `*mut c_void` per parameter
+    /// pointing at the value. It is `&mut` because the driver's signature wants
+    /// a mutable array; nothing writes through it.
+    ///
+    /// # Safety
+    ///
+    /// Every element of `args` must point to a live value of exactly the type
+    /// the kernel declares at that position, and `grid * block` must not index
+    /// outside the buffers those pointers name. The type system cannot check
+    /// either, which is why exactly one call site in this crate does it.
+    pub unsafe fn launch(
+        &self,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_bytes: usize,
+        args: &mut [*mut std::ffi::c_void],
+    ) -> Result<(), String> {
+        let rc = (self.module.driver.fns.launch)(
+            self.handle,
+            grid.0,
+            grid.1,
+            grid.2,
+            block.0,
+            block.1,
+            block.2,
+            shared_bytes as u32,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if rc != CUDA_SUCCESS {
+            return Err(self
+                .module
+                .driver
+                .error(&format!("cuLaunchKernel(shared={shared_bytes})"), rc));
+        }
+        Ok(())
+    }
+}
+
+/// A recorded instant in the current stream, used to split a call into stages.
+///
+/// Events rather than `Instant::now()` around a blocking copy: the kernel runs
+/// asynchronously, so wall time around the launch measures the launch, and wall
+/// time around the copy measures copy + kernel together. Recording on the stream
+/// is the only way to attribute the milliseconds to the right stage.
+pub struct Event {
+    handle: *mut std::ffi::c_void,
+    driver: &'static Driver,
+}
+
+impl Event {
+    /// Mark this point in the stream.
+    pub fn record(&self) -> Result<(), String> {
+        let rc = unsafe { (self.driver.fns.event_record)(self.handle, std::ptr::null_mut()) };
+        if rc != CUDA_SUCCESS {
+            return Err(self.driver.error("cuEventRecord", rc));
+        }
+        Ok(())
+    }
+
+    /// Block until the stream reaches this event.
+    pub fn synchronize(&self) -> Result<(), String> {
+        let rc = unsafe { (self.driver.fns.event_sync)(self.handle) };
+        if rc != CUDA_SUCCESS {
+            return Err(self.driver.error("cuEventSynchronize", rc));
+        }
+        Ok(())
+    }
+
+    /// Milliseconds from `self` to `later`, or an error if either never recorded.
+    pub fn elapsed_ms(&self, later: &Event) -> Result<f32, String> {
+        let mut ms = 0.0f32;
+        let rc = unsafe { (self.driver.fns.event_elapsed)(&mut ms, self.handle, later.handle) };
+        if rc != CUDA_SUCCESS {
+            return Err(self.driver.error("cuEventElapsedTime", rc));
+        }
+        Ok(ms)
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                (self.driver.fns.event_destroy)(self.handle);
+            }
+        }
+        self.handle = std::ptr::null_mut();
+    }
+}
+
 impl Fns {
     fn load(lib: &Library) -> Result<Fns, String> {
         fn need<T: Copy>(lib: &Library, name: &str) -> Result<T, String> {
@@ -464,6 +749,18 @@ impl Fns {
             mem_free_host: need(lib, "cuMemFreeHost")?,
             memcpy_htod_async: optional(lib, &["cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync"])
                 .ok_or_else(|| "driver is missing cuMemcpyHtoDAsync".to_string())?,
+            memcpy_dtoh: optional(lib, &["cuMemcpyDtoH_v2", "cuMemcpyDtoH"])
+                .ok_or_else(|| "driver is missing cuMemcpyDtoH".to_string())?,
+            module_load_ex: need(lib, "cuModuleLoadDataEx")?,
+            module_function: need(lib, "cuModuleGetFunction")?,
+            module_unload: need(lib, "cuModuleUnload")?,
+            launch: need(lib, "cuLaunchKernel")?,
+            event_create: need(lib, "cuEventCreate")?,
+            event_record: need(lib, "cuEventRecord")?,
+            event_sync: need(lib, "cuEventSynchronize")?,
+            event_elapsed: need(lib, "cuEventElapsedTime")?,
+            event_destroy: optional(lib, &["cuEventDestroy_v2", "cuEventDestroy"])
+                .ok_or_else(|| "driver is missing cuEventDestroy".to_string())?,
             error_string: optional(lib, &["cuGetErrorString"]),
         })
     }

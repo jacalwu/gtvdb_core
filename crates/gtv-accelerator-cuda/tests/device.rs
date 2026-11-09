@@ -12,10 +12,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use gtv_accelerator::{
-    Accelerator, Column, ColumnSet, CpuAccelerator, DecisionInputs, DstLayout, ExecutionPolicy, Op,
-    ResidentCache, SnapshotView,
+    Accelerator, AcceleratorError, Column, ColumnSet, CpuAccelerator, DecisionInputs, DstLayout,
+    ExecutionPolicy, Op, ResidentCache, ResidentVectors, SnapshotView, VectorView,
 };
 use gtv_accelerator_cuda::CudaAccelerator;
+use gtv_core::{Metric, Sel, VectorHit};
 
 /// Build a chain graph: node `i -> i+1` for every `i`, all live on `[0, 1000)`.
 /// Returns the five columns plus the node count.
@@ -385,10 +386,12 @@ fn the_cache_drives_the_device_lifecycle() {
 }
 
 #[test]
-fn the_device_is_not_used_until_a_kernel_exists() {
+fn the_kernels_advertised_are_the_kernels_that_landed() {
     let _serial = exclusive();
-    // C1 boundary, asserted rather than described: a route through the registry
-    // must say `Unsupported`, because the backend advertises no operator.
+    // C2 boundary, asserted rather than described: `knn_flat` now routes to the
+    // device once the work clears the threshold, while `window_reduce` — not
+    // ported yet — still reports `Unsupported` rather than pretending there is
+    // no GPU.
     let acc = device_or_skip!();
     let mut reg = gtv_accelerator::AcceleratorRegistry::new();
     reg.register(Arc::new(acc));
@@ -397,12 +400,38 @@ fn the_device_is_not_used_until_a_kernel_exists() {
 
     let (decision, backend) =
         reg.route(&policy, &DecisionInputs::new(&caps, Op::KnnFlat, 10_000_000));
+    assert!(decision.is_device(), "{decision:?}");
+    assert!(backend.is_some());
+
+    let (decision, backend) =
+        reg.route(&policy, &DecisionInputs::new(&caps, Op::WindowReduce, 10_000_000));
     assert!(!decision.is_device());
     assert!(backend.is_none());
     assert_eq!(
         decision.reason(),
         Some(gtv_accelerator::DecisionReason::Unsupported)
     );
+
+    // And a k the shared-memory heap cannot hold is refused at plan time, not by
+    // a launch that was never going to fit.
+    let (decision, _) = reg.route(
+        &policy,
+        &DecisionInputs::new(&caps, Op::KnnFlat, 10_000_000).with_k(4096),
+    );
+    assert_eq!(
+        decision.reason(),
+        Some(gtv_accelerator::DecisionReason::KTooLarge {
+            k: 4096,
+            max_k: 256
+        })
+    );
+    // Small work still stays on the CPU: nothing about C2 changes the transfer
+    // arithmetic that put the threshold there.
+    let (decision, _) = reg.route(&policy, &DecisionInputs::new(&caps, Op::KnnFlat, 10));
+    assert!(matches!(
+        decision.reason(),
+        Some(gtv_accelerator::DecisionReason::BelowThreshold { .. })
+    ));
 }
 
 #[test]
@@ -431,4 +460,351 @@ fn the_cpu_reference_still_answers_the_same_question() {
     let got = cpu.valid_time_filter(cpu_handle.as_ref().unwrap(), 0).unwrap();
     // Every chain edge is live at 0.
     assert_eq!(got.len(), 31);
+}
+
+// ---------------------------------------------------------------------------
+// C2: flat batch K-NN
+// ---------------------------------------------------------------------------
+
+/// A deterministic corpus: a 64-bit LCG in `[-0.5, 0.5)`.
+///
+/// Deterministic rather than random so a failure reproduces; wide enough that
+/// the k-th and (k+1)-th distances are never within rounding of each other, which
+/// is checked by [`gap_is_unambiguous`] rather than assumed.
+fn corpus(rows: usize, dim: usize) -> (Vec<f32>, Vec<u64>) {
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    let data: Vec<f32> = (0..rows * dim).map(|_| next()).collect();
+    // Ids deliberately not the row index: a backend that returns positions
+    // instead of ids would pass every test that assumes `id == row`.
+    let ids: Vec<u64> = (0..rows as u64).map(|i| 1000 + i * 7).collect();
+    (data, ids)
+}
+
+fn vector_view<'a>(
+    space: u32,
+    snapshot: u64,
+    dim: usize,
+    metric: Metric,
+    data: &'a [f32],
+    ids: &'a [u64],
+) -> VectorView<'a> {
+    VectorView::new(space, snapshot, dim, metric, data, ids)
+}
+
+/// The device's answer must equal the CPU's, up to the rounding that a different
+/// summation order costs.
+///
+/// Two assertions, and the second is the one that makes the first meaningful:
+///
+/// * every distance is within `1e-5 * max(1, |d|)` of the reference;
+/// * the ids are the same, *provided* the reference's k-th and (k+1)-th
+///   distances are far enough apart that no rounding could reorder them. Run
+///   `k + 1` on the CPU to get that gap and check it here, so a "the sets differ"
+///   failure can never mean "the corpus had a tie at the boundary".
+fn assert_matches_reference(
+    label: &str,
+    gpu: &[Vec<VectorHit>],
+    cpu_k: &[Vec<VectorHit>],
+    cpu_k1: &[Vec<VectorHit>],
+    k: usize,
+) {
+    assert_eq!(gpu.len(), cpu_k.len(), "{label}: batch length");
+    for (q, (got, want)) in gpu.iter().zip(cpu_k).enumerate() {
+        assert_eq!(got.len(), want.len(), "{label} q{q}: hit count");
+        for (rank, (g, w)) in got.iter().zip(want).enumerate() {
+            let tol = 1e-5 * w.distance.abs().max(1.0);
+            assert!(
+                (g.distance - w.distance).abs() <= tol,
+                "{label} q{q} rank{rank}: distance {} vs {} (tol {tol})",
+                g.distance,
+                w.distance
+            );
+        }
+        // Boundary gap from the reference's full (k+1) list. A comparison of id
+        // sets is only meaningful if no permitted error could reorder the pair:
+        // both sides may be off by `tol`, so the gap has to exceed `2 * tol`.
+        let gap = cpu_k1[q]
+            .get(k)
+            .map(|extra| extra.distance - cpu_k1[q][k - 1].distance);
+        if let Some(gap) = gap {
+            let boundary = cpu_k1[q][k - 1].distance.abs().max(1.0);
+            assert!(
+                gap > 2.0 * 1e-5 * boundary,
+                "{label} q{q}: corpus has a near-tie at rank {k} (gap {gap} vs \
+                 rounding {}) — the comparison would not be meaningful",
+                2.0 * 1e-5 * boundary
+            );
+            let got_ids: Vec<u64> = got.iter().map(|h| h.id).collect();
+            let want_ids: Vec<u64> = want.iter().map(|h| h.id).collect();
+            assert_eq!(got_ids, want_ids, "{label} q{q}: top-{k} id sets");
+        }
+    }
+}
+
+fn load_both<'a>(
+    gpu: &CudaAccelerator,
+    cpu: &CpuAccelerator,
+    view: VectorView<'a>,
+) -> (ResidentVectors, ResidentVectors) {
+    let g = gpu.load_vectors(view).unwrap().expect("device does residency");
+    let c = cpu.load_vectors(view).unwrap().expect("cpu does residency");
+    (g, c)
+}
+
+#[test]
+fn a_batch_matches_the_reference_on_every_metric() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let cpu = CpuAccelerator::new();
+
+    let rows = 4_000;
+    let dim = 64;
+    let batch = 6;
+    let k = 8;
+    let (data, ids) = corpus(rows, dim);
+    let mut seed = 42u64;
+    let queries: Vec<f32> = (0..batch * dim)
+        .map(|_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+        })
+        .collect();
+
+    for metric in [Metric::L2, Metric::Cosine, Metric::Ip] {
+        let (g, c) = load_both(
+            &gpu,
+            &cpu,
+            vector_view(1, 11, dim, metric, &data, &ids),
+        );
+        let got = gpu.knn_flat(&g, &queries, k, None).unwrap();
+        let want = cpu.knn_flat(&c, &queries, k, None).unwrap();
+        let want1 = cpu.knn_flat(&c, &queries, k + 1, None).unwrap();
+        assert_matches_reference(&format!("{metric:?}"), &got, &want, &want1, k);
+
+        // The scan has to be a scan: `knn_flat` must have produced a receipt
+        // naming the kernel as the dominant stage, or the number is not a
+        // measurement of anything.
+        let m = gpu.last_knn_metrics().expect("a call leaves a receipt");
+        assert_eq!(m.queries, batch);
+        assert_eq!(m.rows, rows);
+        assert_eq!(m.k, k);
+        assert!(m.kernel_ns > 0 && m.download_ns > 0);
+        assert!(m.result_bytes >= batch * k * 12);
+        assert!(gpu.last_vector_load_metrics().is_some());
+
+        gpu.release_vectors(&g);
+        cpu.release_vectors(&c);
+    }
+}
+
+#[test]
+fn a_filtered_scan_returns_only_candidates_and_matches_the_reference() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let cpu = CpuAccelerator::new();
+
+    let rows = 3_000;
+    let dim = 32;
+    let k = 5;
+    let (data, ids) = corpus(rows, dim);
+    let queries: Vec<f32> = data[..dim].to_vec();
+
+    // Every third row, as a `Sel` — the shape a temporal filter leaves behind.
+    let allowed: Vec<u64> = (0..rows as u64).filter(|i| i % 3 == 0).collect();
+    let sel = Sel::from_ids(11, rows as u64, allowed.iter().copied()).unwrap();
+
+    let (g, c) = load_both(&gpu, &cpu, vector_view(1, 11, dim, Metric::L2, &data, &ids));
+    let got = gpu.knn_flat(&g, &queries, k, Some(&sel)).unwrap();
+    let want = cpu.knn_flat(&c, &queries, k, Some(&sel)).unwrap();
+    let want1 = cpu.knn_flat(&c, &queries, k + 1, Some(&sel)).unwrap();
+    assert_matches_reference("filtered", &got, &want, &want1, k);
+
+    for hit in &got[0] {
+        let row = ids.iter().position(|&id| id == hit.id).expect("known id");
+        assert_eq!(row % 3, 0, "row {row} is not in the candidate set");
+    }
+    assert!(gpu.last_knn_metrics().unwrap().filtered);
+
+    // The same set over a *different* universe must not silently select other
+    // rows: the kernel reads whole words and cannot see where the universe ends,
+    // so the host has to refuse the mismatch before launching.
+    let short = Sel::from_ids(
+        11,
+        (rows - 1) as u64,
+        (0..rows as u64 - 1).filter(|i| i % 3 == 0),
+    )
+    .unwrap();
+    let err = gpu.knn_flat(&g, &queries, k, Some(&short)).unwrap_err();
+    assert!(matches!(err, AcceleratorError::InvalidArgument(_)), "{err}");
+
+    gpu.release_vectors(&g);
+    cpu.release_vectors(&c);
+}
+
+#[test]
+fn degenerate_k_and_batch_have_defined_answers() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let cpu = CpuAccelerator::new();
+    let (data, ids) = corpus(3, 4);
+    let (g, c) = load_both(&gpu, &cpu, vector_view(2, 5, 4, Metric::L2, &data, &ids));
+
+    // Every query returns a list, even when the list is empty: the shape does not
+    // change with k, so a caller can `zip` without checking.
+    let queries = data.clone();
+    assert_eq!(gpu.knn_flat(&g, &queries, 0, None).unwrap(), vec![Vec::new(); 3]);
+    assert_eq!(cpu.knn_flat(&c, &queries, 0, None).unwrap().len(), 3);
+
+    // k larger than the corpus: everything, in order.
+    let got = gpu.knn_flat(&g, &queries, 10, None).unwrap();
+    let want = cpu.knn_flat(&c, &queries, 10, None).unwrap();
+    assert_eq!(got.len(), 3);
+    for (a, b) in got.iter().zip(&want) {
+        assert_eq!(a.len(), 3);
+        assert_eq!(
+            a.iter().map(|h| h.id).collect::<Vec<_>>(),
+            b.iter().map(|h| h.id).collect::<Vec<_>>()
+        );
+    }
+
+    // An empty batch does no work and is not an error.
+    assert!(gpu.knn_flat(&g, &[], 5, None).unwrap().is_empty());
+
+    // A k the kernel cannot hold is a scheduling fact: the CPU can still answer,
+    // and the error says so rather than claiming the operator is missing.
+    let err = gpu.knn_flat(&g, &queries, 257, None).unwrap_err();
+    assert!(
+        matches!(err, AcceleratorError::LimitExceeded { limit: 256, .. }),
+        "{err}"
+    );
+    assert_eq!(err.fallback(), gtv_accelerator::Fallback::Cpu);
+
+    // A misaligned query length is a caller bug and surfaces.
+    let err = gpu.knn_flat(&g, &queries[..6], 5, None).unwrap_err();
+    assert!(matches!(err, AcceleratorError::InvalidArgument(_)), "{err}");
+    assert_eq!(err.fallback(), gtv_accelerator::Fallback::Surface);
+
+    gpu.release_vectors(&g);
+    cpu.release_vectors(&c);
+}
+
+#[test]
+fn an_upload_reports_its_stages_and_its_bytes() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let (data, ids) = corpus(1_000, 16);
+
+    // L2: the matrix is uploaded as handed over, so the normalisation pass is
+    // zero and the copy is the whole story.
+    let view = vector_view(3, 1, 16, Metric::L2, &data, &ids);
+    let h = gpu.load_vectors(view).unwrap().unwrap();
+    let m = gpu.last_vector_load_metrics().expect("a load leaves a receipt");
+    assert_eq!(m.rows, 1_000);
+    assert_eq!(m.dim, 16);
+    assert_eq!(m.normalize_ns, 0);
+    assert!(m.copy_ns > 0);
+    assert_eq!(m.uploaded_bytes, 1_000 * (16 * 4 + 8));
+    assert!(m.accounting_holds());
+    assert_eq!(gpu.resident_bytes(), view.bytes());
+    assert_eq!(gpu.resident_spaces(), vec![3]);
+
+    gpu.release_vectors(&h);
+    assert_eq!(gpu.resident_bytes(), 0);
+    assert!(gpu.resident_spaces().is_empty());
+
+    // Cosine: one host pass over the whole matrix, reported separately. Folding
+    // it into `copy_ns` would make the link look slower than it is.
+    let view = vector_view(3, 1, 16, Metric::Cosine, &data, &ids);
+    let h = gpu.load_vectors(view).unwrap().unwrap();
+    let m = gpu.last_vector_load_metrics().unwrap();
+    assert!(m.normalize_ns > 0, "cosine rows must be normalised");
+    assert!(m.accounting_holds());
+    gpu.release_vectors(&h);
+
+    // Releasing twice is a no-op, and a stranger's token frees nothing.
+    gpu.release_vectors(&h);
+    assert_eq!(gpu.resident_bytes(), 0);
+}
+
+#[test]
+fn a_stale_snapshot_or_a_foreign_filter_is_an_error_not_an_answer() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let (data, ids) = corpus(64, 8);
+    let queries = data[..8].to_vec();
+
+    let h = gpu
+        .load_vectors(vector_view(4, 100, 8, Metric::L2, &data, &ids))
+        .unwrap()
+        .unwrap();
+
+    // The handle says space 4 / snapshot 100; a handle for snapshot 101 must not
+    // be able to use this copy.
+    let mut stale = h.clone();
+    stale = ResidentVectors::new(
+        stale.token(),
+        4,
+        101,
+        64,
+        8,
+        Metric::L2,
+        stale.bytes(),
+    );
+    let err = gpu.knn_flat(&stale, &queries, 3, None).unwrap_err();
+    assert!(matches!(err, AcceleratorError::SnapshotStale { .. }), "{err}");
+
+    // A candidate set bound to another snapshot is refused before any rows are
+    // read from it.
+    let foreign = Sel::from_ids(999, 64, [0u64, 1, 2]).unwrap();
+    let err = gpu.knn_flat(&h, &queries, 3, Some(&foreign)).unwrap_err();
+    assert!(matches!(err, AcceleratorError::SnapshotStale { .. }), "{err}");
+
+    // A set over the wrong universe selects the wrong rows; that is a caller bug.
+    let short = Sel::from_ids(100, 32, [0u64, 1]).unwrap();
+    let err = gpu.knn_flat(&h, &queries, 3, Some(&short)).unwrap_err();
+    assert!(matches!(err, AcceleratorError::InvalidArgument(_)), "{err}");
+
+    gpu.release_vectors(&h);
+}
+
+#[test]
+fn a_second_accelerator_reuses_the_loaded_kernel() {
+    let _serial = exclusive();
+    let (data, ids) = corpus(512, 16);
+    let queries = data[..32].to_vec();
+
+    // The kernel module is loaded once per process and lives inside the device's
+    // primary context. Dropping the only accelerator used to release that
+    // context, which destroyed the context the module lived in — so the *second*
+    // accelerator's first launch failed with `CUDA_ERROR_INVALID_HANDLE`. This is
+    // the regression test for that: two lifecycles, two launches.
+    let first = {
+        let gpu = device_or_skip!();
+        let h = gpu
+            .load_vectors(vector_view(9, 1, 16, Metric::L2, &data, &ids))
+            .unwrap()
+            .unwrap();
+        let hits = gpu.knn_flat(&h, &queries, 3, None).unwrap();
+        gpu.release_vectors(&h);
+        hits[0].iter().map(|h| h.id).collect::<Vec<_>>()
+    };
+
+    let gpu = device_or_skip!();
+    let h = gpu
+        .load_vectors(vector_view(9, 1, 16, Metric::L2, &data, &ids))
+        .unwrap()
+        .unwrap();
+    let hits = gpu.knn_flat(&h, &queries, 3, None).unwrap();
+    assert_eq!(
+        hits[0].iter().map(|h| h.id).collect::<Vec<_>>(),
+        first,
+        "the second accelerator answered differently"
+    );
+    gpu.release_vectors(&h);
 }

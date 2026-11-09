@@ -1,0 +1,4 @@
+# `cargo xtask <task>` — development tasks that need a CUDA toolkit and must
+# stay out of the normal build. See `crates/xtask/src/main.rs`.
+[alias]
+xtask = "run -p xtask --"

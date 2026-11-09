@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# A development tool, not a library: nothing depends on this crate.
+publish = false
+
+[dependencies]
+# Already in the lock file through gtv-storage; used only to stamp the kernel
+# source hash into the generated PTX so the checked-in image can be verified
+# against the source it claims to come from.
+blake3.workspace = true

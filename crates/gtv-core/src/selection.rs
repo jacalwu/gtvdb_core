@@ -271,6 +271,49 @@ impl Sel {
         BooleanArray::new(self.to_buffer(), None)
     }
 
+    /// Membership as 32-bit words, the layout a device kernel reads.
+    ///
+    /// Bit `i` of the universe is bit `i % 32` of word `i / 32`, least
+    /// significant bit first, and the result is padded to a whole word so a
+    /// kernel's `words[row >> 5]` can never read past the end of the transfer.
+    ///
+    /// This lives here rather than in a backend because the bit layout is a
+    /// property of [`Sel`], not of any one device: two ports that each decode
+    /// arrow's buffer by hand is two places to get the offset wrong.
+    pub fn to_bitmap_words(&self) -> Vec<u32> {
+        let universe = self.universe as usize;
+        let mut words = vec![0u32; universe.div_ceil(32)];
+        let bits = self.to_buffer();
+        let offset = bits.offset();
+        let bytes = bits.inner().as_slice();
+
+        if offset % 8 == 0 {
+            // Byte-aligned: the bits are a plain byte stream from here, so each
+            // word is four loads and a shift instead of 32 test-and-sets.
+            let start = offset / 8;
+            for (i, word) in words.iter_mut().enumerate() {
+                let mut v = 0u32;
+                for b in 0..4 {
+                    if let Some(byte) = bytes.get(start + i * 4 + b) {
+                        v |= (*byte as u32) << (8 * b);
+                    }
+                }
+                *word = v;
+            }
+        } else {
+            // A bit offset inside a byte: rare (it takes an explicitly sliced
+            // mask), and not worth a second specialised path.
+            for (i, word) in words.iter_mut().enumerate() {
+                for b in 0..32 {
+                    if i * 32 + b < universe && bits.value(i * 32 + b) {
+                        *word |= 1 << b;
+                    }
+                }
+            }
+        }
+        words
+    }
+
     // -- set algebra -------------------------------------------------------
 
     fn same_space(&self, other: &Sel) -> Result<()> {
@@ -625,5 +668,51 @@ mod tests {
                 ranges: vec![(0, 4), (5, 10)]
             }
         );
+    }
+
+    #[test]
+    fn bitmap_words_are_lsb_first_and_padded_to_a_whole_word() {
+        // 40 rows: word 0 covers 0..32, word 1 covers 32..40 with 24 padding
+        // bits that must be zero — a kernel reads a whole word at a time and
+        // cannot see the universe.
+        let mut ids = vec![0u64, 31, 32, 39];
+        ids.sort_unstable();
+        let s = Sel::from_ids(7, 40, ids).unwrap();
+        let words = s.to_bitmap_words();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0], 1 | 1 << 31);
+        assert_eq!(words[1], 1 | 1 << 7);
+
+        // Dense repr (small sets), bitmap repr (large ones) and ranges must all
+        // produce the same words: the layout is a property of the set.
+        let mask = BooleanArray::from((0..40).map(|i| i % 3 == 0).collect::<Vec<_>>());
+        let from_mask = Sel::from_mask(7, &mask);
+        let every_third: Vec<(u64, u64)> = (0..40).step_by(3).map(|i| (i, i + 1)).collect();
+        let from_ranges = Sel::from_ranges(7, 40, every_third);
+        let expected: Vec<u32> = from_mask.to_bitmap_words();
+        assert_eq!(from_ranges.to_bitmap_words(), expected);
+        for (i, bit) in (0..40).map(|i| (i, i % 3 == 0)) {
+            let has = expected[i / 32] >> (i % 32) & 1 == 1;
+            assert_eq!(has, bit, "row {i}");
+        }
+    }
+
+    #[test]
+    fn a_bit_offset_buffer_still_yields_the_same_words() {
+        // Sliced masks carry a bit offset; decoding them as if the buffer
+        // started at bit 0 is the bug this test exists to prevent.
+        let full = BooleanArray::from((0..64).map(|i| i % 5 == 0).collect::<Vec<_>>());
+        let sliced = full.slice(3, 40);
+        let s = Sel::from_mask(1, &sliced);
+        assert_eq!(s.universe(), 40);
+        let words = s.to_bitmap_words();
+        let expected = Sel::from_ids(1, 40, (0..40).filter(|i| (i + 3) % 5 == 0)).unwrap();
+        assert_eq!(words, expected.to_bitmap_words());
+    }
+
+    #[test]
+    fn an_empty_universe_needs_no_words() {
+        assert!(Sel::empty(1, 0).to_bitmap_words().is_empty());
+        assert_eq!(Sel::all(1, 1).to_bitmap_words(), vec![1]);
     }
 }

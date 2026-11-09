@@ -14,3 +14,10 @@ gtv-core = { path = "../gtv-core" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Already in the lock file through gtv-storage. Used by `tests/ptx_stamp.rs` to
+# recompute the BLAKE3 of the kernel source and compare it with the hash stamped
+# into the committed PTX — the only part of the kernel that a machine without a
+# GPU can verify.
+blake3.workspace = true

@@ -101,6 +101,14 @@ impl ExecutionPolicy {
         if !inputs.caps.supports(inputs.op) {
             return cpu(DecisionReason::Unsupported);
         }
+        if let Some(k) = inputs.k {
+            if !inputs.caps.admits_k(k) {
+                return cpu(DecisionReason::KTooLarge {
+                    k,
+                    max_k: inputs.caps.max_k,
+                });
+            }
+        }
         let limit = self
             .max_device_bytes
             .or(inputs.caps.max_device_bytes)
@@ -143,6 +151,8 @@ pub struct DecisionInputs<'a> {
     pub required_bytes: u64,
     /// The backend's last failure in this query, if any.
     pub last_error: Option<&'a AcceleratorError>,
+    /// `k` for a KNN; `None` when the operator has no such parameter.
+    pub k: Option<usize>,
 }
 
 impl<'a> DecisionInputs<'a> {
@@ -154,7 +164,14 @@ impl<'a> DecisionInputs<'a> {
             resident: false,
             required_bytes: 0,
             last_error: None,
+            k: None,
         }
+    }
+
+    /// The KNN parameter, so the policy can refuse a `k` the kernel cannot hold.
+    pub fn with_k(mut self, k: usize) -> Self {
+        self.k = Some(k);
+        self
     }
 
     pub fn resident(mut self, resident: bool) -> Self {
@@ -215,6 +232,8 @@ pub enum DecisionReason {
     OverBudget { needed: u64, limit: u64 },
     /// Not resident, and the policy forbids an upload on a miss.
     UploadNotAllowed,
+    /// `k` is larger than the backend's kernel can hold.
+    KTooLarge { k: usize, max_k: usize },
     /// The backend failed earlier in this query.
     AfterError(&'static str),
 }
@@ -228,6 +247,7 @@ impl DecisionReason {
             DecisionReason::BelowThreshold { .. } => "below_threshold",
             DecisionReason::OverBudget { .. } => "over_budget",
             DecisionReason::UploadNotAllowed => "upload_not_allowed",
+            DecisionReason::KTooLarge { .. } => "k_too_large",
             DecisionReason::AfterError(_) => "after_error",
         }
     }
@@ -242,6 +262,7 @@ impl AcceleratorError {
             AcceleratorError::Unsupported { .. } => "unsupported",
             AcceleratorError::SnapshotStale { .. } => "snapshot_stale",
             AcceleratorError::OutOfBudget { .. } => "out_of_budget",
+            AcceleratorError::LimitExceeded { .. } => "limit_exceeded",
             AcceleratorError::Backend { .. } => "backend_error",
             AcceleratorError::InvalidArgument(_) => "invalid_argument",
         }
@@ -339,6 +360,27 @@ mod tests {
         };
         let d = policy.decide(&DecisionInputs::new(&caps, Op::KnnFlat, 1_000_000).after(Some(&err)));
         assert_eq!(d.reason(), Some(DecisionReason::AfterError("device_unavailable")));
+    }
+
+    #[test]
+    fn a_k_the_kernel_cannot_hold_is_routed_at_plan_time() {
+        // 8 warps x k x 12 B has to fit a block's shared memory; the CPU has no
+        // such bound, so an oversized k is a scheduling fact, not a failure.
+        let caps = cuda(true, None).with_max_k(256);
+        let ok = ExecutionPolicy::default()
+            .decide(&DecisionInputs::new(&caps, Op::KnnFlat, 10_000_000).with_k(256));
+        assert_eq!(ok, BackendDecision::CudaLoadThenRun);
+
+        let d = ExecutionPolicy::default()
+            .decide(&DecisionInputs::new(&caps, Op::KnnFlat, 10_000_000).with_k(257));
+        assert_eq!(
+            d.reason(),
+            Some(DecisionReason::KTooLarge {
+                k: 257,
+                max_k: 256
+            })
+        );
+        assert_eq!(DecisionReason::KTooLarge { k: 1, max_k: 0 }.as_str(), "k_too_large");
     }
 
     #[test]

@@ -4,8 +4,9 @@
 //! The default build contains no device code at all: `gtv-accelerator` is a pure
 //! CPU crate, and `gtv-accelerator-cuda` is an optional dependency behind the
 //! `cuda` feature. Nothing in the query path consults this module today, which is
-//! deliberate — C1 adds the plumbing and changes no behaviour, so `cargo test`
-//! results are identical with and without the feature.
+//! deliberate — C1 added the plumbing and changed no behaviour, and C2 added a
+//! kernel behind the trait without wiring it into SQL, so `cargo test` results
+//! are still identical with and without the feature.
 //!
 //! Registration is conditional at *run* time as well as build time. A build with
 //! `--features cuda` on a machine without a driver produces a CPU-only registry:

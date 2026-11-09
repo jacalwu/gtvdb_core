@@ -125,6 +125,7 @@ impl AcceleratorRegistry {
             resident: inputs.resident,
             required_bytes: inputs.required_bytes,
             last_error: inputs.last_error,
+            k: inputs.k,
         };
         (policy.decide(&probe), None)
     }

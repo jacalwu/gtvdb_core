@@ -1,7 +1,7 @@
 //! Backend abstraction for the optional CUDA path — and the residency rules
 //! that decide whether a device copy is worth having at all.
 //!
-//! # Scope (C1)
+//! # Scope (C1–C2)
 //!
 //! This crate is the *contract*: one trait, one cache, one policy, one error
 //! type. It contains no kernel. That ordering is deliberate and measured: a
@@ -23,6 +23,14 @@
 //! | [`ResidentCache`] / [`VectorCache`] | [`resident`] | upload once per snapshot, evict by LRU, never serve a stale copy |
 //! | [`ExecutionPolicy`] | [`policy`] | one place decides CPU vs device, and says why |
 //! | [`AcceleratorRegistry`] | [`registry`] | which backends exist, per operator |
+//!
+//! C2 adds the first operator to that contract without adding a kernel to this
+//! crate: [`Accelerator::load_vectors`] / [`Accelerator::knn_flat`] carry the
+//! signature, [`Caps::max_k`] carries the device's own ceiling, and
+//! [`AcceleratorError::LimitExceeded`] is the fallback-shaped answer for a
+//! request the hardware cannot serve. The kernel stays in
+//! `gtv-accelerator-cuda`, so this crate still compiles and tests on a machine
+//! without a GPU.
 //!
 //! # Invariants
 //!
@@ -80,7 +88,10 @@ pub use api::{
 };
 pub use cpu::{live_at, CpuAccelerator};
 pub use error::{AcceleratorError, Fallback};
-pub use metrics::{AcceleratorMetrics, Column, ColumnLoad, ColumnSet, GraphLoadMetrics, OpRecord};
+pub use metrics::{
+    AcceleratorMetrics, Column, ColumnLoad, ColumnSet, GraphLoadMetrics, KnnMetrics, OpRecord,
+    VectorLoadMetrics,
+};
 pub use policy::{BackendDecision, DecisionInputs, DecisionReason, ExecutionPolicy};
 pub use registry::AcceleratorRegistry;
 pub use resident::{CacheStats, GraphKey, Resident, ResidentCache, VectorCache};

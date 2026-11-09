@@ -17,7 +17,7 @@
 use gtv_core::{CsrColumns, Metric, Sel, TemporalCSR, VectorHit};
 
 use crate::error::AcceleratorError;
-use crate::metrics::{Column, ColumnSet, GraphLoadMetrics};
+use crate::metrics::{Column, ColumnSet, GraphLoadMetrics, KnnMetrics, VectorLoadMetrics};
 
 /// Identifies one immutable version of the whole database.
 ///
@@ -84,6 +84,14 @@ pub struct Caps {
     pub resident: bool,
     /// `None` = unbounded (the CPU reference).
     pub max_device_bytes: Option<usize>,
+    /// Largest `k` [`Accelerator::knn_flat`] serves; `0` = no KNN at all.
+    ///
+    /// A device kernel keeps its candidate heap in shared memory, so `k` is
+    /// bounded by a block's shared-memory budget (eight warps x `k` x 12 B in
+    /// the C2 kernel, hence 256). The CPU reference is bounded by nothing. The
+    /// number is advertised so a planner can send a 10 000-neighbour query to
+    /// the CPU *before* the call instead of learning it from an error.
+    pub max_k: usize,
     supported: u8,
 }
 
@@ -94,6 +102,7 @@ impl Caps {
             name: "cpu-reference".into(),
             resident: true,
             max_device_bytes: None,
+            max_k: usize::MAX,
             supported: Op::ValidTimeFilter.bit()
                 | Op::KnnFlat.bit()
                 | Op::BatchKhop.bit()
@@ -107,12 +116,19 @@ impl Caps {
             name: name.into(),
             resident: false,
             max_device_bytes,
+            max_k: 0,
             supported: 0,
         }
     }
 
     pub fn with_resident(mut self, resident: bool) -> Self {
         self.resident = resident;
+        self
+    }
+
+    /// Advertise the largest `k` this backend's KNN accepts.
+    pub fn with_max_k(mut self, max_k: usize) -> Self {
+        self.max_k = max_k;
         self
     }
 
@@ -123,6 +139,11 @@ impl Caps {
 
     pub fn supports(&self, op: Op) -> bool {
         self.supported & op.bit() != 0
+    }
+
+    /// Whether a `k`-neighbour query is within this backend's limit.
+    pub fn admits_k(&self, k: usize) -> bool {
+        k <= self.max_k
     }
 
     /// Refuse a copy that cannot fit, before a byte is allocated.
@@ -713,6 +734,24 @@ pub trait Accelerator: Send + Sync {
     /// have to destructure a second field to find out. `None` means the backend
     /// did not upload anything (CPU) or did not measure.
     fn last_load_metrics(&self) -> Option<GraphLoadMetrics> {
+        None
+    }
+
+    /// What this backend's last [`Accelerator::load_vectors`] cost.
+    ///
+    /// Same convention as [`Accelerator::last_load_metrics`]: out of band,
+    /// because a caller that only wants the handle should not have to unwrap a
+    /// timing struct to get it.
+    fn last_vector_load_metrics(&self) -> Option<VectorLoadMetrics> {
+        None
+    }
+
+    /// Stage breakdown of the last [`Accelerator::knn_flat`].
+    ///
+    /// Had to be out of band for a second reason: the return value is the answer,
+    /// and a benchmark that wants the kernel time must not be able to see it
+    /// interleaved with the hits.
+    fn last_knn_metrics(&self) -> Option<KnnMetrics> {
         None
     }
 

@@ -55,6 +55,22 @@ pub enum AcceleratorError {
     #[error("device budget {limit} bytes cannot hold {needed} bytes")]
     OutOfBudget { needed: usize, limit: usize },
 
+    /// A well-formed request outside this backend's parameter limits, where
+    /// another backend can still serve it.
+    ///
+    /// Distinct from [`AcceleratorError::InvalidArgument`], which means the
+    /// caller is wrong and retrying elsewhere would hide a bug. A device kernel
+    /// that keeps its candidate heap in shared memory cannot answer `k =
+    /// 10_000`; that is a fact about the kernel, not about the query, and the
+    /// CPU reference has no such bound.
+    #[error("backend {backend} cannot serve {what}={requested} (limit is {limit})")]
+    LimitExceeded {
+        backend: &'static str,
+        what: &'static str,
+        requested: usize,
+        limit: usize,
+    },
+
     /// The driver rejected a call.
     #[error("backend {backend} failed in {op}: {message} (code {code})")]
     Backend {
@@ -87,6 +103,7 @@ impl AcceleratorError {
             AcceleratorError::DeviceUnavailable { .. }
                 | AcceleratorError::Backend { .. }
                 | AcceleratorError::OutOfBudget { .. }
+                | AcceleratorError::LimitExceeded { .. }
         )
     }
 }
@@ -124,6 +141,12 @@ mod tests {
             AcceleratorError::OutOfBudget {
                 needed: 2,
                 limit: 1,
+            },
+            AcceleratorError::LimitExceeded {
+                backend: "cuda",
+                what: "k",
+                requested: 10_000,
+                limit: 256,
             },
         ] {
             assert_eq!(e.fallback(), Fallback::Cpu, "{e}");

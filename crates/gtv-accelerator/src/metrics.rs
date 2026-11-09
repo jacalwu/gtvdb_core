@@ -445,6 +445,182 @@ impl AcceleratorMetrics {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Vectors: the upload and the scan
+// ---------------------------------------------------------------------------
+
+/// What one `load_vectors` cost.
+///
+/// Shorter than [`GraphLoadMetrics`] on purpose — a vector matrix is one array,
+/// not five columns, so there is no per-column table to keep. What it does keep
+/// is the one stage a graph upload does not have: **normalisation**. Cosine
+/// space normalises every row, and that is a host pass over the whole matrix
+/// (51 MB at 1e5 x 128) which would otherwise hide inside "upload took 30 ms"
+/// and be mistaken for PCIe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorLoadMetrics {
+    pub vector_space_id: u32,
+    pub snapshot_id: SnapshotId,
+    pub rows: usize,
+    pub dim: usize,
+    /// What the view priced; must equal `uploaded_bytes`.
+    pub priced_bytes: usize,
+    /// What the backend really allocated.
+    pub uploaded_bytes: usize,
+    /// Host pass that unit-normalises rows. Zero for `L2` / `Ip`, where the
+    /// matrix is uploaded as it was handed over.
+    pub normalize_ns: u64,
+    pub alloc_ns: u64,
+    pub copy_ns: u64,
+    pub total_ns: u64,
+}
+
+impl VectorLoadMetrics {
+    pub fn new(vector_space_id: u32, snapshot_id: SnapshotId, rows: usize, dim: usize) -> Self {
+        Self {
+            vector_space_id,
+            snapshot_id,
+            rows,
+            dim,
+            priced_bytes: 0,
+            uploaded_bytes: 0,
+            normalize_ns: 0,
+            alloc_ns: 0,
+            copy_ns: 0,
+            total_ns: 0,
+        }
+    }
+
+    /// Bytes per row, `dim` floats plus the id.
+    pub fn bytes_per_row(&self) -> f64 {
+        if self.rows == 0 {
+            0.0
+        } else {
+            self.uploaded_bytes as f64 / self.rows as f64
+        }
+    }
+
+    pub fn upload_gbps(&self) -> f64 {
+        if self.copy_ns == 0 {
+            0.0
+        } else {
+            self.uploaded_bytes as f64 / (self.copy_ns as f64 / 1e9) / 1e9
+        }
+    }
+
+    /// What fraction of the load was the normalisation pass rather than the
+    /// link. Above ~0.5 the upload is CPU-bound and PCIe is not the lever.
+    pub fn normalize_share(&self) -> f64 {
+        if self.total_ns == 0 {
+            0.0
+        } else {
+            self.normalize_ns as f64 / self.total_ns as f64
+        }
+    }
+
+    /// The budget must be charged for exactly what was allocated, or residency
+    /// silently over- or under-commits.
+    pub fn accounting_holds(&self) -> bool {
+        self.priced_bytes == self.uploaded_bytes
+    }
+}
+
+/// What one `knn_flat` call cost, split the way a pipeline can act on it.
+///
+/// Four stages with four different fixes: `upload_ns` is query bytes over PCIe,
+/// `kernel_ns` is the scan, `download_ns` is the result over PCIe, and
+/// `merge_ns` is the host-side reduction of the per-split partial lists. A
+/// benchmark that reports only the total cannot tell "the kernel is slow" from
+/// "the results are too big to bring back" — and at small `k` the latter wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnnMetrics {
+    pub queries: usize,
+    pub rows: usize,
+    pub dim: usize,
+    pub k: usize,
+    /// Blocks per query in the row dimension: the grid's `y`.
+    pub splits: usize,
+    pub filtered: bool,
+    /// Query rows + candidate bitmap, host to device.
+    pub upload_bytes: usize,
+    /// `k * (4 + 8)` bytes per query, device to host, before trimming.
+    pub result_bytes: usize,
+    pub upload_ns: u64,
+    pub kernel_ns: u64,
+    pub download_ns: u64,
+    /// Host merge of `splits` sorted lists per query, into the final top-k.
+    pub merge_ns: u64,
+    pub total_ns: u64,
+}
+
+impl KnnMetrics {
+    pub fn new(queries: usize, rows: usize, dim: usize, k: usize) -> Self {
+        Self {
+            queries,
+            rows,
+            dim,
+            k,
+            splits: 1,
+            filtered: false,
+            upload_bytes: 0,
+            result_bytes: 0,
+            upload_ns: 0,
+            kernel_ns: 0,
+            download_ns: 0,
+            merge_ns: 0,
+            total_ns: 0,
+        }
+    }
+
+    /// Corpus bytes one query has to read. Multiply by `queries` for the work,
+    /// divide by `kernel_ns` for the achieved bandwidth — which is the number
+    /// that says whether the scan is memory-bound (it should be) or has found
+    /// something to do per row that it should not.
+    pub fn bytes_per_pass(&self) -> usize {
+        self.rows * self.dim * std::mem::size_of::<f32>()
+    }
+
+    /// Effective read bandwidth, counting one corpus pass per query. Above the
+    /// card's HBM bandwidth when the batch reuses L2, which is expected and is
+    /// not an error — `bench_knn` compares it against `cuMemGetInfo`-sized
+    /// reality rather than against the datasheet.
+    pub fn scan_gbps(&self) -> f64 {
+        if self.kernel_ns == 0 {
+            0.0
+        } else {
+            self.bytes_per_pass() as f64 * self.queries as f64
+                / (self.kernel_ns as f64 / 1e9)
+                / 1e9
+        }
+    }
+
+    /// Per-query latency, the number a single-query caller cares about.
+    pub fn per_query_us(&self) -> f64 {
+        if self.queries == 0 {
+            0.0
+        } else {
+            self.total_ns as f64 / self.queries as f64 / 1e3
+        }
+    }
+
+    /// The stage that dominated. Printed by the bench so a regression names
+    /// itself.
+    pub fn dominant_stage(&self) -> &'static str {
+        let mut best = ("none", 0u64);
+        for (name, ns) in [
+            ("upload", self.upload_ns),
+            ("kernel", self.kernel_ns),
+            ("download", self.download_ns),
+            ("merge", self.merge_ns),
+        ] {
+            if ns > best.1 {
+                best = (name, ns);
+            }
+        }
+        best.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +743,60 @@ mod tests {
         assert!((m.upload_share() - 0.30).abs() < 1e-9);
         m.total_ns = 0;
         assert_eq!(m.upload_share(), 0.0);
+    }
+
+    #[test]
+    fn a_vector_load_names_the_normalisation_pass() {
+        let mut m = VectorLoadMetrics::new(7, 3, 100_000, 128);
+        m.priced_bytes = 100_000 * (128 * 4 + 8);
+        m.uploaded_bytes = m.priced_bytes;
+        m.normalize_ns = 15_000_000;
+        m.copy_ns = 30_000_000;
+        m.total_ns = 45_000_000;
+
+        assert!(m.accounting_holds());
+        assert!((m.bytes_per_row() - 520.0).abs() < 1e-9);
+        // 51.2 MB in 30 ms is 1.7 GB/s of *copy* — the number to compare with
+        // the link, not with the 45 ms total.
+        assert!((m.upload_gbps() - 1.7).abs() < 0.1);
+        assert!((m.normalize_share() - 1.0 / 3.0).abs() < 1e-9);
+
+        // An L2 space does no pass, and the zero has to read as "not done"
+        // rather than as "done instantly".
+        let mut l2 = m.clone();
+        l2.normalize_ns = 0;
+        l2.total_ns = 30_000_000;
+        assert_eq!(l2.normalize_share(), 0.0);
+
+        // Mispriced upload is the same failure as in the graph path.
+        l2.uploaded_bytes += 1;
+        assert!(!l2.accounting_holds());
+    }
+
+    #[test]
+    fn a_knn_call_names_the_stage_that_dominated() {
+        let mut m = KnnMetrics::new(8, 100_000, 128, 10);
+        m.splits = 8;
+        m.result_bytes = 8 * 10 * 12;
+        m.upload_bytes = 8 * 128 * 4;
+        m.upload_ns = 10_000;
+        m.kernel_ns = 970_000;
+        m.download_ns = 20_000;
+        m.merge_ns = 1_000;
+        m.total_ns = 1_001_000;
+
+        assert_eq!(m.dominant_stage(), "kernel");
+        assert_eq!(m.bytes_per_pass(), 100_000 * 128 * 4);
+        // 8 passes of 51.2 MB in 0.97 ms: 422 GB/s, i.e. well above HBM and
+        // therefore L2 reuse across the batch. Real, and not a data error.
+        assert!(m.scan_gbps() > 400.0);
+        assert!((m.per_query_us() - 125.1).abs() < 1.0);
+
+        // With no kernel measured the derived numbers are zero, not a division
+        // by zero and not an infinity in a log line.
+        let empty = KnnMetrics::new(0, 0, 0, 0);
+        assert_eq!(empty.scan_gbps(), 0.0);
+        assert_eq!(empty.per_query_us(), 0.0);
+        assert_eq!(empty.dominant_stage(), "none");
     }
 }
