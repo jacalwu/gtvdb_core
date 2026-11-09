@@ -301,8 +301,8 @@ M0 是**可独立丢弃**的验证：即使 M1 决定换实现，它的属性测
 - `crates/gtv-core/src/csr.rs:871-909` — `Neighbors::next()` 热循环（2 次比较）、`all_active_at()`（`csr.rs:386-388`）。
 - `crates/gtv-core/src/bitemporal.rs:9-11, 120` — 「两轴同索引会 blow up」注释；`overlaps()` 判据。
 - `crates/gtv-storage/src/segment.rs:17-64` — GTVSeg v1 定宽 / 64B 对齐 / 7 列目录 / 「disk == memory == cache line」。
-- `crates/gtv-storage/src/store.rs:165, 537, 616` — `Manifest`、`entries_at_system()`、`graph_at()` 纯并集。
-- `crates/gtv-storage/src/segment_meta.rs:44-64` — `SegmentMeta` 六个标量。
+- `crates/gtv-storage/src/store.rs` — `Manifest`、`entries_at_system()`；**`graph_at()` 在 M1 已改为折叠 retract**（见 §12，不再是纯并集）。
+- `crates/gtv-storage/src/segment_meta.rs` — `SegmentMeta` 时间盒 + 节点/源点区间标量。
 - `crates/gtv-core/src/table.rs:73` — `NodeTable`（属性是业务列，无版本字段）。
 - `crates/gtv-core/src/endpoint.rs` — M0 实现：`EndpointPolicy` 位图、`NodeLifetime` 快照、`EndpointView` 包围盒、`ActiveNeighbors` 三态迭代器、7 项测试。
 - `crates/gtv-core/examples/bench_endpoint.rs` — §7 实测脚本，含顺序对照与行级双时间模拟。
@@ -313,3 +313,73 @@ M0 是**可独立丢弃**的验证：即使 M1 决定换实现，它的属性测
 - `docs/past-update-design.md` — 上一轮：位置化 retract、I1/I2、跨版本 sweep、区间汇总去重。
 - `docs/metadata-design-comparison.md` §6 — L2/L3 分离、只有可加/可并的量才进段级元数据。
 - `docs/metadata-benchmark.md` — 冷开 O(1)、FullHit 短路、段粒度必须 ≳ 节点数。
+
+---
+
+## 12. M1 落地：更正可用，读路径仍然零回归
+
+M0 证明了「快照级系统时间 + `EndpointView`」不会拖慢遍历；M1 补的是**过去时点更正**，即 `docs/asymmetric-bitemporal-review.md` 裁剪后的第一优先级工单。
+
+### 12.1 两层边界
+
+| | 查询面（M0，未改） | 控制面（M1，新增） |
+| :-- | :-- | :-- |
+| 位置 | `gtv-core`（`csr.rs` / `endpoint.rs`） | `gtv-storage`（`delta.rs` / `wal.rs` / `node_lifetime.rs` / `store.rs`） |
+| 动作 | `neighbors(src, t)` 两次比较 | 提交期区间 sweep、位置化 retract、Delta 文件、manifest 发布、compaction |
+| 代价 | 0（Passthrough 直接返回原 `Neighbors`） | O(E) 一次，仅发生在提交 / 版本查询 / compaction |
+
+**`csr.rs`、`GTVSeg v1` 的 7 列目录、`neighbors()` 热循环一行未改。** 拖慢遍历的风险因此不存在；风险搬到了提交延迟、冷开与崩溃恢复，用属性测试和注入测试覆盖。
+
+### 12.2 三个原语在 M1 的落点
+
+| 原语 | 实现 |
+| :-- | :-- |
+| `PUBLISH` | `SegmentStore::flush_at(system_ts)`（原有）；新增 `publish_delta()` 作为更正的发布点 |
+| `RETRACT` | `REMOVE VERSION` = 从**结果快照**的可见集合移除 `(segment_id, row)`；`RetractSet` 是排序 `Vec<RowPos>`，`contains()` 一次二分 |
+| `AS OF` | `live_rows_at(system_t)` 唯一枚举入口；`graph_at()` / 更正规划 / compaction 全部复用它，无法对「可见」产生分歧 |
+
+`u128 version_id` 只作为审计列 `removed_version_ids`（由 `RowPos::audit_id()` 派生），**任何读路径都不查它**，也不需要全局索引。
+
+### 12.3 关键实现决策（对应评审 R1–R6）
+
+- **区间 sweep 在发布内部执行**：第二次更正会触发强制 compaction，而 compaction 重写整个位置空间。若 `correct_edge()` 先按旧位置规划 retract，位置必然悬空。`DeltaDraft.plan` 把 sweep 推迟到 compaction 之后；低层调用者若携带显式位置则直接报错，不静默丢弃。
+- **K=1 有界 overlay**：`MAX_DELTA_DEPTH = 1`。第二个 live delta 进入前先把第一个折叠成新的不可变段，因此 `neighbors()` 永远不需要 K 路归并或 RetractMap。
+- **物理重写 ≠ 逻辑变更**：被折叠的段和 delta 打上 `superseded_at = M`，新的段带 `system_ts = M`。所有 `t < M` 仍看到原来的集合，所有 `t >= M` 只看到新段。
+- **单发布点（R4）**：WAL 的 `OP_MUTATION` 只是**意图**；delta 文件与 `nodes_<commit>.bin` 在 manifest 写入前都是孤儿。manifest 的原子写入让 delta、节点版本、失效事件三者同时可见，不存在「更正已生效但派生序列静默陈旧」的窗口。崩溃后未发布的 mutation 由 `open()` 计入 `mutations_orphaned` 并**拒绝重放**。
+- **节点寿命**：整列定宽快照 `nodes_c<commit>.bin`，按 `system_ts` 选版本；没有行级 `system_from/system_to`。
+- **不做（R1/R5/R6）**：`ActiveNodeBitmap` 仍只是可选加速器，`NodeLifetime` 定宽数组 + O(1) 包围盒是事实源；Parent+Diff Manifest、Branch 均推迟。
+
+### 12.4 落盘格式（全部定宽、LE、blake3 trailer）
+
+```
+*.gtvd   header[96] | puts[n*42] | removed[m*12] | audit[k*16]
+                    | inval[j*48] | checksum[32]
+nodes_c*.bin  header[64] | valid_from[i64;N] | valid_to[i64;N] | checksum[32]
+wal.log  v2：OP_INSERT(1) 不变；新增 OP_MUTATION(2)，payload = 完整 *.gtvd 编码
+```
+
+WAL 头保留 v1 兼容（`WAL_VERSION_V1` 仍可读）；manifest 的 `deltas` / `node_versions` / `next_delta_id` 全部 `#[serde(default)]`，旧仓直接打开且 `src_id_min/max` 用 `u64::MAX/0` 哨兵表示「未知，绝不剪枝」。
+
+### 12.5 SQL 面
+
+- `gtv_invalidations()` / `gtv_invalidations(cursor)` — manifest 提交日志的只读投影，`commit_id >= cursor`；列含 `object_kind`、`reason`、`state`、`file`。`GtvContext::register_segment_store()` 会自动 attach。
+- `gtv_segments()` 新增 `src_id_min` / `src_id_max`（旧 manifest 报 NULL）；`register_segment_store()` 跳过 `superseded_at` 段，避免 head 视图重复。
+- `SegmentStore::entries_at_src(src, t)` 用紧源点盒在**打开任何 .seg 之前**剪掉无关段。
+
+### 12.6 验收结果与门禁
+
+| 项 | 结果 |
+| :-- | :-- |
+| 全量 `cargo test --workspace` | **448 passed / 0 failed / 1 ignored**（M0 为 428，本轮 +20） |
+| `tests/m1_correction.rs` | 8 项：retract 折叠、AS KNOWN AT 稳定、属性更正、紧源点盒、旧 manifest、§23.6 随机属性、孤儿 WAL、重开与原子失效视图 |
+| `tests/m1_invalidation_sql.rs` | 3 项：投影列与游标、自动 attach + 隐藏退役段、未 attach 显式报错 |
+| §23.6 属性测试 | 120 组随机序列 × 3 次更正；`Overlay == 朴素重放 == Materialized`，且所有历史快照点在 compaction 前后逐条相等 |
+| 生成数据 | 仅 tempdir，`*.csv / *.seg / *.gtvd / nodes_c*.bin` 全部被 `.gitignore` + CI `generated-data` 拦截 |
+| 读路径基准 | `bench_endpoint` 所有路径结果一致；行级双时间方案仍为 2.0–2.6x。`csr.rs` 未改，包装开销在本机噪声区间 1.13–1.26x（M0 静默环境实测 1.00–1.06x），非代码回归 |
+| CI | `Kernel + temporal graph tests` 新增 M1 两步；`full-tests` 已覆盖 |
+
+### 12.7 明确不做 / 留给 M2
+
+后台 compaction 与延迟 GC、观测表落盘、段内节点区间窄化、L2 `range_agg()` / `active_edge_count()`、`BitemporalStore` 持久化、Parent+Diff Manifest、Branch、ActiveNodeBitmap。当前 `materialize()` 是同步、显式调用、关闭自动 GC 的开发模式，便于复现每个崩溃点。
+
+另一个语义边界：GTVSeg v1 只存 `src / dst / valid_from / valid_to / edge_type` 五列，因此 after-image 唯一能变更的属性是 `edge_type`（重分类）。端点 `(src, dst)` 在更正中不可变；更丰富的属性版本化属于 M2 的列扩展，而不是给每行加系统时间。
