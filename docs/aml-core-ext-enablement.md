@@ -441,6 +441,25 @@ gtv_ext_lib/
 
 **顺序上的硬约束**：M1 之前不要动 CUDA（任何 kernel 都会因为 `Sel` 缺失而重写一次）；M3 之前不要建 7 个 AML crate（接口还没定型）。
 
+### 7.1 M1 交付记录
+
+三项全部落地，验收项对应到测试名：
+
+| 交付 | 位置 | 验收 |
+|---|---|---|
+| `Sel` 统一候选集 | `gtv-core/src/selection.rs`（新，`Sel` / `SelRepr` / `UNBOUND_SNAPSHOT`） | `selection::tests::*` 9 项；`khop_rejects_selection_from_another_snapshot` 证明跨快照直接报错而非静默取错行 |
+| `Neighbor.edge_idx` | `csr.rs`（32 B 不变，`const` 断言守门）+ `MatchedEdge.edge_idx` | `neighbor_edge_idx_addresses_the_same_edge`（四列同时比对）；`parallel_edges_are_distinguishable_by_edge_idx`（同源同目标同区间的两笔转账可区分） |
+| 预算语义 | `traversal.rs`：`Truncation` / `TraversalOutcome` / `TriState`；`khop_*` 与 `find_bounded` 返回残缺结果 | `khop_budget_keeps_completed_hops`、`hop_cap_that_cuts_the_requested_depth_is_reported`、`find_bounded_matches_find_and_reports_truncation` |
+
+实现中比方案多出来的四处判断：
+
+1. **转置图不得冒充边身份。** `transpose()` 会重排数组，槽位在副本里有效、在正排里指错行。用 `edge_identity` 标志把它标成 `u32::MAX`，而不是返回一个"恰好落在范围内"的数字；`pull_frontier` 同理，`needs_edge_identity()` 的谓词强制走 push。
+2. **`max_hops` 截断必须报。** 原来 `k = k.min(budget.max_hops)` 会静默少跑几跳，现在记为 `TruncReason::Hops`——它和"图只有这么深"是两回事。
+3. **SQL 只有两种输出，没有第三种。** `khop` UDTF 遇到截断直接报错（附 limit/observed），因为空行集会被读成"无结果"；三态信息留给 Rust 调用方。
+4. **`gtv_motif_edges.edge_idx` 原本是路径序号。** 该列一直装的是 `j`（0,1,2…），不是边槽位——名字错、语义也错。现拆成 `edge_pos`（路径内位置）+ `edge_idx`（真实槽位），parity 测试同时校验后者能回到 CSR 寻址。
+
+M2 起才动 Top-K 与 provenance 分层；CUDA 仍排在 M4 之后。
+
 ---
 
 ## 8. 明确不做

@@ -122,7 +122,7 @@ P0 的以下补完属于测量欠账，**不新增任何算子**：
 | `motif(shape, valid_at [, limit [, window]])` | 逐点 UDTF，全图扫描，字面量参数 | `find` / `find_windowed` |
 | `motif_from(shape, seed, valid_at [, limit [, window]])` | 逐点 UDTF，锚定单种子；Q1 的逐点基线 | `find_from` / `find_windowed_from` |
 | `gtv_motif_matches` | 可 join 批量表，一行一 match：`match_id`、`n0..n{k-1}`、`event_min`、`event_max` | 同一次 `Vec<Match>` |
-| `gtv_motif_edges` | 可 join 批量表，一行一 matched edge（含 `edge_type` / 有效区间） | 同一次 `Vec<Match>` |
+| `gtv_motif_edges` | 可 join 批量表，一行一 matched edge：`match_id`、`edge_pos`（路径内位置）、`edge_idx`（CSR 槽位）、`src`、`dst`、`edge_type`、有效区间 | 同一次 `Vec<Match>` |
 
 `shape` 为 `ring3` / `ring4` / `path2` / `path3` / `path4` / `diamond`；`MotifSpec` 另支持滚动时间窗 `with_window()` 与按事件时间排序的边类型序列 `with_sequence()`（SQL 侧只暴露 `window` 可选参数）。注册走 `register_motif()` / `register_motif_batch()` / `register_motif_batch_shared()`；两张批量表由**同一次 `Vec<Match>`** 物化，不重复跑 DFS。
 
@@ -137,7 +137,19 @@ P0 的以下补完属于测量欠账，**不新增任何算子**：
 
 Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；硬断言 `pointwise == batch == gtv_pattern::find_from`。与 M6-a 同结论：**瓶颈是 N 次 SQL 规划，不是图内核**；N=1 时 owned 仍慢（整图 clone），shared 路径已 >1。门禁用保守的 owned 路径，N≥32 必须 >1，否则 CI 失败。
 
-**边界**：`find_bounded`（显式 `TraversalBudget` / `CancelToken`）尚未接出 SQL，当前上界由 `limit` 提供；`sequence` 只在 Rust `MotifSpec` 可用，未做 SQL 数组字面量；`csr.rs` / `neighbors()` / `endpoint.rs` / GTVSeg v1 列区零改动。
+**边界**：`find_bounded`（显式 `TraversalBudget` / `CancelToken`）仍未接出 SQL，当前上界由 `limit` 提供；`sequence` 只在 Rust `MotifSpec` 可用，未做 SQL 数组字面量；`neighbors()` 热循环与 GTVSeg v1 列区零改动（`csr.rs` 在 M1 中只加了 `Neighbor::edge_idx` 与预算返回语义，见 §3.4）。
+
+### 3.4 已交付（M1）：候选集 / 边身份 / 预算语义
+
+三项通用原语，为 AML 一类「图 + 时间 + 向量」组合查询补齐**算子之间的公共值**。方案与裁定过程见 [`docs/aml-core-ext-enablement.md`](docs/aml-core-ext-enablement.md) §3 与 §7.1。
+
+| 项 | 交付 | 关键事实 |
+|:--|:--|:--|
+| `Sel` 统一候选集 | `gtv-core/src/selection.rs`：`Dense` / `Bitmap` / `Ranges` 三表示，按代价自动选；`to_mask()` 一次转 Arrow，即 CUDA 的 H2D 输入 | 携带 `snapshot_id`，跨快照喂给 `khop` 直接 `SnapshotMismatch`；`UNBOUND_SNAPSHOT` 为无快照上下文放行。`khop_bounded(&Sel, …)` 为主入口，`khop_bounded_ids(&UInt64Array, …)` 保留兼容 |
+| `Neighbor::edge_idx` | `csr.rs`：`u32` 槽位，**结构体仍是 32 B**（`const` 断言守门）；`MatchedEdge` 同步带出 | 解决"同源同目标同区间的两笔转账不可区分"；转置图的槽位不是正排身份，以 `u32::MAX` 表示未知并在 `needs_edge_identity()` 时强制 push |
+| 预算语义 | `traversal.rs`：`Truncation` / `TraversalOutcome` / `TriState{Found, NoMatch, Incomplete}`；`khop_*` 与 `find_bounded` 返回**残缺结果 + 截断原因**，不再丢结果报错 | `TruncReason` 含 `Edges/Nodes/Frontier/Rows/Hops/Memory/Deadline`；`max_hops` 少跑也计作截断。SQL 的 `khop` 无三态通道，遇截断直接报错而不是返回空行集 |
+
+**验收**：`cargo test --workspace` 521 项全绿，其中新增 10 项（`selection::tests` 9 项 + 边身份 4 项 + 预算三态 3 项，含 `p1_4_motif_sql` 中新增的槽位回址断言）。**未做**：Top-K 证据路径、provenance 三层拆分（M2）；CUDA 一切实现（M4 之后）。
 
 ---
 
@@ -151,7 +163,7 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 | M7 增量 frontier | 🧊 冻结 | 与 AML / CRM / LE 无关；仅 quantum state 有真实分支集需求时再评估 |
 | M8 crates.io、M9 pyo3、M10 canonical demo、M12 dylib loader | 🗑 主线下架 | 出现真实嵌入用户后按需；对速度零贡献，且会继续扩大接口面积 |
 | 任何新的非图算子 UDTF / 领域功能 | ⛔ 本轮禁止 | 领域一律进 `gtvdb_ext`；核心只保留注册接口 |
-| CUDA 加速（C1 起） | 🧊 C0 已完成，C1 起按需 | [`docs/cuda-acceleration-plan.md`](docs/cuda-acceleration-plan.md)：本机实测冷路径传输占 96%、break-even 2.1 次，**只有设备常驻才成立**；C1 前置是驻留句柄 + `snapshot_id` 失效，不是 kernel |
+| CUDA 加速（C1 起） | 🧊 C0 已完成、M1 前置已解除；C1 起按需 | [`docs/cuda-acceleration-plan.md`](docs/cuda-acceleration-plan.md)：本机实测冷路径传输占 96%、break-even 2.1 次，**只有设备常驻才成立**；C1 前置是驻留句柄 + `snapshot_id` 失效，不是 kernel |
 
 **门禁索引**：触发条件与 go/no-go 结论以 [`docs/perf-first-roadmap-review.md`](docs/perf-first-roadmap-review.md) 为准；CI 已有「M6 batch graph operator」（step 17，逐条 parity）、「M6 admission gate」（step 18，目标查询延迟 + 段粒度）与「P1-4 motif SQL」（step 19，9 项 parity + Q1 准入基准）三道门禁，generated-data guard 与 core-boundary 保持不变。§3.2 的工程/文档欠账**不占里程碑**；§3.3 已被业主批准纳入 P1-4 并交付。
 
