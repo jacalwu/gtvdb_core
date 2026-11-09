@@ -8,6 +8,7 @@ pub mod bitemporal;
 pub mod chunk;
 pub mod column;
 pub mod csr;
+pub mod endpoint;
 pub mod error;
 pub mod graph;
 pub mod metric;
@@ -26,6 +27,9 @@ pub use chunk::TemporalEdgeChunk;
 pub use column::{Col, ColumnError, MappedRegion, Pod};
 pub use csr::{
     CsrColumns, DirectionMode, Neighbor, NeighborStrategy, Neighbors, TemporalCSR, TemporalCsrStats,
+};
+pub use endpoint::{
+    ActiveNeighbors, EndpointPolicy, EndpointView, NodeLifetime, OPEN_FROM, OPEN_TO,
 };
 pub use error::{GtvError, Result};
 pub use graph::TemporalGraph;
