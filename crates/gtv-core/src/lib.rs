@@ -15,14 +15,13 @@ pub mod graph;
 pub mod metric;
 pub mod provenance;
 pub mod quantum_state;
+pub mod selection;
 pub mod table;
 pub mod temporal;
 pub mod traits;
 pub mod traversal;
 
-pub use active_bitmap::{
-    ActiveNodeBitmap, BitmapCache, BitmapDecision, BitmapKey, BitmapPlanner,
-};
+pub use active_bitmap::{ActiveNodeBitmap, BitmapCache, BitmapDecision, BitmapKey, BitmapPlanner};
 pub use bitemporal::{
     bitemporal_edge_schema, business_date, find_overlaps, migrate_legacy_edges, BitemporalRange,
     Overlap, OPEN_ENDED,
@@ -45,9 +44,10 @@ pub use provenance::{
 pub use quantum_state::{
     Gate, ProbabilitySemantics, QuantumStateLog, QuantumStateRecord, Reconstruction, StateError,
 };
+pub use selection::{Sel, SelIter, SelRepr, UNBOUND_SNAPSHOT};
 pub use table::{EdgeTable, NodeTable};
 pub use traits::{CustomTemporalOperator, TemporalGraphIndex, VectorHit, VectorIndex};
 pub use traversal::{
-    BudgetTracker, CancelToken, EdgePredicate, KhopResult, TraversalBudget, TraversalStats,
-    VisitedSet,
+    BudgetTracker, CancelToken, EdgePredicate, KhopResult, TraversalBudget, TraversalOutcome,
+    TraversalStats, TriState, TruncReason, Truncation, VisitedSet,
 };

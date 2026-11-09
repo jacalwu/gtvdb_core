@@ -53,17 +53,8 @@ fn main() {
     let k = 4;
 
     let run = |mode: DirectionMode| {
-        csr.khop_directed(
-            &seeds,
-            k,
-            0,
-            &budget,
-            None,
-            None,
-            Some(&reverse),
-            mode,
-        )
-        .unwrap()
+        csr.khop_directed_ids(&seeds, k, 0, &budget, None, None, Some(&reverse), mode)
+            .unwrap()
     };
 
     // Correctness: all directions agree.

@@ -25,6 +25,11 @@ pub enum GtvError {
     DimensionMismatch { index: usize, query: usize },
 
     /// A graph traversal exceeded one of its resource budgets.
+    ///
+    /// Since M1 budget exhaustion is *reported* on the result (see
+    /// [`crate::traversal::Truncation`]) rather than raised; this variant stays
+    /// for callers that want to convert a truncation into an error at their own
+    /// boundary.
     #[error("budget exceeded during {stage}: limit={limit}, observed={observed}")]
     BudgetExceeded {
         stage: &'static str,
@@ -32,8 +37,18 @@ pub enum GtvError {
         observed: u64,
     },
 
+    /// A candidate set built for one snapshot was handed to another.
+    #[error("snapshot mismatch: selection was built for {expected}, operand is {got}")]
+    SnapshotMismatch { expected: u64, got: u64 },
+
+    /// A candidate set/index covers a different number of rows than expected.
+    #[error("universe mismatch: expected {expected} rows, operand has {got}")]
+    UniverseMismatch { expected: u64, got: u64 },
+
     /// A high-degree node was hit without a predicate to narrow the traversal.
-    #[error("high-degree node {node} (degree {degree}); add an edge predicate or raise the budget")]
+    #[error(
+        "high-degree node {node} (degree {degree}); add an edge predicate or raise the budget"
+    )]
     HighDegreeNode {
         node: u64,
         degree: u64,

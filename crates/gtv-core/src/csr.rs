@@ -22,10 +22,12 @@ use arrow::record_batch::RecordBatch;
 
 use crate::column::Col;
 use crate::error::{GtvError, Result};
+use crate::selection::Sel;
 use crate::table::edge_schema;
 use crate::traits::TemporalGraphIndex;
 use crate::traversal::{
-    BudgetTracker, CancelToken, EdgePredicate, KhopResult, TraversalBudget, VisitedSet,
+    BudgetTracker, CancelToken, EdgePredicate, KhopResult, TraversalBudget, TruncReason,
+    Truncation, VisitedSet,
 };
 
 /// Edges per zone-map chunk.
@@ -34,12 +36,36 @@ pub const CHUNK_SIZE: usize = 64;
 pub const LINEAR_SCAN_MAX_DEGREE: u32 = 16;
 
 /// A single neighbor edge resolved at a point in time.
+///
+/// `edge_idx` is the edge's slot in this CSR's sorted arrays and is stable for
+/// the life of the snapshot. It is the join key for the attribute sidecar and
+/// for provenance, and it costs nothing: the struct is 32 bytes either way
+/// (`valid_from` 8 + `valid_to` 8 + `dst` 8 + `edge_idx` 4 + `edge_type` 2 =
+/// 30, aligned to 32) — the field occupies padding that was already there.
+///
+/// `u32::MAX` means "no identity", which only happens for the synthetic forward
+/// edge the pull-direction traversal rebuilds from a transposed graph; a
+/// predicate that reads `edge_idx` forces push (see
+/// [`crate::traversal::EdgePredicate::needs_edge_identity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Neighbor {
     pub dst: u64,
     pub edge_type: u16,
     pub valid_from: i64,
     pub valid_to: i64,
+    /// Slot in this CSR's edge arrays; `u32::MAX` when unknown.
+    pub edge_idx: u32,
+}
+
+/// The padding claim above is load-bearing for the cache budget: it must never
+/// grow. If a future field pushes this to 40 bytes, every hot loop pays for it.
+const _: () = assert!(std::mem::size_of::<Neighbor>() == 32);
+
+impl Neighbor {
+    /// Identity of this edge within the snapshot, if known.
+    pub fn edge_idx(&self) -> Option<u32> {
+        (self.edge_idx != u32::MAX).then_some(self.edge_idx)
+    }
 }
 
 /// Which lookup strategy a `(src, T)` query used (for telemetry / tests).
@@ -126,6 +152,15 @@ pub struct TemporalCSR {
     chunk_index: Col<u32>,
     /// `chunk_max_valid_to[c]` = max `valid_to` over the edges of global chunk `c`.
     chunk_max_valid_to: Col<i64>,
+    /// Snapshot this graph was materialised from, when known. Used to reject a
+    /// [`crate::Sel`] built for a different snapshot; `None` means the caller
+    /// has not declared one and the check is skipped.
+    snapshot_id: Option<u64>,
+    /// Whether this index's slots are *the* edge identities. False for a
+    /// transpose, whose arrays are re-sorted: a slot there is a slot in the
+    /// transposed copy, and handing it out as an edge id would silently point
+    /// at the wrong row.
+    edge_identity: bool,
 }
 
 impl TemporalCSR {
@@ -165,14 +200,18 @@ impl TemporalCSR {
         node_count: usize,
     ) -> Result<Self> {
         let n = src.len();
-        if dst.len() != n
-            || valid_from.len() != n
-            || valid_to.len() != n
-            || edge_type.len() != n
-        {
+        if dst.len() != n || valid_from.len() != n || valid_to.len() != n || edge_type.len() != n {
             return Err(GtvError::InvalidArgument(
                 "edge arrays have mismatched lengths".into(),
             ));
+        }
+        if n > u32::MAX as usize {
+            // `offsets` is u32-addressed and `Neighbor::edge_idx` is u32; a
+            // larger graph would silently alias edge identities.
+            return Err(GtvError::InvalidArgument(format!(
+                "edge count {n} exceeds the u32 address space ({} edges)",
+                u32::MAX
+            )));
         }
 
         let mut rows: Vec<EdgeRow> = (0..n)
@@ -295,6 +334,12 @@ impl TemporalCSR {
         chunk_max_valid_to: Col<i64>,
     ) -> Result<Self> {
         let edge_count = dst.len();
+        if edge_count > u32::MAX as usize {
+            return Err(GtvError::InvalidArgument(format!(
+                "edge count {edge_count} exceeds the u32 address space ({} edges)",
+                u32::MAX
+            )));
+        }
         if valid_from.len() != edge_count
             || valid_to.len() != edge_count
             || edge_type.len() != edge_count
@@ -318,9 +363,7 @@ impl TemporalCSR {
             )));
         }
         if chunk_size == 0 {
-            return Err(GtvError::InvalidArgument(
-                "chunk_size must be > 0".into(),
-            ));
+            return Err(GtvError::InvalidArgument("chunk_size must be > 0".into()));
         }
         if offsets[node_count] as usize != edge_count {
             return Err(GtvError::InvalidArgument(format!(
@@ -360,7 +403,23 @@ impl TemporalCSR {
             chunk_size,
             chunk_index,
             chunk_max_valid_to,
+            snapshot_id: None,
+            edge_identity: true,
         })
+    }
+
+    /// Declare which snapshot this graph came from (builder form).
+    ///
+    /// Only then can [`crate::Sel`] values be checked against it; a graph with
+    /// no declared snapshot accepts any candidate set.
+    pub fn with_snapshot_id(mut self, snapshot_id: u64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// The declared snapshot, if any.
+    pub fn snapshot_id(&self) -> Option<u64> {
+        self.snapshot_id
     }
 
     pub fn node_count(&self) -> usize {
@@ -596,12 +655,16 @@ impl TemporalCSR {
     /// and bounded. Seeds are marked visited but not emitted; each frontier is
     /// sorted ascending.
     ///
-    /// * `budget` caps hops / edges / frontier / rows / memory / wall clock;
+    /// * `seeds` — candidate set; must belong to this graph's snapshot;
+    /// * `budget` caps hops / nodes / edges / frontier / rows / memory / clock;
     /// * `predicate` filters edges before the frontier grows;
     /// * `cancel` aborts cooperatively from another thread.
+    ///
+    /// Exhausting `budget` does **not** fail: the partial frontiers come back
+    /// with [`KhopResult::truncation`] set. Only cancellation is an error.
     pub fn khop_bounded(
         &self,
-        seeds: &UInt64Array,
+        seeds: &Sel,
         k: usize,
         valid_at: i64,
         budget: &TraversalBudget,
@@ -620,6 +683,26 @@ impl TemporalCSR {
         )
     }
 
+    /// Id-array form of [`TemporalCSR::khop_bounded`] for callers that have no
+    /// snapshot context yet. The set is built unbound, so no cross-snapshot
+    /// check happens; prefer the [`Sel`] form on any real query path.
+    pub fn khop_bounded_ids(
+        &self,
+        seeds: &UInt64Array,
+        k: usize,
+        valid_at: i64,
+        budget: &TraversalBudget,
+        predicate: Option<&dyn EdgePredicate>,
+        cancel: Option<&CancelToken>,
+    ) -> Result<KhopResult> {
+        let sel = Sel::from_ids(
+            crate::selection::UNBOUND_SNAPSHOT,
+            self.node_count as u64,
+            seeds.values().iter().copied(),
+        )?;
+        self.khop_bounded(&sel, k, valid_at, budget, predicate, cancel)
+    }
+
     /// Direction-optimizing k-hop BFS (B1-3).
     ///
     /// With a dense frontier, expanding it edge-by-edge (`push`) touches
@@ -629,11 +712,13 @@ impl TemporalCSR {
     /// size. Provide the [`TemporalCSR::transpose`] as `reverse` to enable it.
     ///
     /// [`DirectionMode::Auto`] picks the cheaper direction per hop. Predicates
-    /// are evaluated on the *forward* edge (`src -> dst`) in both directions.
+    /// are evaluated on the *forward* edge (`src -> dst`) in both directions;
+    /// a predicate that reads [`Neighbor::edge_idx`] forces push, because the
+    /// transposed graph cannot supply a forward edge slot.
     #[allow(clippy::too_many_arguments)]
     pub fn khop_directed(
         &self,
-        seeds: &UInt64Array,
+        seeds: &Sel,
         k: usize,
         valid_at: i64,
         budget: &TraversalBudget,
@@ -642,13 +727,27 @@ impl TemporalCSR {
         reverse: Option<&TemporalCSR>,
         mode: DirectionMode,
     ) -> Result<KhopResult> {
+        if let Some(id) = self.snapshot_id {
+            seeds.check_against(id)?;
+        }
         let tracker = BudgetTracker::new(budget.clone(), cancel.cloned());
-        tracker.check_time()?;
+        if !tracker.check_time()? {
+            return Ok(KhopResult {
+                frontiers: Vec::new(),
+                stats: tracker.stats(0),
+                truncation: tracker.truncation(),
+            });
+        }
+        let wants_identity = predicate.map(|p| p.needs_edge_identity()).unwrap_or(false);
+        // `max_hops` is a resource cap, so asking for more hops than it allows
+        // changes the answer. Remember that: if the walk then stops at the cap
+        // with a live frontier, the result is partial and must say so.
+        let hop_capped = k > budget.max_hops;
         let k = k.min(budget.max_hops);
         let mut visited = VisitedSet::new(self.node_count);
         let mut in_frontier = VisitedSet::new(self.node_count);
 
-        let mut current: Vec<u64> = seeds.values().as_ref().to_vec();
+        let mut current: Vec<u64> = seeds.to_ids();
         for &s in &current {
             if s >= self.node_count as u64 {
                 return Err(GtvError::NodeOutOfRange(s));
@@ -656,6 +755,13 @@ impl TemporalCSR {
         }
         current.sort_unstable();
         current.dedup();
+        if !tracker.add_nodes(current.len() as u64) {
+            return Ok(KhopResult {
+                frontiers: Vec::new(),
+                stats: tracker.stats(0),
+                truncation: tracker.truncation(),
+            });
+        }
         for &s in &current {
             visited.mark(s);
         }
@@ -668,8 +774,11 @@ impl TemporalCSR {
 
         let mut frontiers = Vec::with_capacity(k);
         let mut pending_edges = 0u64;
-        for _hop in 0..k {
-            tracker.check_time()?;
+        for hop in 0..k {
+            tracker.set_hop(hop + 1);
+            if !tracker.check_time()? {
+                break;
+            }
             if current.is_empty() {
                 break;
             }
@@ -690,17 +799,18 @@ impl TemporalCSR {
             let p = current.len() as f64 / self.node_count.max(1) as f64;
             let use_pull = match mode {
                 DirectionMode::Push => false,
-                DirectionMode::Pull => true,
+                // Edge identity only exists in the forward arrays.
+                DirectionMode::Pull => !wants_identity,
                 // Direction-optimizing trigger (random-graph model): with a
                 // frontier fraction `p`, pull is expected to scan
                 // `V(1-p)/p` edges (early exit) vs push's `pV*avg`. Pull wins
                 // when `(1-p) < p^2 * avg_degree`.
                 DirectionMode::Auto => {
-                    reverse.is_some() && (1.0 - p) < p * p * avg_degree.max(1.0)
+                    !wants_identity && reverse.is_some() && (1.0 - p) < p * p * avg_degree.max(1.0)
                 }
             };
 
-            let mut next = if use_pull {
+            let expanded = if use_pull {
                 let rev = reverse.ok_or_else(|| {
                     GtvError::InvalidArgument(
                         "pull traversal requires the transposed graph (reverse)".into(),
@@ -726,28 +836,80 @@ impl TemporalCSR {
                     &mut pending_edges,
                 )?
             };
+            // `None` means a cap tripped mid-expansion: keep what we have and
+            // report the truncation instead of discarding the frontiers.
+            let Some(mut next) = expanded else { break };
 
-            tracker.add_edges(pending_edges)?;
+            if !tracker.add_edges(pending_edges) {
+                break;
+            }
             pending_edges = 0;
             next.sort_unstable();
             next.dedup();
             if next.is_empty() {
                 break;
             }
-            tracker.record_frontier(next.len())?;
-            tracker.add_rows(next.len() as u64)?;
+            if !tracker.record_frontier(next.len()) {
+                break;
+            }
+            if !tracker.add_rows(next.len() as u64) {
+                break;
+            }
             let mem = visited.memory_bytes()
                 + in_frontier.memory_bytes()
                 + (next.len() as u64 + current.len() as u64) * std::mem::size_of::<u64>() as u64;
-            tracker.check_memory(mem)?;
+            if !tracker.check_memory(mem) {
+                break;
+            }
             frontiers.push(UInt64Array::from(next.clone()));
             current = next;
         }
         let stats = tracker.stats(frontiers.len());
-        Ok(KhopResult { frontiers, stats })
+        // A hop cap that cut the requested depth is also a truncation: the walk
+        // reached its limit with nodes still waiting to be expanded, so a larger
+        // `k` could have found more.
+        let truncation = tracker.truncation().or_else(|| {
+            (hop_capped && frontiers.len() == k && !current.is_empty()).then(|| Truncation {
+                reason: TruncReason::Hops,
+                hop: k,
+                frontier_at_stop: current.len(),
+                limit: budget.max_hops as u64,
+                observed: k as u64 + 1,
+            })
+        });
+        Ok(KhopResult {
+            frontiers,
+            stats,
+            truncation,
+        })
+    }
+
+    /// Id-array form of [`TemporalCSR::khop_directed`]; see
+    /// [`TemporalCSR::khop_bounded_ids`] for why this is not the preferred form.
+    #[allow(clippy::too_many_arguments)]
+    pub fn khop_directed_ids(
+        &self,
+        seeds: &UInt64Array,
+        k: usize,
+        valid_at: i64,
+        budget: &TraversalBudget,
+        predicate: Option<&dyn EdgePredicate>,
+        cancel: Option<&CancelToken>,
+        reverse: Option<&TemporalCSR>,
+        mode: DirectionMode,
+    ) -> Result<KhopResult> {
+        let sel = Sel::from_ids(
+            crate::selection::UNBOUND_SNAPSHOT,
+            self.node_count as u64,
+            seeds.values().iter().copied(),
+        )?;
+        self.khop_directed(&sel, k, valid_at, budget, predicate, cancel, reverse, mode)
     }
 
     /// Push step: expand `current` edge by edge into the next frontier.
+    ///
+    /// `Ok(None)` means a budget cap tripped; the caller keeps the frontiers it
+    /// already has.
     #[allow(clippy::too_many_arguments)]
     fn push_frontier(
         &self,
@@ -757,15 +919,19 @@ impl TemporalCSR {
         visited: &mut VisitedSet,
         tracker: &BudgetTracker,
         pending_edges: &mut u64,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Option<Vec<u64>>> {
         let mut next: Vec<u64> = Vec::new();
         for &s in current {
             for nb in self.neighbors(s, valid_at)? {
                 *pending_edges += 1;
                 if *pending_edges >= 4096 {
-                    tracker.add_edges(*pending_edges)?;
+                    if !tracker.add_edges(*pending_edges) {
+                        return Ok(None);
+                    }
                     *pending_edges = 0;
-                    tracker.check_time()?;
+                    if !tracker.check_time()? {
+                        return Ok(None);
+                    }
                 }
                 if let Some(p) = predicate {
                     if !p.keep(&nb) {
@@ -773,11 +939,14 @@ impl TemporalCSR {
                     }
                 }
                 if visited.mark(nb.dst) {
+                    if !tracker.add_nodes(1) {
+                        return Ok(None);
+                    }
                     next.push(nb.dst);
                 }
             }
         }
-        Ok(next)
+        Ok(Some(next))
     }
 
     /// Pull step: scan every unvisited node and stop at its first in-neighbour
@@ -793,7 +962,7 @@ impl TemporalCSR {
         in_frontier: &mut VisitedSet,
         tracker: &BudgetTracker,
         pending_edges: &mut u64,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Option<Vec<u64>>> {
         in_frontier.reset();
         for &s in current {
             in_frontier.mark(s);
@@ -806,20 +975,28 @@ impl TemporalCSR {
             for nb in reverse.neighbors(u, valid_at)? {
                 *pending_edges += 1;
                 if *pending_edges >= 4096 {
-                    tracker.add_edges(*pending_edges)?;
+                    if !tracker.add_edges(*pending_edges) {
+                        return Ok(None);
+                    }
                     *pending_edges = 0;
-                    tracker.check_time()?;
+                    if !tracker.check_time()? {
+                        return Ok(None);
+                    }
                 }
                 // `nb.dst` is the original source; must be in the frontier.
                 if !in_frontier.seen(nb.dst) {
                     continue;
                 }
                 // Evaluate the predicate on the forward edge (src=nb.dst -> dst=u).
+                // The forward edge slot is not recoverable from the transpose,
+                // so `edge_idx` is `u32::MAX`; `needs_edge_identity` predicates
+                // are routed to push instead of ever seeing this edge.
                 let edge = Neighbor {
                     dst: u,
                     edge_type: nb.edge_type,
                     valid_from: nb.valid_from,
                     valid_to: nb.valid_to,
+                    edge_idx: u32::MAX,
                 };
                 if let Some(p) = predicate {
                     if !p.keep(&edge) {
@@ -827,11 +1004,14 @@ impl TemporalCSR {
                     }
                 }
                 visited.mark(u);
+                if !tracker.add_nodes(1) {
+                    return Ok(None);
+                }
                 next.push(u);
                 break;
             }
         }
-        Ok(next)
+        Ok(Some(next))
     }
 
     /// Build the transposed (reverse) CSR: every edge `s -> d` becomes `d -> s`
@@ -854,14 +1034,22 @@ impl TemporalCSR {
                 et.push(self.edge_type[e]);
             }
         }
-        TemporalCSR::from_arrays(
+        let mut rev = TemporalCSR::from_arrays(
             &UInt64Array::from(src),
             &UInt64Array::from(dst),
             &TimestampNanosecondArray::from(vf),
             &TimestampNanosecondArray::from(vt),
             &UInt16Array::from(et),
             self.node_count,
-        )
+        )?;
+        // The transposed arrays are the same edges in a different order, so a
+        // slot in `rev` is not an edge id: say so instead of returning a number
+        // that merely happens to be in range.
+        rev.edge_identity = false;
+        // The *snapshot* is the same graph, so a candidate set built for it
+        // stays valid.
+        rev.snapshot_id = self.snapshot_id;
+        Ok(rev)
     }
 }
 
@@ -893,14 +1081,18 @@ impl Iterator for Neighbors<'_> {
             let e = self.pos;
             self.pos += 1;
             if self.all_active
-                || (self.csr.valid_from[e] <= self.valid_at
-                    && self.valid_at < self.csr.valid_to[e])
+                || (self.csr.valid_from[e] <= self.valid_at && self.valid_at < self.csr.valid_to[e])
             {
                 return Some(Neighbor {
                     dst: self.csr.dst[e],
                     edge_type: self.csr.edge_type[e],
                     valid_from: self.csr.valid_from[e],
                     valid_to: self.csr.valid_to[e],
+                    edge_idx: if self.csr.edge_identity {
+                        e as u32
+                    } else {
+                        u32::MAX
+                    },
                 });
             }
         }
@@ -921,6 +1113,8 @@ impl TemporalGraphIndex for TemporalCSR {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::UNBOUND_SNAPSHOT;
+    use crate::traversal::{TriState, TruncReason};
 
     fn sample() -> TemporalCSR {
         TemporalCSR::from_arrays(
@@ -950,7 +1144,7 @@ mod tests {
         // valid_to is exclusive: at exactly valid_to the edge is gone.
         assert_eq!(csr.neighbors(3, 399).unwrap().count(), 1); // 3 -> 5 active
         assert_eq!(csr.neighbors(3, 400).unwrap().count(), 0); // 3 -> 5 expired
-        // node 0's first edge (0->1, [0,100)) expires at T=100 while 0->2 persists.
+                                                               // node 0's first edge (0->1, [0,100)) expires at T=100 while 0->2 persists.
         let nbs: Vec<u64> = csr.neighbors(0, 100).unwrap().map(|n| n.dst).collect();
         assert_eq!(nbs, vec![2]);
     }
@@ -984,7 +1178,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             self.0
         }
         fn range(&mut self, lo: i64, hi: i64) -> i64 {
@@ -992,7 +1189,11 @@ mod tests {
         }
     }
 
-    fn random_csr(nodes: usize, edges: usize, seed: u64) -> (TemporalCSR, Vec<(u64, u64, i64, i64)>) {
+    fn random_csr(
+        nodes: usize,
+        edges: usize,
+        seed: u64,
+    ) -> (TemporalCSR, Vec<(u64, u64, i64, i64)>) {
         let mut rng = Lcg(seed);
         let mut src = Vec::new();
         let mut dst = Vec::new();
@@ -1100,7 +1301,7 @@ mod tests {
     fn khop_bounded_visits_once() {
         let csr = cyclic();
         let r = csr
-            .khop_bounded(
+            .khop_bounded_ids(
                 &UInt64Array::from(vec![0u64]),
                 5,
                 0,
@@ -1109,11 +1310,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let f: Vec<Vec<u64>> = r
-            .frontiers
-            .iter()
-            .map(|a| a.values().to_vec())
-            .collect();
+        let f: Vec<Vec<u64>> = r.frontiers.iter().map(|a| a.values().to_vec()).collect();
         // 0 is never re-emitted (visited bitmap).
         assert_eq!(f, vec![vec![1], vec![2], vec![3]]);
         assert_eq!(r.stats.rows, 3);
@@ -1124,7 +1321,7 @@ mod tests {
         let (csr, _) = random_csr(32, 2_000, 99);
         let seeds = UInt64Array::from(vec![0u64, 1, 2, 3]);
         let run = || {
-            csr.khop_bounded(&seeds, 4, 5_000, &TraversalBudget::unlimited(), None, None)
+            csr.khop_bounded_ids(&seeds, 4, 5_000, &TraversalBudget::unlimited(), None, None)
                 .unwrap()
                 .frontiers
                 .iter()
@@ -1157,8 +1354,11 @@ mod tests {
             101,
         )
         .unwrap();
-        let err = csr
-            .khop_bounded(
+        // M1: an exceeded edge budget is reported on the result, not raised.
+        // The partial frontiers survive so the caller can tell "no path" from
+        // "did not finish".
+        let r = csr
+            .khop_bounded_ids(
                 &UInt64Array::from(vec![0u64]),
                 1,
                 0,
@@ -1166,8 +1366,45 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap_err();
-        assert!(matches!(err, GtvError::BudgetExceeded { stage: "edges", .. }));
+            .unwrap();
+        let tr = r.truncation.as_ref().expect("edge cap must be reported");
+        assert_eq!(tr.reason, TruncReason::Edges);
+        assert_eq!(tr.hop, 1);
+        assert_eq!(tr.limit, 5);
+        assert!(r.frontiers.is_empty());
+        assert_eq!(r.tri_state(), TriState::Incomplete);
+    }
+
+    #[test]
+    fn khop_budget_keeps_completed_hops() {
+        // Two-hop chain 0->1->2 with a frontier cap that trips on hop 2 only:
+        // hop 1 must survive in the result.
+        let csr = TemporalCSR::from_arrays(
+            &UInt64Array::from(vec![0u64, 1]),
+            &UInt64Array::from(vec![1u64, 2]),
+            &TimestampNanosecondArray::from(vec![0i64, 0]),
+            &TimestampNanosecondArray::from(vec![100i64, 100]),
+            &UInt16Array::from(vec![0u16, 0]),
+            3,
+        )
+        .unwrap();
+        let r = csr
+            .khop_bounded_ids(
+                &UInt64Array::from(vec![0u64]),
+                2,
+                0,
+                &TraversalBudget::unlimited().with_max_edges(1),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(r.frontiers.len(), 1);
+        assert_eq!(r.frontiers[0].values().as_ref(), &[1u64]);
+        assert_eq!(
+            r.truncation.as_ref().map(|t| t.reason),
+            Some(TruncReason::Edges)
+        );
+        assert_eq!(r.tri_state(), TriState::Incomplete);
     }
 
     #[test]
@@ -1177,7 +1414,7 @@ mod tests {
         let pred = |nb: &Neighbor| nb.edge_type == 2;
         let pred: &dyn EdgePredicate = &pred;
         let r = csr
-            .khop_bounded(
+            .khop_bounded_ids(
                 &UInt64Array::from(vec![2u64]),
                 1,
                 0,
@@ -1196,7 +1433,7 @@ mod tests {
         let csr = cyclic();
         let token = Arc::new(AtomicBool::new(true));
         assert!(matches!(
-            csr.khop_bounded(
+            csr.khop_bounded_ids(
                 &UInt64Array::from(vec![0u64]),
                 2,
                 0,
@@ -1225,7 +1462,7 @@ mod tests {
         )
         .unwrap();
         let err = csr
-            .khop_bounded(
+            .khop_bounded_ids(
                 &UInt64Array::from(vec![0u64]),
                 1,
                 0,
@@ -1257,10 +1494,19 @@ mod tests {
         let seeds = UInt64Array::from(vec![0u64, 1, 2, 3, 4, 5]);
         let budget = TraversalBudget::unlimited();
         let push = csr
-            .khop_directed(&seeds, 4, 5_000, &budget, None, None, None, DirectionMode::Push)
+            .khop_directed_ids(
+                &seeds,
+                4,
+                5_000,
+                &budget,
+                None,
+                None,
+                None,
+                DirectionMode::Push,
+            )
             .unwrap();
         let pull = csr
-            .khop_directed(
+            .khop_directed_ids(
                 &seeds,
                 4,
                 5_000,
@@ -1272,7 +1518,7 @@ mod tests {
             )
             .unwrap();
         let auto = csr
-            .khop_directed(
+            .khop_directed_ids(
                 &seeds,
                 4,
                 5_000,
@@ -1298,7 +1544,7 @@ mod tests {
         let pred = |nb: &Neighbor| nb.edge_type == 2;
         let pred: &dyn EdgePredicate = &pred;
         let r = csr
-            .khop_directed(
+            .khop_directed_ids(
                 &UInt64Array::from(vec![2u64]),
                 1,
                 0,
@@ -1316,7 +1562,7 @@ mod tests {
     fn pull_requires_reverse() {
         let csr = cyclic();
         let err = csr
-            .khop_directed(
+            .khop_directed_ids(
                 &UInt64Array::from(vec![0u64]),
                 2,
                 0,
@@ -1328,5 +1574,123 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, GtvError::InvalidArgument(_)));
+    }
+
+    // ---- M1: edge identity on the neighbor path --------------------------
+
+    #[test]
+    fn neighbor_edge_idx_addresses_the_same_edge() {
+        let csr = sample();
+        // 0 has two out-edges: ->1 [0,100), ->2 [50,200). At T=50 both are
+        // live, so the check covers a multi-edge run rather than a singleton.
+        let nbs: Vec<Neighbor> = csr.neighbors(0, 50).unwrap().collect();
+        assert_eq!(nbs.len(), 2);
+        let (dst, vf, vt, et) = csr.edge_slices(0).unwrap();
+        for nb in &nbs {
+            let i = nb.edge_idx().expect("forward iteration always has a slot") as usize;
+            assert!(i < dst.len());
+            // The slot must name *this* edge, not merely an edge of the same
+            // source: every column has to agree.
+            assert_eq!(dst[i], nb.dst);
+            assert_eq!(vf[i], nb.valid_from);
+            assert_eq!(vt[i], nb.valid_to);
+            assert_eq!(et[i], nb.edge_type);
+        }
+        // Slots are strictly increasing in iteration order, which is what makes
+        // them usable as a stable sort key for evidence ordering.
+        let idx: Vec<u32> = nbs.iter().filter_map(|n| n.edge_idx()).collect();
+        assert!(idx.windows(2).all(|w| w[0] < w[1]), "{idx:?}");
+    }
+
+    #[test]
+    fn pull_path_reports_unknown_edge_idx() {
+        let csr = cyclic();
+        let rev = csr.transpose().unwrap();
+        let nb: Vec<Neighbor> = rev.neighbors(1, 0).unwrap().collect();
+        assert_eq!(nb[0].dst, 0);
+        // The transpose stores its own slots; the forward slot is not
+        // recoverable, so it must report "unknown" instead of a wrong number.
+        assert_eq!(nb[0].edge_idx(), None);
+    }
+
+    #[test]
+    fn hop_cap_that_cuts_the_requested_depth_is_reported() {
+        let csr = cyclic();
+        let seeds = Sel::from_ids(UNBOUND_SNAPSHOT, csr.node_count() as u64, [0u64]).unwrap();
+
+        // Ask for 3 hops with a 1-hop cap: the walk stops with a live frontier,
+        // so the answer is partial and must not look like a complete result.
+        let r = csr
+            .khop_bounded(
+                &seeds,
+                3,
+                0,
+                &TraversalBudget::unlimited().with_max_hops(1),
+                None,
+                None,
+            )
+            .unwrap();
+        let t = r.truncation.as_ref().expect("hop cap must be reported");
+        assert_eq!(t.reason, TruncReason::Hops);
+        assert_eq!(r.tri_state(), TriState::Incomplete);
+
+        // Same request without the cap: two frontiers, and complete.
+        let full = csr
+            .khop_bounded(&seeds, 3, 0, &TraversalBudget::unlimited(), None, None)
+            .unwrap();
+        assert!(full.is_complete());
+        assert!(full.frontiers.len() > r.frontiers.len());
+    }
+
+    #[test]
+    fn khop_rejects_selection_from_another_snapshot() {
+        let csr = cyclic().with_snapshot_id(41);
+        let stale = Sel::from_ids(42, csr.node_count() as u64, [0u64]).unwrap();
+        let err = csr
+            .khop_bounded(&stale, 2, 0, &TraversalBudget::unlimited(), None, None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GtvError::SnapshotMismatch {
+                expected: 42,
+                got: 41
+            }
+        ));
+
+        // The right snapshot (or an unbound set) goes through.
+        let fresh = Sel::from_ids(41, csr.node_count() as u64, [0u64]).unwrap();
+        assert!(csr
+            .khop_bounded(&fresh, 2, 0, &TraversalBudget::unlimited(), None, None)
+            .is_ok());
+        let unbound = Sel::from_ids(UNBOUND_SNAPSHOT, csr.node_count() as u64, [0u64]).unwrap();
+        assert!(csr
+            .khop_bounded(&unbound, 2, 0, &TraversalBudget::unlimited(), None, None)
+            .is_ok());
+    }
+
+    #[test]
+    fn khop_seeds_from_a_selection_skip_non_members() {
+        let csr = cyclic();
+        let all: Vec<u64> = csr
+            .khop_bounded_ids(
+                &UInt64Array::from(vec![0u64]),
+                3,
+                0,
+                &TraversalBudget::unlimited(),
+                None,
+                None,
+            )
+            .unwrap()
+            .frontiers
+            .iter()
+            .flat_map(|f| f.values().iter().copied().collect::<Vec<_>>())
+            .collect();
+        // Hop-1 set becomes the seed set: same reachable nodes, one fewer hop.
+        let hop1 = Sel::from_ids(UNBOUND_SNAPSHOT, csr.node_count() as u64, all.clone()).unwrap();
+        let again = csr
+            .khop_bounded(&hop1, 1, 0, &TraversalBudget::unlimited(), None, None)
+            .unwrap();
+        assert!(!again.frontiers.is_empty());
+        assert!(again.is_complete());
     }
 }
