@@ -163,7 +163,7 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 | M7 增量 frontier | 🧊 冻结 | 与 AML / CRM / LE 无关；仅 quantum state 有真实分支集需求时再评估 |
 | M8 crates.io、M9 pyo3、M10 canonical demo、M12 dylib loader | 🗑 主线下架 | 出现真实嵌入用户后按需；对速度零贡献，且会继续扩大接口面积 |
 | 任何新的非图算子 UDTF / 领域功能 | ⛔ 本轮禁止 | 领域一律进 `gtvdb_ext`；核心只保留注册接口 |
-| CUDA 加速（C2 起） | 🧊 C1 已完成（驻留 + 失效 + 回落），C2 起按需 | [`docs/cuda-acceleration-plan.md`](docs/cuda-acceleration-plan.md) §9.1：C1 实测把 break-even 从估算的 2.1 次修正为 **7.6 次**（视图是 26–27 B/edge 而非 16 B，pageable 上载 5.6–7.6 GB/s 而非 pinned 12.0 GB/s）。C2 第一个要测的量是 `dst` 从 u64 收窄到 u32 |
+| CUDA 加速（C2 起） | 🧊 C1 已完成（驻留 + 失效 + 回落），C2 起按需 | [`docs/cuda-acceleration-plan.md`](docs/cuda-acceleration-plan.md) §9.1–9.2：C1 实测把 break-even 从估算的 2.1 次修正为 **5.9 次稳态**（视图是 26–27 B/edge 而非 16 B，pageable 上载 7.3–7.9 GB/s 而非 pinned 12.0 GB/s）。`dst` 收窄已实测：**22 B/edge 只在由上游提供窄列时成立**（5.9 → 4.9 次）；`load_graph` 里转换要 9.5 ms 才省 5.7 ms，故不做 |
 
 **门禁索引**：触发条件与 go/no-go 结论以 [`docs/perf-first-roadmap-review.md`](docs/perf-first-roadmap-review.md) 为准；CI 已有「M6 batch graph operator」（step 17，逐条 parity）、「M6 admission gate」（step 18，目标查询延迟 + 段粒度）与「P1-4 motif SQL」（step 19，9 项 parity + Q1 准入基准）三道门禁，generated-data guard 与 core-boundary 保持不变。§3.2 的工程/文档欠账**不占里程碑**；§3.3 已被业主批准纳入 P1-4 并交付。
 
