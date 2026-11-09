@@ -19,7 +19,7 @@ jobs:
       - name: No tracked generated datasets
         run: |
           set -euo pipefail
-          bad=$(git ls-files | grep -Ei '\.(csv|seg|gtvd|parquet|pdf)$|nodes_c[0-9]+\.bin$' || true)
+          bad=$(git ls-files | grep -Ei '\.(csv|seg|gtvd|gtvobs|parquet|pdf)$|nodes_c[0-9]+\.bin$' || true)
           if [ -n "$bad" ]; then
             echo "::error::generated data is tracked; regenerate it instead of committing it"
             echo "$bad"
@@ -109,6 +109,12 @@ jobs:
         run: |
           cargo test -p gtv-storage --test m1_correction
           cargo test -p gtv-engine --test m1_invalidation_sql
+      - name: M2 control plane (worker compaction, delayed GC, observations, aggregates)
+        run: |
+          cargo test -p gtv-storage --test m2_control_plane
+          cargo test -p gtv-engine --test m2_aggregate_sql
+      - name: M2 control-plane regression gate
+        run: cargo run --release -p gtv-storage --example bench_correction
 
   full-tests:
     name: Full workspace regression

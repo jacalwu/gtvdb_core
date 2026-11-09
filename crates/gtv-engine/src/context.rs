@@ -157,6 +157,10 @@ pub struct GtvContext {
     /// `gtv_invalidations()` (M1). A path, not a cached event list: every call
     /// re-reads the manifest, so the projection cannot go stale.
     invalidation_root: crate::invalidation::InvalidationSlot,
+    /// M2: folded, de-duplicated snapshot behind
+    /// `gtv_active_edge_count()` / `gtv_range_agg()`. Explicitly refreshed by
+    /// `register_segment_store()` — never an implicit cache.
+    aggregate: crate::aggregate::AggregateSlot,
 }
 
 impl GtvContext {
@@ -375,6 +379,21 @@ impl GtvContext {
             )),
         );
 
+        // -- core: M2 L2 aggregates over a folded snapshot -----------------
+        let aggregate = crate::aggregate::empty_aggregate_slot();
+        ctx.register_udtf(
+            "gtv_active_edge_count",
+            Arc::new(crate::aggregate::ActiveEdgeCountTableFunction::new(
+                aggregate.clone(),
+            )),
+        );
+        ctx.register_udtf(
+            "gtv_range_agg",
+            Arc::new(crate::aggregate::RangeAggTableFunction::new(
+                aggregate.clone(),
+            )),
+        );
+
         Self {
             ctx,
             knn_collections,
@@ -390,6 +409,7 @@ impl GtvContext {
             segment_metas,
             catalog,
             invalidation_root,
+            aggregate,
             table_sources: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -587,13 +607,35 @@ impl GtvContext {
         self.segment_metas.clone()
     }
 
+    /// Attach (or refresh) the folded aggregate projection behind
+    /// `gtv_active_edge_count()` / `gtv_range_agg()`.
+    ///
+    /// The view covers exactly one system snapshot. Refreshing it is explicit,
+    /// like `sync_catalog()` for L1: a stale metadata answer is worse than a
+    /// slow one, and SQL never silently re-reads a store it does not own.
+    pub fn attach_aggregate_view(&self, view: gtv_storage::AggregateView) -> Result<()> {
+        let mut slot = self.aggregate.write().map_err(|_| {
+            datafusion::error::DataFusionError::Execution("aggregate slot lock poisoned".into())
+        })?;
+        *slot = Some(view);
+        Ok(())
+    }
+
+    /// The currently attached aggregate view, if any.
+    pub fn aggregate_view(&self) -> Option<gtv_storage::AggregateView> {
+        self.aggregate.read().ok()?.clone()
+    }
+
     /// Register every segment published by a P1 [`SegmentStore`] under
     /// `<prefix>_<segment id>`, making the ingested data visible to
     /// `gtv_segments()` / `gtv_segment_edges(name)` without a Parquet round
     /// trip or a CSV import.
     ///
-    /// Registration stays O(1) per segment: each file is mmap'd and its
-    /// header validated, but no edge column is copied or decoded.
+    /// Segment registration itself stays O(1) per segment: each file is
+    /// mmap'd and its header validated, with no edge column copied. Since M2
+    /// the same call is also the explicit synchronisation point for the
+    /// aggregate projection, which folds the head row set once (O(E)); use
+    /// `register_segment()` directly when only the segment listing is needed.
     pub fn register_segment_store(
         &self,
         store: &gtv_storage::store::SegmentStore,
@@ -602,6 +644,24 @@ impl GtvContext {
         // The same store also backs the invalidation projection, so a normal
         // P1 registration makes `gtv_invalidations()` work with no extra call.
         self.attach_delta_log(store.root())?;
+
+        // M2: one explicit synchronisation point for both new read-only
+        // projections. Observation versions make `as_of('cpi', ...)` survive a
+        // restart; the aggregate view is the de-duplicated L2 snapshot.
+        if let Ok(mut bt) = self.bitemporal.write() {
+            store.load_observations_into(&mut bt).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "cannot replay observation versions: {e}"
+                ))
+            })?;
+        }
+        let view = store.aggregate_view(store.system_ts()).map_err(|e| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "cannot build aggregate view: {e}"
+            ))
+        })?;
+        self.attach_aggregate_view(view)?;
+
         // Retired segments still exist on disk for `AS KNOWN AT` queries, but
         // they are not part of the head snapshot and must not appear twice.
         for entry in store.segments().iter().filter(|e| e.superseded_at.is_none()) {

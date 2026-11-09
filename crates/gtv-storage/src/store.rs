@@ -44,21 +44,31 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arrow::record_batch::RecordBatch;
 use gtv_core::csr::TemporalCSR;
 use gtv_core::endpoint::NodeLifetime;
 use serde::{Deserialize, Serialize};
 
+use crate::aggregate::{AggregateView, LogicalEdge};
 use crate::atomic::write_atomic;
+use crate::bitemporal::BitemporalStore;
 use crate::delta::{
     decode_delta, encode_delta, plan_correction, Correction, DeltaContext, EdgeKey, HolePolicy,
     InvalidationRecord, MaterializationState, ObjectKind, RemoveReason, RetractSet, RowPos,
     SnapshotDelta, VisibleRow,
 };
 use crate::error::{Result, StorageError};
-use crate::mem_segment::MemSegment;
+use crate::gc::{reader_count, remove_file, GcPolicy, GcReport, ReadScope};
+use crate::mem_segment::{IngestedEdge, MemSegment};
 use crate::node_lifetime::{decode_node_lifetime, encode_node_lifetime};
+use crate::observation::{
+    encode_observation, read_observation, version_at, ObservationEntry,
+};
 use crate::segment::{encode_segment, Segment, HEADER_SIZE};
 use crate::segment_meta::{PruneOutcome, SegmentMeta};
 use crate::wal::{EdgeRecord, Wal, WalFrame, OP_INSERT, OP_MUTATION};
@@ -334,6 +344,20 @@ pub struct Manifest {
     pub node_versions: Vec<NodeVersionEntry>,
     #[serde(default)]
     pub next_delta_id: u64,
+    /// M2: persisted system-time versions of observation tables.
+    #[serde(default)]
+    pub observations: Vec<ObservationEntry>,
+    #[serde(default)]
+    pub next_observation_id: u64,
+    /// M2: `AS KNOWN AT t < gc_floor` is no longer answerable because the
+    /// files it needs were reclaimed by delayed GC. `None` = full history.
+    #[serde(default)]
+    pub gc_floor: Option<i64>,
+    /// Highest published commit id (graph deltas + observation versions).
+    /// Observation versions have no WAL frame, so the cursor must survive a
+    /// restart through the manifest rather than the WAL tail.
+    #[serde(default)]
+    pub next_commit_id: u64,
 }
 
 impl Manifest {
@@ -348,6 +372,10 @@ impl Manifest {
             deltas: Vec::new(),
             node_versions: Vec::new(),
             next_delta_id: 1,
+            observations: Vec::new(),
+            next_observation_id: 1,
+            gc_floor: None,
+            next_commit_id: 0,
         }
     }
 
@@ -415,6 +443,59 @@ impl PruneSummary {
     }
 }
 
+/// Borrowed view of every input needed to reconstruct one snapshot.
+///
+/// M2 keeps this as a *view* rather than an owned struct: the synchronous
+/// version query pays nothing, while a background compaction can clone the
+/// same data once and call the very same reconstruction function. There is
+/// still only one retract fold in the codebase.
+#[derive(Clone, Copy)]
+struct LiveRowsView<'a> {
+    root: &'a Path,
+    node_count: usize,
+    manifest: &'a Manifest,
+    deltas: &'a HashMap<u64, SnapshotDelta>,
+    mem_records: &'a [IngestedEdge],
+}
+
+/// Owned snapshot of the read-only state, `Send` so `spawn_compaction()` can
+/// move it to a worker thread without locking the store.
+#[derive(Debug, Clone)]
+pub struct CompactionInput {
+    pub root: PathBuf,
+    pub node_count: usize,
+    pub manifest: Manifest,
+    pub deltas: HashMap<u64, SnapshotDelta>,
+    pub mem_records: Vec<IngestedEdge>,
+    /// Shared with the store so GC cannot delete files under a worker.
+    pub readers: Arc<AtomicUsize>,
+}
+
+impl CompactionInput {
+    fn view(&self) -> LiveRowsView<'_> {
+        LiveRowsView {
+            root: &self.root,
+            node_count: self.node_count,
+            manifest: &self.manifest,
+            deltas: &self.deltas,
+            mem_records: &self.mem_records,
+        }
+    }
+}
+
+/// Result of the **prepare** phase: fully encoded segments, no disk writes and
+/// no manifest change. `apply_compaction()` validates the three base cursors
+/// before publishing, so a stale plan can never rewrite newer data.
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    pub base_head: i64,
+    pub base_next_segment_id: u64,
+    pub base_checkpoint_txn: u64,
+    pub system_ts: i64,
+    pub segments: Vec<(SegmentEntry, Vec<u8>)>,
+    pub rows: usize,
+}
+
 #[derive(Debug)]
 pub struct SegmentStore {
     root: PathBuf,
@@ -428,6 +509,9 @@ pub struct SegmentStore {
     next_txn: u64,
     flush_threshold_bytes: usize,
     last_recovery: RecoveryReport,
+    /// In-flight version queries / background compactions. Delayed GC refuses
+    /// to unlink anything while this is non-zero.
+    readers: Arc<AtomicUsize>,
 }
 
 impl SegmentStore {
@@ -537,7 +621,13 @@ impl SegmentStore {
             }
         }
 
-        let next_txn = scan.last_txn.max(manifest.checkpoint_txn) + 1;
+        let max_delta_commit = manifest.deltas.iter().map(|d| d.commit_id).max().unwrap_or(0);
+        let next_txn = scan
+            .last_txn
+            .max(manifest.checkpoint_txn)
+            .max(manifest.next_commit_id)
+            .max(max_delta_commit)
+            + 1;
         Ok(Self {
             root,
             node_count,
@@ -548,12 +638,62 @@ impl SegmentStore {
             next_txn,
             flush_threshold_bytes: DEFAULT_FLUSH_THRESHOLD,
             last_recovery: report,
+            readers: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// Borrowed reconstruction input for a synchronous control-plane call.
+    fn view(&self) -> LiveRowsView<'_> {
+        LiveRowsView {
+            root: &self.root,
+            node_count: self.node_count,
+            manifest: &self.manifest,
+            deltas: &self.deltas,
+            mem_records: self.mem.records(),
+        }
+    }
+
+    /// Owned reconstruction input for `spawn_compaction()`.
+    pub fn compaction_input(&self) -> CompactionInput {
+        CompactionInput {
+            root: self.root.clone(),
+            node_count: self.node_count,
+            manifest: self.manifest.clone(),
+            deltas: self.deltas.clone(),
+            mem_records: self.mem.records().to_vec(),
+            readers: self.readers.clone(),
+        }
+    }
+
+    /// History below the retention floor has been physically reclaimed by a
+    /// delayed GC. Fail loudly instead of returning a different graph.
+    fn check_history(&self, t: i64) -> Result<()> {
+        if let Some(floor) = self.manifest.gc_floor {
+            if t < floor {
+                return Err(err(format!(
+                    "AS KNOWN AT {t} is below the GC retention floor {floor}; \
+                     this history has been collected"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// In-flight reader tickets (mmap readers + background compactions).
+    pub fn active_readers(&self) -> usize {
+        reader_count(&self.readers)
+    }
+
+    /// Explicit RAII ticket for an external `open_entry()` user. Holding one
+    /// prevents delayed GC from unlinking the file underneath the mapping.
+    pub fn read_scope(&self) -> ReadScope {
+        ReadScope::new(&self.readers)
+    }
+
     pub fn node_count(&self) -> usize {
         self.node_count
     }
@@ -762,22 +902,20 @@ impl SegmentStore {
     }
 
     fn save_manifest(&self) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(&self.manifest)
+        self.save_manifest_as(&self.manifest)
+    }
+
+    /// Publish an arbitrary candidate manifest atomically. Used when a publish
+    /// must be computed before any of its files become visible.
+    fn save_manifest_as(&self, m: &Manifest) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(m)
             .map_err(|e| err(format!("cannot serialize manifest: {e}")))?;
         write_atomic(&self.manifest_path(), &bytes)
     }
 
     /// Open one published segment and verify it against the manifest checksum.
     pub fn open_entry(&self, entry: &SegmentEntry) -> Result<Segment> {
-        let seg = Segment::open(self.segment_path(entry))?;
-        let got = to_hex(&seg.header().data_checksum);
-        if got != entry.data_checksum {
-            return Err(err(format!(
-                "segment {} checksum mismatch: manifest {}, file {got}",
-                entry.id, entry.data_checksum
-            )));
-        }
-        Ok(seg)
+        open_entry_from(&self.root, entry)
     }
 
     /// Segments that form the baseline at system time `T`.
@@ -881,23 +1019,12 @@ impl SegmentStore {
 
     // -- M1: visible-set reconstruction (the only retract fold) ------------
 
-    /// Deltas whose effect belongs to the snapshot at `t`.
-    ///
     /// `superseded_at = M` means "folded into the materialized base at M":
     /// the delta is still applied for every older `t < M`, but at `t >= M`
-    /// its effect is already baked into the replacement segments.
-    fn live_delta_ids(&self, t: i64) -> Vec<&DeltaEntry> {
-        self.manifest
-            .deltas
-            .iter()
-            .filter(|d| d.system_ts <= t && d.superseded_at.map_or(true, |m| m > t))
-            .collect()
-    }
-
+    /// its effect is already baked into the replacement segments. The
+    /// authoritative filter lives in `live_rows_from()`, shared with workers.
     fn decoded_delta(&self, id: u64) -> Result<&SnapshotDelta> {
-        self.deltas
-            .get(&id)
-            .ok_or_else(|| err(format!("delta {id} is in the manifest but not decoded")))
+        decoded_delta_from(&self.deltas, id)
     }
 
     /// Enumerate every visible row at system time `t`, with its stable physical
@@ -909,81 +1036,11 @@ impl SegmentStore {
     /// sorted vector; the per-row check is a binary search in the control
     /// plane, never inside `TemporalCSR::neighbors()`.
     pub fn live_rows_at(&self, t: i64) -> Result<Vec<LiveRow>> {
-        let live_deltas = self.live_delta_ids(t);
-        let retracts = RetractSet::merge(
-            &live_deltas
-                .iter()
-                .map(|de| self.decoded_delta(de.id).map(|d| d.retracts()))
-                .collect::<Result<Vec<_>>>()?,
-        );
-        let mut out = Vec::new();
-
-        for entry in self.entries_at_system(t) {
-            let seg = self.open_entry(entry)?;
-            let c = seg.csr().columns();
-            if c.dst.len() > u32::MAX as usize {
-                return Err(err(format!(
-                    "segment {} has {} rows; positional retract uses u32 row ids",
-                    entry.id,
-                    c.dst.len()
-                )));
-            }
-            let mut row = 0u32;
-            for s in 0..c.node_count {
-                let (a, b) = (c.offsets[s] as usize, c.offsets[s + 1] as usize);
-                for e in a..b {
-                    let pos = RowPos::new(entry.id, row);
-                    row += 1;
-                    if retracts.contains(pos) {
-                        continue;
-                    }
-                    out.push(LiveRow {
-                        pos,
-                        edge: EdgeRecord {
-                            src: s as u64,
-                            dst: c.dst[e],
-                            valid_from: c.valid_from[e],
-                            valid_to: c.valid_to[e],
-                            edge_type: c.edge_type[e],
-                            system_ts: entry.system_ts,
-                        },
-                        table_id: entry.table_id,
-                        partition_id: entry.partition_id,
-                    });
-                }
-            }
-        }
-
-        for de in &live_deltas {
-            let d = self.decoded_delta(de.id)?;
-            for (i, &edge) in d.puts.iter().enumerate() {
-                let pos = RowPos::new(d.put_segment_id, i as u32);
-                if retracts.contains(pos) {
-                    continue;
-                }
-                out.push(LiveRow {
-                    pos,
-                    edge,
-                    table_id: 0,
-                    partition_id: 0,
-                });
-            }
-        }
-
-        // Unflushed WAL rows live in a namespace that is never a retract
-        // target. They are visible to version queries but not to corrections.
-        for (i, r) in self.mem.records().iter().enumerate() {
-            if r.edge.system_ts > t {
-                continue;
-            }
-            out.push(LiveRow {
-                pos: RowPos::new(MEM_ROW_NAMESPACE, i as u32),
-                edge: r.edge,
-                table_id: r.table_id,
-                partition_id: r.partition_id,
-            });
-        }
-        Ok(out)
+        // One atomic ticket for the whole reconstruction; delayed GC refuses
+        // to unlink a file while this scope is alive.
+        let _scope = ReadScope::new(&self.readers);
+        self.check_history(t)?;
+        live_rows_from(self.view(), t)
     }
 
     /// Sorted logical edge tuple at `t`, excluding `system_ts` (which is not a
@@ -1005,6 +1062,8 @@ impl SegmentStore {
     /// Latest node-lifetime snapshot visible at `t`. Absent ⇒ every node is
     /// alive on the whole time axis (the pre-M1 behaviour).
     pub fn node_lifetime_at(&self, t: i64) -> Result<NodeLifetime> {
+        let _scope = ReadScope::new(&self.readers);
+        self.check_history(t)?;
         let entry = self
             .manifest
             .node_versions
@@ -1267,6 +1326,7 @@ impl SegmentStore {
         if let Some(ne) = node_entry {
             next_manifest.node_versions.push(ne);
         }
+        next_manifest.next_commit_id = commit_id;
         next_manifest.system_ts = system_ts;
         let manifest_bytes = serde_json::to_vec_pretty(&next_manifest)
             .map_err(|e| err(format!("cannot serialize manifest: {e}")))?;
@@ -1297,59 +1357,58 @@ impl SegmentStore {
         if !self.mem.is_empty() {
             return Err(err("flush pending inserts before materializing"));
         }
-        if system_ts <= self.manifest.system_ts {
-            return Err(err(format!(
-                "materialize system_ts {system_ts} does not advance past {}",
-                self.manifest.system_ts
-            )));
+        // The synchronous path uses the very same two phases as the worker
+        // thread, so forced materialization can never diverge from a spawned
+        // compaction.
+        let plan = prepare_compaction(self.view(), system_ts)?;
+        self.apply_compaction(plan)
+    }
+
+    /// Phase 1 on a worker thread. The store is **not** locked: only the
+    /// read-only reconstruction state is cloned, CPU work (CSR build + GTVSeg
+    /// encode) happens on the worker, and no file or manifest is touched.
+    /// The shared reader ticket keeps GC from unlinking inputs meanwhile.
+    pub fn spawn_compaction(&self, system_ts: i64) -> Result<JoinHandle<Result<CompactionPlan>>> {
+        let input = self.compaction_input();
+        Ok(std::thread::spawn(move || {
+            let _scope = ReadScope::new(&input.readers);
+            prepare_compaction(input.view(), system_ts)
+        }))
+    }
+
+    /// Phase 2: short critical section that writes the prepared segments and
+    /// publishes one manifest. A plan prepared against an older head is
+    /// rejected outright — its row positions no longer describe the store.
+    pub fn apply_compaction(&mut self, plan: CompactionPlan) -> Result<MaterializeReport> {
+        let _scope = ReadScope::new(&self.readers);
+        if !self.mem.is_empty() {
+            return Err(err("flush pending inserts before applying a compaction"));
         }
-        let head = self.manifest.system_ts;
-        let rows = self.live_rows_at(head)?;
-        let mut groups: BTreeMap<(u32, u32), Vec<EdgeRecord>> = BTreeMap::new();
-        for r in &rows {
-            groups
-                .entry((r.table_id, r.partition_id))
-                .or_default()
-                .push(r.edge);
+        if self.manifest.system_ts != plan.base_head
+            || self.manifest.next_segment_id != plan.base_next_segment_id
+            || self.manifest.checkpoint_txn != plan.base_checkpoint_txn
+        {
+            return Err(err(format!(
+                "stale compaction plan (base head {}, next segment {}, checkpoint {}) \
+                 does not match store (head {}, next segment {}, checkpoint {})",
+                plan.base_head,
+                plan.base_next_segment_id,
+                plan.base_checkpoint_txn,
+                self.manifest.system_ts,
+                self.manifest.next_segment_id,
+                self.manifest.checkpoint_txn
+            )));
         }
 
         let mut next_manifest = self.manifest.clone();
-        let checkpoint_txn = next_manifest.checkpoint_txn;
-        let mut new_entries = Vec::with_capacity(groups.len());
-        for ((table_id, partition_id), edges) in &groups {
-            if edges.is_empty() {
-                continue;
-            }
-            let csr = MemSegment::to_csr(edges, self.node_count)?;
-            let meta = SegmentMeta::from_csr(&csr);
-            let bytes = encode_segment(&csr)?;
-            let checksum = to_hex(blake3::hash(&bytes[HEADER_SIZE..]).as_bytes());
-            let id = next_manifest.next_segment_id;
-            next_manifest.next_segment_id += 1;
-            let file = format!("seg_{id:08}_t{table_id}_p{partition_id}.seg");
-            write_atomic(&self.segments_dir().join(&file), &bytes)?;
-            new_entries.push(SegmentEntry {
-                id,
-                file,
-                table_id: *table_id,
-                partition_id: *partition_id,
-                txn_start: checkpoint_txn,
-                txn_end: checkpoint_txn,
-                system_ts,
-                node_count: meta.node_count,
-                edge_count: meta.edge_count,
-                data_checksum: checksum,
-                valid_from_min: Some(meta.valid_from_min),
-                valid_to_max: Some(meta.valid_to_max),
-                max_valid_from: Some(meta.max_valid_from),
-                min_valid_to: Some(meta.min_valid_to),
-                node_id_min: Some(meta.node_id_min),
-                node_id_max: Some(meta.node_id_max),
-                src_id_min: Some(meta.src_id_min),
-                src_id_max: Some(meta.src_id_max),
-                superseded_at: None,
-            });
+        let head = plan.base_head;
+        let system_ts = plan.system_ts;
+        for (entry, bytes) in &plan.segments {
+            write_atomic(&self.segment_path(entry), bytes)?;
+            next_manifest.segments.push(entry.clone());
         }
+        next_manifest.next_segment_id =
+            plan.base_next_segment_id + plan.segments.len() as u64;
 
         let mut retired_segments = 0usize;
         for e in &mut next_manifest.segments {
@@ -1366,8 +1425,6 @@ impl SegmentStore {
                 retired_deltas += 1;
             }
         }
-        let new_segments = new_entries.len();
-        next_manifest.segments.extend(new_entries);
         next_manifest.system_ts = system_ts;
         let manifest_bytes = serde_json::to_vec_pretty(&next_manifest)
             .map_err(|e| err(format!("cannot serialize manifest: {e}")))?;
@@ -1376,10 +1433,10 @@ impl SegmentStore {
 
         Ok(MaterializeReport {
             system_ts,
-            new_segments,
+            new_segments: plan.segments.len(),
             retired_segments,
             retired_deltas,
-            rows: rows.len(),
+            rows: plan.rows,
         })
     }
 
@@ -1428,6 +1485,481 @@ impl SegmentStore {
         }
         Ok(checked)
     }
+
+    // -- M2: persisted observation versions -------------------------------
+
+    pub fn observations_dir(&self) -> PathBuf {
+        self.root.join("observations")
+    }
+
+    pub fn observations(&self) -> &[ObservationEntry] {
+        &self.manifest.observations
+    }
+
+    /// Newest version of `table` known at `system_t`, decoded from its IPC file.
+    pub fn observation_batches(&self, table: &str, system_t: i64) -> Result<Vec<RecordBatch>> {
+        self.check_history(system_t)?;
+        match version_at(&self.manifest.observations, table, system_t) {
+            Some(e) => read_observation(&self.root, e),
+            None => Err(err(format!(
+                "no observation version of `{table}` at or before {system_t}"
+            ))),
+        }
+    }
+
+    /// Publish one system-time version of an observation table.
+    ///
+    /// The file is written first, but the version only becomes visible when
+    /// the manifest publish succeeds (a crash leaves an unreferenced orphan
+    /// file, reclaimed by the next GC). No WAL frame: this is an append-only
+    /// immutable version, not a mutation of published rows.
+    pub fn publish_observation(
+        &mut self,
+        table: &str,
+        system_ts: i64,
+        batches: Vec<RecordBatch>,
+    ) -> Result<ObservationEntry> {
+        if table.trim().is_empty() {
+            return Err(err("observation table name is empty"));
+        }
+        let (bytes, _schema, rows) = encode_observation(&batches)?;
+        let checksum = to_hex(blake3::hash(&bytes).as_bytes());
+        let mut next_manifest = self.manifest.clone();
+        let id = next_manifest.next_observation_id.max(1);
+        next_manifest.next_observation_id = id + 1;
+        let commit_id = self.next_txn;
+        let file = format!("obs_{id:08}_c{commit_id:012}.gtvobs");
+        fs::create_dir_all(self.observations_dir())?;
+        write_atomic(&self.observations_dir().join(&file), &bytes)?;
+
+        let entry = ObservationEntry {
+            id,
+            table: table.to_string(),
+            system_ts,
+            file,
+            row_count: rows,
+            data_checksum: checksum,
+            commit_id,
+        };
+        next_manifest.observations.push(entry.clone());
+        next_manifest.next_commit_id = commit_id;
+        self.save_manifest_as(&next_manifest)?;
+        self.manifest = next_manifest;
+        self.next_txn = commit_id + 1;
+        Ok(entry)
+    }
+
+    /// Rehydrate a session `BitemporalStore` from the published versions, so
+    /// `as_of('cpi', ...)` keeps working across a process restart. `record()`
+    /// is idempotent per `system_ts`, so this is safe to call repeatedly.
+    pub fn load_observations_into(&self, target: &mut BitemporalStore) -> Result<usize> {
+        let mut loaded = 0usize;
+        for e in &self.manifest.observations {
+            let batches = read_observation(&self.root, e)?;
+            target.record(&e.table, e.system_ts, batches)?;
+            loaded += 1;
+        }
+        Ok(loaded)
+    }
+
+    // -- M2: L2 aggregates -------------------------------------------------
+
+    /// Folded, de-duplicated snapshot projection for the SQL aggregate layer.
+    /// `register_segment_store()` calls this once; a later correction requires
+    /// an explicit re-registration, exactly like the L1 catalog projection.
+    pub fn aggregate_view(&self, system_t: i64) -> Result<AggregateView> {
+        let _scope = ReadScope::new(&self.readers);
+        self.check_history(system_t)?;
+        let rows = live_rows_from(self.view(), system_t)?;
+        let segments_total = self.entries_at_system(system_t).len();
+        Ok(AggregateView::from_rows(system_t, &rows, segments_total))
+    }
+
+    /// Distinct logical edges active at `(business_t, system_t)`, plus the L2
+    /// segment-level pruning decision.
+    ///
+    /// Segment classification (`Skip` / `FullHit` / `Scan`) is O(1) per segment
+    /// and never opens a segment file. The *count* still goes through the single
+    /// retract fold, because a FullHit segment may contain retracted rows and
+    /// interval-split fragments must be de-duplicated — correctness wins over
+    /// an O(1) sum that would double count.
+    pub fn active_edge_count_at(
+        &self,
+        system_t: i64,
+        business_t: i64,
+    ) -> Result<(u64, PruneSummary)> {
+        let _scope = ReadScope::new(&self.readers);
+        self.check_history(system_t)?;
+        let mut summary = PruneSummary::default();
+        for e in self.entries_at_system(system_t) {
+            match e.classify(business_t, business_t.saturating_add(1)) {
+                PruneOutcome::Skip => summary.skipped += 1,
+                PruneOutcome::FullHit => {
+                    summary.full_hit += 1;
+                    summary.selected += 1;
+                }
+                PruneOutcome::Scan => {
+                    summary.scan += 1;
+                    summary.selected += 1;
+                }
+            }
+        }
+        let distinct: HashSet<LogicalEdge> = live_rows_from(self.view(), system_t)?
+            .iter()
+            .filter(|r| r.edge.valid_from <= business_t && business_t < r.edge.valid_to)
+            .map(LogicalEdge::of)
+            .collect();
+        Ok((distinct.len() as u64, summary))
+    }
+
+    // -- M2: delayed GC ----------------------------------------------------
+
+    /// Reclaim files whose only consumers are snapshots below the retention
+    /// floor. Default policy is a no-op dry run; see [`GcPolicy`].
+    pub fn gc(&mut self, policy: GcPolicy) -> Result<GcReport> {
+        let active = reader_count(&self.readers);
+        if active != 0 {
+            return Err(err(format!(
+                "cannot run GC while {active} reader(s) hold a store scope"
+            )));
+        }
+        let Some(retain) = policy.retain_from else {
+            return Ok(GcReport::no_op(active));
+        };
+
+        // Snapshot points, used to protect the newest N published points even
+        // when they fall below the requested floor.
+        let mut points: Vec<i64> = vec![self.manifest.system_ts];
+        points.extend(self.manifest.segments.iter().map(|e| e.system_ts));
+        points.extend(self.manifest.segments.iter().filter_map(|e| e.superseded_at));
+        points.extend(self.manifest.deltas.iter().map(|d| d.system_ts));
+        points.extend(self.manifest.deltas.iter().filter_map(|d| d.superseded_at));
+        points.extend(self.manifest.node_versions.iter().map(|v| v.system_ts));
+        points.extend(self.manifest.observations.iter().map(|v| v.system_ts));
+        points.sort_unstable();
+        points.dedup();
+        let keep_floor = if policy.keep_last_n == 0 {
+            i64::MIN
+        } else {
+            points[points.len().saturating_sub(policy.keep_last_n)]
+        };
+        let cutoff = retain.min(keep_floor);
+        if cutoff <= self.manifest.gc_floor.unwrap_or(i64::MIN) {
+            return Ok(GcReport::no_op(active));
+        }
+
+        // `node_lifetime_at(t >= cutoff)` needs the newest version at or below
+        // the floor; observation tables need one per table for the same reason.
+        let keep_node_ts = self
+            .manifest
+            .node_versions
+            .iter()
+            .filter(|v| v.system_ts <= cutoff)
+            .map(|v| v.system_ts)
+            .max();
+        let mut keep_obs: HashMap<String, i64> = HashMap::new();
+        for v in &self.manifest.observations {
+            if v.system_ts <= cutoff {
+                let slot = keep_obs.entry(v.table.clone()).or_insert(i64::MIN);
+                *slot = (*slot).max(v.system_ts);
+            }
+        }
+
+        let mut report = GcReport {
+            cutoff,
+            dry_run: policy.dry_run,
+            active_readers: active,
+            ..GcReport::default()
+        };
+        // (directory, file) pairs staged for unlink *after* the manifest publish.
+        let mut dropped: Vec<(&'static str, String)> = Vec::new();
+        let mut next_manifest = self.manifest.clone();
+
+        next_manifest.segments.retain(|e| {
+            if e.superseded_at.map_or(false, |m| m <= cutoff) {
+                dropped.push(("segments", e.file.clone()));
+                report.segments_removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        next_manifest.deltas.retain(|d| {
+            if d.superseded_at.map_or(false, |m| m <= cutoff) {
+                dropped.push(("deltas", d.file.clone()));
+                report.deltas_removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        next_manifest.node_versions.retain(|v| {
+            if v.system_ts <= cutoff && keep_node_ts.map_or(true, |k| v.system_ts < k) {
+                dropped.push(("nodes", v.file.clone()));
+                report.node_versions_removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        next_manifest.observations.retain(|v| {
+            let keep = keep_obs.get(&v.table).copied();
+            if v.system_ts <= cutoff && keep.map_or(true, |k| v.system_ts < k) {
+                dropped.push(("observations", v.file.clone()));
+                report.observations_removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        if policy.dry_run {
+            // Report candidates only: no manifest change, no unlink.
+            return Ok(report);
+        }
+
+        // Publish-before-unlink. A crash here leaves orphan files, never a
+        // manifest pointing at a deleted file.
+        next_manifest.gc_floor = Some(cutoff);
+        self.save_manifest_as(&next_manifest)?;
+        self.manifest = next_manifest;
+        report.manifest_rewritten = true;
+
+        for (dir, file) in &dropped {
+            report.bytes_reclaimed += remove_file(&self.root.join(dir).join(file))?;
+        }
+
+        // Unreferenced files from an interrupted flush / publish / compaction.
+        let mut referenced: HashSet<String> = HashSet::new();
+        referenced.extend(self.manifest.segments.iter().map(|e| e.file.clone()));
+        referenced.extend(self.manifest.deltas.iter().map(|e| e.file.clone()));
+        referenced.extend(self.manifest.node_versions.iter().map(|e| e.file.clone()));
+        referenced.extend(self.manifest.observations.iter().map(|e| e.file.clone()));
+        for (dir, ext) in [
+            ("segments", ".seg"),
+            ("deltas", ".gtvd"),
+            ("nodes", ".bin"),
+            ("observations", ".gtvobs"),
+        ] {
+            let path = self.root.join(dir);
+            if !path.exists() {
+                continue;
+            }
+            for item in fs::read_dir(&path)? {
+                let item = item?;
+                if !item.path().is_file() {
+                    continue;
+                }
+                let name = item.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(ext) || referenced.contains(&name) {
+                    continue;
+                }
+                report.bytes_reclaimed += remove_file(&item.path())?;
+                report.orphan_files_removed += 1;
+            }
+        }
+        Ok(report)
+    }
+}
+
+fn open_entry_from(root: &Path, entry: &SegmentEntry) -> Result<Segment> {
+    let seg = Segment::open(root.join("segments").join(&entry.file))?;
+    let got = to_hex(&seg.header().data_checksum);
+    if got != entry.data_checksum {
+        return Err(err(format!(
+            "segment {} checksum mismatch: manifest {}, file {got}",
+            entry.id, entry.data_checksum
+        )));
+    }
+    Ok(seg)
+}
+
+fn decoded_delta_from<'a>(
+    deltas: &'a HashMap<u64, SnapshotDelta>,
+    id: u64,
+) -> Result<&'a SnapshotDelta> {
+    deltas
+        .get(&id)
+        .ok_or_else(|| err(format!("delta {id} is in the manifest but not decoded")))
+}
+
+/// The **single** retract fold in the codebase.
+///
+/// Both the live store and a background compaction worker call this with the
+/// same inputs, so "visible at t" can never diverge between an overlay query
+/// and its materialized form. The source sweep is narrowed to the tight L2
+/// `src_id_min/max` box; the absolute row id starts at `offsets[lo]` so the
+/// positional `(segment_id, row)` namespace stays byte-for-byte identical to
+/// the un-narrowed scan.
+fn live_rows_from(v: LiveRowsView<'_>, t: i64) -> Result<Vec<LiveRow>> {
+    let live_deltas: Vec<&DeltaEntry> = v
+        .manifest
+        .deltas
+        .iter()
+        .filter(|d| d.system_ts <= t && d.superseded_at.map_or(true, |m| m > t))
+        .collect();
+    let retracts = RetractSet::merge(
+        &live_deltas
+            .iter()
+            .map(|de| decoded_delta_from(v.deltas, de.id).map(|d| d.retracts()))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    let mut out = Vec::new();
+
+    for entry in v
+        .manifest
+        .segments
+        .iter()
+        .filter(|e| e.system_ts <= t && e.superseded_at.map_or(true, |m| m > t))
+    {
+        let seg = open_entry_from(v.root, entry)?;
+        let c = seg.csr().columns();
+        if c.node_count != v.node_count {
+            return Err(err(format!(
+                "segment {} has node_count {} but store expects {}",
+                entry.id, c.node_count, v.node_count
+            )));
+        }
+        if c.dst.len() > u32::MAX as usize {
+            return Err(err(format!(
+                "segment {} has {} rows; positional retract uses u32 row ids",
+                entry.id,
+                c.dst.len()
+            )));
+        }
+        if c.node_count == 0 {
+            continue;
+        }
+        let last = (c.node_count - 1) as u64;
+        let lo = entry.src_id_min.unwrap_or(0).min(last) as usize;
+        let hi = entry.src_id_max.unwrap_or(u64::MAX).min(last) as usize + 1;
+        let mut row = c.offsets[lo] as u32;
+        for s in lo..hi {
+            let (a, b) = (c.offsets[s] as usize, c.offsets[s + 1] as usize);
+            for e in a..b {
+                let pos = RowPos::new(entry.id, row);
+                row += 1;
+                if retracts.contains(pos) {
+                    continue;
+                }
+                out.push(LiveRow {
+                    pos,
+                    edge: EdgeRecord {
+                        src: s as u64,
+                        dst: c.dst[e],
+                        valid_from: c.valid_from[e],
+                        valid_to: c.valid_to[e],
+                        edge_type: c.edge_type[e],
+                        system_ts: entry.system_ts,
+                    },
+                    table_id: entry.table_id,
+                    partition_id: entry.partition_id,
+                });
+            }
+        }
+    }
+
+    for de in &live_deltas {
+        let d = decoded_delta_from(v.deltas, de.id)?;
+        for (i, &edge) in d.puts.iter().enumerate() {
+            let pos = RowPos::new(d.put_segment_id, i as u32);
+            if retracts.contains(pos) {
+                continue;
+            }
+            out.push(LiveRow {
+                pos,
+                edge,
+                table_id: 0,
+                partition_id: 0,
+            });
+        }
+    }
+
+    // Unflushed WAL rows live in a namespace that is never a retract target.
+    for (i, r) in v.mem_records.iter().enumerate() {
+        if r.edge.system_ts > t {
+            continue;
+        }
+        out.push(LiveRow {
+            pos: RowPos::new(MEM_ROW_NAMESPACE, i as u32),
+            edge: r.edge,
+            table_id: r.table_id,
+            partition_id: r.partition_id,
+        });
+    }
+    Ok(out)
+}
+
+/// Phase 1 of compaction, shared by the synchronous and worker paths.
+///
+/// Pure CPU over a read-only view: no file is written and the manifest is not
+/// advanced. A crash / cancellation here has **zero** on-disk effect, which is
+/// what makes §23.8's compaction crash points safe.
+fn prepare_compaction(v: LiveRowsView<'_>, system_ts: i64) -> Result<CompactionPlan> {
+    if system_ts <= v.manifest.system_ts {
+        return Err(err(format!(
+            "compaction system_ts {system_ts} does not advance past {}",
+            v.manifest.system_ts
+        )));
+    }
+    let head = v.manifest.system_ts;
+    let rows = live_rows_from(v, head)?;
+    let mut groups: BTreeMap<(u32, u32), Vec<EdgeRecord>> = BTreeMap::new();
+    for r in &rows {
+        groups
+            .entry((r.table_id, r.partition_id))
+            .or_default()
+            .push(r.edge);
+    }
+
+    let checkpoint_txn = v.manifest.checkpoint_txn;
+    let mut next_id = v.manifest.next_segment_id;
+    let mut segments = Vec::with_capacity(groups.len());
+    for ((table_id, partition_id), edges) in &groups {
+        if edges.is_empty() {
+            continue;
+        }
+        let csr = MemSegment::to_csr(edges, v.node_count)?;
+        let meta = SegmentMeta::from_csr(&csr);
+        let bytes = encode_segment(&csr)?;
+        let checksum = to_hex(blake3::hash(&bytes[HEADER_SIZE..]).as_bytes());
+        let id = next_id;
+        next_id += 1;
+        let file = format!("seg_{id:08}_t{table_id}_p{partition_id}.seg");
+        segments.push((
+            SegmentEntry {
+                id,
+                file,
+                table_id: *table_id,
+                partition_id: *partition_id,
+                txn_start: checkpoint_txn,
+                txn_end: checkpoint_txn,
+                system_ts,
+                node_count: meta.node_count,
+                edge_count: meta.edge_count,
+                data_checksum: checksum,
+                valid_from_min: Some(meta.valid_from_min),
+                valid_to_max: Some(meta.valid_to_max),
+                max_valid_from: Some(meta.max_valid_from),
+                min_valid_to: Some(meta.min_valid_to),
+                node_id_min: Some(meta.node_id_min),
+                node_id_max: Some(meta.node_id_max),
+                src_id_min: Some(meta.src_id_min),
+                src_id_max: Some(meta.src_id_max),
+                superseded_at: None,
+            },
+            bytes,
+        ));
+    }
+
+    Ok(CompactionPlan {
+        base_head: head,
+        base_next_segment_id: v.manifest.next_segment_id,
+        base_checkpoint_txn: checkpoint_txn,
+        system_ts,
+        segments,
+        rows: rows.len(),
+    })
 }
 
 fn invalidation_row(inv: &InvalidationRecord, de: &DeltaEntry) -> InvalidationRow {

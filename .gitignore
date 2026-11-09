@@ -36,6 +36,9 @@
 # Immutable, checksummed, always regenerated from a manifest — never source.
 *.gtvd
 nodes_c*.bin
+# M2: persistent observation versions (Arrow IPC files published by
+# publish_observation). Regenerated from the manifest, never source.
+*.gtvobs
 # WorkBuddy session data (local work logs). Keep on disk, do not publish.
 /.workbuddy/
 # tool-local cache (not project data; bifrost.json.bak is the only copy of that
