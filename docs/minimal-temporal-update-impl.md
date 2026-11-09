@@ -176,6 +176,8 @@ as_of(table, business_ts, system_ts)  // SQL: as_of('cpi', t, S1) vs (t, S2)
 
 SQL 入口也已在 `crates/gtv-engine/src/bitemporal.rs:5-6` 注册。**`ObservationVersion` / `series_id: u128` / `value_ref` / `quality_flags` 全部是业务列**，由调用方在 Arrow schema 里定义，内核不需要认识它们，也不需要新的 `TemporalObject` 枚举。
 
+> **范围说明**：当前 `BitemporalStore` 是会话内 `HashMap`（`bitemporal.rs:43`），**尚未持久化**。这里说「零新代码」指的是**语义与查询形态已经具备**，不需要设计新的内核对象；把版本表接进 L1 快照与 manifest、落到磁盘，属于 §9 的 M2。在 M2 之前，观测值的 `AS KNOWN AT` 只在会话生命周期内有效。
+
 > 这一条是最大的过度设计：把「一张时序表」升格成「内核第四类持久化对象」，会让 Delta Segment 从纯定宽变成变长混合记录，直接推翻 §11 自己要求保留的定宽布局。
 
 ### 4.3 统一选择
