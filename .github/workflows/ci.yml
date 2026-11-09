@@ -125,6 +125,10 @@ jobs:
         run: cargo test -p gtv-engine --test m6_batch_graph
       - name: M6 admission gate (target query latency + segment granularity)
         run: cargo run --release -p gtv-engine --example bench_m6_gate
+      - name: P1-4 motif SQL (row-for-row parity + admission gate)
+        run: |
+          cargo test -p gtv-engine --test p1_4_motif_sql
+          cargo run --release -p gtv-engine --example bench_motif_gate
 
   full-tests:
     name: Full workspace regression

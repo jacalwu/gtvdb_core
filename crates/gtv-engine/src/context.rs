@@ -20,6 +20,7 @@ use crate::ext::{ExtensionInfo, ExtensionRegistry};
 use crate::registry::{AsofResource, ResourceRegistry};
 use crate::knn::{KnnCollection, KnnTableFunction};
 use crate::embedding::{EmbeddingCollection, EmbeddingRegistry, EmbeddingSearchTableFunction};
+use crate::motif::MotifSpec;
 
 /// Options attached to a lineage-enabled execution.
 #[derive(Debug, Clone, Default)]
@@ -868,6 +869,66 @@ impl GtvContext {
         let _ = self.ctx.deregister_table("gtv_batch_khop");
         self.ctx.register_table("gtv_batch_neighbors", Arc::new(neighbors))?;
         self.ctx.register_table("gtv_batch_khop", Arc::new(khop))?;
+        Ok(())
+    }
+
+    /// Register the `gtv-pattern` SQL surface (ROADMAP §3.3 / P1-4).
+    ///
+    /// Both UDTFs share one `Arc<TemporalCSR>`:
+    ///
+    /// ```sql
+    /// SELECT * FROM motif('ring3', 100, 500);              -- all starts
+    /// SELECT * FROM motif_from('ring3', 7, 100, 500, 30);  -- one seed + window
+    /// ```
+    ///
+    /// They are literal-only, exactly like `neighbors()` / `khop()`, and serve
+    /// as the pointwise baseline for the batch tables below.
+    pub fn register_motif(&self, csr: &TemporalCSR) {
+        let shared = Arc::new(csr.clone());
+        self.ctx.register_udtf(
+            "motif",
+            Arc::new(crate::motif::MotifTableFunction::from_arc(shared.clone())),
+        );
+        self.ctx.register_udtf(
+            "motif_from",
+            Arc::new(crate::motif::MotifFromTableFunction::from_arc(shared)),
+        );
+    }
+
+    /// Register joinable motif tables for a batch of seeds. One kernel run
+    /// materializes both projections, one planning cycle per SQL statement:
+    ///
+    /// ```sql
+    /// SELECT c.case_id, m.n0, m.n1, m.n2
+    ///   FROM cases c JOIN gtv_motif_matches m ON m.n0 = c.account_id;
+    /// SELECT * FROM gtv_motif_edges WHERE edge_type = 1;
+    /// ```
+    ///
+    /// `MotifSpec` carries shape / valid_at / limit / rolling window / edge-type
+    /// sequence. Re-registering replaces the previous tables, so a new alert
+    /// list does not re-copy the graph when using the `_shared` variant.
+    pub fn register_motif_batch(
+        &self,
+        csr: &TemporalCSR,
+        spec: &MotifSpec,
+        seeds: &[u64],
+    ) -> Result<()> {
+        self.register_motif_batch_shared(&Arc::new(csr.clone()), spec, seeds)
+    }
+
+    /// See [`Self::register_batch_graph_shared`]: seed sets change far more
+    /// often than the graph image does.
+    pub fn register_motif_batch_shared(
+        &self,
+        csr: &Arc<TemporalCSR>,
+        spec: &MotifSpec,
+        seeds: &[u64],
+    ) -> Result<()> {
+        let pair = crate::motif::build_motif_tables(csr, spec.clone(), seeds)?;
+        let _ = self.ctx.deregister_table("gtv_motif_matches");
+        let _ = self.ctx.deregister_table("gtv_motif_edges");
+        self.ctx.register_table("gtv_motif_matches", Arc::new(pair.matches))?;
+        self.ctx.register_table("gtv_motif_edges", Arc::new(pair.edges))?;
         Ok(())
     }
 

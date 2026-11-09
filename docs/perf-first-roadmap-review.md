@@ -263,3 +263,36 @@ L2 很有效，但它的收益来自**跳过不看的数据**：`trips_x100` 1×
 - **C 段再次证明只比趋势**：Linux ingest 1,522.8 µs ≈ **13.13 M edges/s**、publish 3,813.6 µs；Windows 为 6,458 µs / 22,783 µs，约 **4–6×** 差距。M2 的 fsync 结论在本轮复现。
 - **runner 全量回归**：53 suites / **494 passed / 0 failed / 1 ignored**，与本机逐项一致；M6 step 17（7 项 parity）与 step 18（准入基准）均实际执行且 success。
 - **已知 CI 成本**：step 18 是 kernel job 里第一个需要 release 编译 `gtv-engine`（DataFusion）的步骤，首次运行让该 job 从分钟级涨到约 20+ 分钟。后续应把 release 基准拆成独立 job 并复用 release cache，或仅在 `gtv-core` / `gtv-engine` / `gtv-storage` 路径变更时触发；这属于 CI 工程优化，不改变任何基准结论。
+
+---
+
+## 8. P1-4 落地记录（2026-11-09）：`gtv-pattern` 接出 SQL
+
+§3.3 第 2 点指出 `gtv-engine` 虽声明 `gtv-pattern` 依赖却零引用；§4 的 P1 三项没有包含它。业主在剩余项盘点后批准追加，路线图记为 **P1-4**（`ROADMAP.md` §3.3 已由「待业主决策」改为「已交付」）。它仍遵守 §4 的判定规则：能明确回答「让 Q1 的延迟降了多少，基准在哪个文件」。
+
+### 8.1 判定与落点
+
+| 事实 | 判定 |
+|:--|:--|
+| 时序 motif / 环路的匹配算法早已存在（`find` / `find_from` / `find_windowed*` / `find_bounded`），缺的只是 SQL 出口 | 与 M6-a 完全同型的「核心已有、SQL 缺出口」，**不新造算法**；`gtv-core` / `gtv-storage` 零改动 |
+| 会新增 UDTF 与两张表，扩大 SQL 面积 | 只接出**图算子**；§4 P2「禁止新增非图算子 UDTF / 领域功能」继续有效，领域逻辑仍在 `gtvdb_ext` |
+| AML 洗售资金环是 §1 定义的目标查询形态 | Q1 从「只能 k-hop」补成「可直接在 SQL 里做有序环路检测」 |
+
+**交付**：`crates/gtv-engine/src/motif.rs`（两个逐点 UDTF + 两张 joinable 批量表，共用一次 `Vec<Match>`）、`context.rs` 三个注册入口、`tests/p1_4_motif_sql.rs`（9 项）、`examples/bench_motif_gate.rs`、CI step 19。shape 为 `ring3/ring4/path2/path3/path4/diamond`，支持滚动时间窗与边类型序列（`MotifSpec`）。
+
+### 8.2 实测（Windows 本机 release，合成账户图 V=20,000 / ring3）
+
+| seeds | 逐点 p50 / p99 µs | owned µs | shared µs | spd owned | spd shared |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 302.9 / 302.9 | 717.3 | 246.1 | 0.42× | 1.23× |
+| 8 | 248.1 / 296.3 | 788.8 | 258.5 | 2.59× | 7.90× |
+| 32 | 241.1 / 382.2 | 693.3 | 268.7 | 11.82× | 30.49× |
+| 128 | 246.4 / 454.0 | 709.3 | 316.6 | 49.79× | 111.55× |
+
+**GO**（保守口径同 M6-a A 段：owned 路径在 N≥32 必须 >1，否则 CI 失败）。硬断言 `pointwise == batch == gtv_pattern::find_from` 在四组 seeds 上全部成立；9 项集成测试另覆盖全图 UDTF vs `find`、边表逐字段重建 `Match.edges`、滚动窗口 vs `find_windowed_from`、类型序列、shape 变体、join/投影/过滤下推、空集与 `limit=0`。结论仍是**瓶颈在 N 次 SQL 规划，不在图内核**。
+
+### 8.3 边界
+
+- `find_bounded`（显式 `TraversalBudget` / `CancelToken`）未接出 SQL，上界由 `limit` 提供；`sequence` 仅 Rust `MotifSpec` 可用，未做 SQL 数组字面量。
+- `csr.rs` / `neighbors()` / `endpoint.rs` / GTVSeg v1 定宽列区一行未改；无生成数据入库，5 份未跟踪需求稿未动。
+- 本节数字为 Windows 本机值，与 M6 一样**只比趋势**；Linux runner 结果以 CI step 19 为准。

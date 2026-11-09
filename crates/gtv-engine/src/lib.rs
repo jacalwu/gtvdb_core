@@ -35,6 +35,7 @@ pub mod invalidation;
 pub mod knn;
 pub mod lineage;
 pub mod monitor;
+pub mod motif;
 pub mod quantum_state;
 pub mod registry;
 pub mod segment;
@@ -59,4 +60,8 @@ pub use invalidation::{
     empty_invalidation_slot, InvalidationsTableFunction, InvalidationSlot, TagsTableFunction,
 };
 pub use lineage::{extract_udfs, ReplayError, ENGINE_VERSION, LINEAGE_TABLE};
+pub use motif::{
+    build_motif_tables, edge_schema, find_matches, match_schema, MotifBatches, MotifEdgeTable,
+    MotifFromTableFunction, MotifMatchTable, MotifShape, MotifSpec, MotifTableFunction,
+};
 pub use registry::{AsofResource, HftRegistry, PitResource, ResourceRegistry};
