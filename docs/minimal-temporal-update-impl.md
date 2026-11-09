@@ -491,6 +491,8 @@ M2 交付时留给 M3 的是：Parent+Diff Manifest、Branch/Tag、`ActiveNodeBi
 
 本节数值均为 **Windows 本机 release**；M2 已证实同代码在 Linux CI 上的 fsync 成本相差一个数量级（publish 1.75 ms vs 19.5 ms），所以跨机器只看趋势与硬断言，不看绝对毫秒数。
 
+**Linux CI 对照（run `42565080506`，同配置）**：bitmap 交叉点降到 E/V ≈ 1；Full Manifest 序列化 100 段 144.9 µs / 1000 段 850.1 µs / 5000 段 4728.7 µs / 20000 段 18.9 ms，**触发点仍是 ~5000 段**（跨平台结论一致）；`apply_compaction` 仅 **1.08 ms**、同步物化 1.10 ms，而 worker prepare+wait 2.06 ms——Windows 上 12.4 ms 的 apply 主要来自文件系统，不是算法。也就是说 Parent+Diff 的 DEFER 判定在 Linux 上同样成立，而常驻 worker 在 Linux 上省下的 prepare 反而**大于**前台 apply，收益比 Windows 更明显。
+
 ### 14.2 A：`ActiveNodeBitmap` 是派生缓存，不是事实源
 
 `crates/gtv-core/src/active_bitmap.rs` 落地四条约束：
@@ -513,7 +515,7 @@ M2 交付时留给 M3 的是：Parent+Diff Manifest、Branch/Tag、`ActiveNodeBi
 | 16 | 1035.2 | 674.5 | 0.65 | Build |
 | 64 | 3969.0 | 2457.6 | 0.62 | Build |
 
-交叉点 run-to-run 在 2–4 之间；默认阈值 8 是刻意保守的（基准未计入缓存失效、内存占用与快照切换成本）。
+交叉点是**机器相关**的：本机 2–4，Linux CI 可低到 1，run-to-run 有波动。默认阈值 8 是刻意保守的（基准未计入缓存失效、内存占用与快照切换成本）；真要调低，应先在同一台机器上重跑 `bench_m3_gate` 而不是照搬别处的比值。
 
 ### 14.3 B：Parent+Diff 的收益边界被实测出来了
 
@@ -545,7 +547,7 @@ worker       → input.prepare(head+1)    [纯 CPU：不写盘、不改 manifest
 - `gc_policy(head)` 由 `retain_window` 生成滚动 floor；**默认 `None` + `dry_run = true`，全历史不删**，prod 才显式开 `retain_window` 与 `gc_dry_run = false`。策略生成不删任何文件，GC 仍是前台显式调用。
 - `stop()` 幂等，`Drop` 自动 join；未消费的 plan 丢弃即可，下次显式 `materialize()` 会重算。
 
-C 段实测：前台 submit **0.5 µs**、worker prepare+wait **2.4 ms**、`apply_compaction` **12.4 ms**、同步 `materialize` **13.1 ms**。所以收益是「prepare 与前台重叠」，**不是免费的 materialize**——apply 的写盘与 manifest 发布仍在前台。文档刻意不把入队耗时说成「phase-1 CPU 全部移出」，避免误读。
+C 段实测（Windows）：前台 submit **0.5 µs**、worker prepare+wait **2.4 ms**、`apply_compaction` **12.4 ms**、同步 `materialize` **13.1 ms**。Linux CI 同配置：submit 0.7 µs、prepare+wait 2.06 ms、apply **1.08 ms**、同步物化 1.10 ms。所以收益是「prepare 与前台重叠」，**不是免费的 materialize**——apply 的写盘与 manifest 发布仍在前台，只是 Linux 上这一步便宜得多。文档刻意不把入队耗时说成「phase-1 CPU 全部移出」，避免误读。
 
 ### 14.5 D：只做 Tag，不做 Branch
 
@@ -570,6 +572,7 @@ GTVSeg v1 的定宽列区是 `disk == memory == cache line` 恒等式的基础�
 | 读路径 | `bench_endpoint` 所有路径结果一致，行级双时间方案仍 2.19–2.46x；`csr.rs` / `endpoint.rs` / `segment.rs` diff 为空 |
 | 控制面 | `bench_correction` 硬断言 `Overlay == Materialized` 通过；`bench_m3_gate` 输出 A–E 五项判定且 `all paths agree` |
 | 生成数据 | 仅 tempdir；无新文件类型，`.gitignore` / CI guard 保持 `*.csv / *.seg / *.gtvd / *.gtvobs / nodes_c*.bin` 拦截 |
+| CI | Actions run `42565080506` **5/5 success**；新增的 M3 测试（step 15）与准入基准（step 16）均实际执行；`Full workspace regression` 日志同为 487 / 0 / 1 |
 
 ### 14.8 剩余项与明确的触发条件
 

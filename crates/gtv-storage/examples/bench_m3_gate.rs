@@ -144,8 +144,9 @@ fn bitmap_gate() -> usize {
     );
 
     println!(
-        "  => GO (optional accelerator): measured crossover E/V ~{} (run-to-run 2-4). \
-         Planner default 8 keeps a 2-4x margin for cache build / invalidation; \
+        "  => GO (optional accelerator): measured crossover E/V ~{} \
+         (machine dependent: 1-4 across local Windows and Linux CI). \
+         Planner default 8 keeps a conservative margin for cache build / invalidation; \
          point queries and all-active snapshots stay on the O(1) path",
         if crossover == usize::MAX {
             ">64".to_string()
