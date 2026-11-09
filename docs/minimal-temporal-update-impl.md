@@ -464,7 +464,7 @@ M2 的六项能力**全部落在 `gtv-storage` 控制面与 `gtv-engine` SQL 面
 | 版本查询 P99，depth=1 | **2.85 ms（2.60x）** |
 | 版本查询 P99，已物化 | **1.70 ms（1.55x）** |
 
-这些是**控制面与文件系统**成本，不进入 `neighbors()`；depth=1 的 2.6x 是 K=1 overlay 的查询代价，也成为「K 不宜放宽、Materialize 要及时」的实测依据。数值受本机 fsync 与后台负载影响，跨机器不可直接比较，门禁的硬断言是 `Overlay == Materialized` 与所有路径结果一致。
+这些是**控制面与文件系统**成本，不进入 `neighbors()`。Linux CI runner（run `42558214981`，同配置）对照：publish p50 **1.75 ms**、forced **3.69 ms**、P99 depth=0 **0.185 ms** / depth=1 **0.210 ms（1.13x）** / materialized **0.172 ms（0.93x）**。同一份代码在 Windows 上的 19.5 ms 与 2.60x 主要来自 fsync 与文件系统，而非 overlay 本身的算法开销——所以跨机器只看「所有路径结果一致」与相对趋势，不看绝对毫秒数；门禁的硬断言是 `Overlay == Materialized`。
 
 ### 13.8 明确不做 / 留给 M3
 
