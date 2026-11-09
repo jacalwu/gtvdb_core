@@ -29,6 +29,7 @@ pub mod dq;
 pub mod embedding;
 pub mod ext;
 pub mod graph;
+pub mod invalidation;
 pub mod knn;
 pub mod lineage;
 pub mod monitor;
@@ -48,5 +49,8 @@ pub use dq::{
 };
 pub use embedding::{EmbeddingCollection, EmbeddingHit, EmbeddingRegistry, EmbeddingSearchTableFunction};
 pub use ext::{ExtensionInfo, ExtensionRegistry, GtvExtension};
+pub use invalidation::{
+    empty_invalidation_slot, InvalidationsTableFunction, InvalidationSlot,
+};
 pub use lineage::{extract_udfs, ReplayError, ENGINE_VERSION, LINEAGE_TABLE};
 pub use registry::{AsofResource, HftRegistry, PitResource, ResourceRegistry};

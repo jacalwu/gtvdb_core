@@ -91,6 +91,10 @@ impl TableFunctionImpl for SegmentsTableFunction {
             Field::new("valid_to_max", DataType::Int64, true),
             Field::new("node_id_min", DataType::UInt64, true),
             Field::new("node_id_max", DataType::UInt64, true),
+            // Tight source-only box (M1): `neighbors(src, t)` can skip a
+            // segment without opening it. NULL = unknown (legacy manifest).
+            Field::new("src_id_min", DataType::UInt64, true),
+            Field::new("src_id_max", DataType::UInt64, true),
             Field::new("prunable", DataType::Boolean, false),
         ]));
 
@@ -107,6 +111,16 @@ impl TableFunctionImpl for SegmentsTableFunction {
         rows.sort_by(|a, b| a.0.cmp(b.0));
 
         let meta_of = |name: &str| metas.get(name).copied();
+        // A legacy manifest has no src box; the `u64::MAX`/`0` sentinel means
+        // "unknown" and must surface as NULL rather than a fake tight range.
+        let src_box = |name: &str| -> Option<(u64, u64)> {
+            let m = meta_of(name)?;
+            if m.src_id_min == u64::MAX && m.src_id_max == 0 {
+                None
+            } else {
+                Some((m.src_id_min, m.src_id_max))
+            }
+        };
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -166,6 +180,12 @@ impl TableFunctionImpl for SegmentsTableFunction {
                 )),
                 Arc::new(UInt64Array::from_iter(
                     rows.iter().map(|(n, _)| meta_of(n).map(|m| m.node_id_max)),
+                )),
+                Arc::new(UInt64Array::from_iter(
+                    rows.iter().map(|(n, _)| src_box(n).map(|b| b.0)),
+                )),
+                Arc::new(UInt64Array::from_iter(
+                    rows.iter().map(|(n, _)| src_box(n).map(|b| b.1)),
                 )),
                 Arc::new(BooleanArray::from_iter(
                     rows.iter().map(|(n, _)| Some(!matches!(meta_of(n), None))),

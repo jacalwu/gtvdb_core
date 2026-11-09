@@ -5,9 +5,11 @@ pub mod atomic;
 pub mod bitemporal;
 pub mod cache;
 pub mod csv;
+pub mod delta;
 pub mod error;
 pub mod hdb;
 pub mod mem_segment;
+pub mod node_lifetime;
 pub mod parquet;
 pub mod segment;
 pub mod segment_meta;
@@ -32,5 +34,10 @@ pub use segment::{
 };
 pub use segment_meta::{PruneOutcome, SegmentMeta};
 pub use mem_segment::{IngestedEdge, MemSegment};
-pub use store::{FlushReport, Manifest, PruneSummary, RecoveryReport, SegmentEntry, SegmentStore};
+pub use store::{
+    read_invalidation_log, DeltaDraft, DeltaEntry, EdgeCorrectionPlan, FlushReport,
+    InvalidationRow, LiveRow,
+    Manifest, MaterializeReport, NodePublish, NodeVersionEntry, PruneSummary, PublishReport,
+    RecoveryReport, SegmentEntry, SegmentStore, MAX_DELTA_DEPTH,
+};
 pub use wal::{EdgeRecord, Wal, WalFrame, WalScan};

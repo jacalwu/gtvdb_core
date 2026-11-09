@@ -44,15 +44,21 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::atomic::write_atomic;
+use crate::delta::{decode_delta, encode_delta, SnapshotDelta, DELTA_CHECKSUM_SIZE, DELTA_HEADER_SIZE};
 use crate::error::{Result, StorageError};
 
 pub const WAL_MAGIC: [u8; 8] = *b"GTVWAL\0\0";
-pub const WAL_VERSION: u16 = 1;
+/// v2 adds `OP_MUTATION` frames. A v1 WAL (insert-only) is still readable.
+pub const WAL_VERSION: u16 = 2;
+pub const WAL_VERSION_V1: u16 = 1;
 pub const WAL_HEADER_SIZE: usize = 64;
 pub const FRAME_HEADER_SIZE: usize = 24;
 pub const FRAME_TRAILER_SIZE: usize = 32;
 pub const EDGE_RECORD_SIZE: usize = 42;
 pub const OP_INSERT: u8 = 1;
+/// A correction / mutation. Payload is one self-contained `encode_delta` blob,
+/// so a replayed frame needs no base state and no second derivation.
+pub const OP_MUTATION: u8 = 2;
 /// Guard against a corrupt length field asking for a huge allocation.
 const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 
@@ -104,7 +110,18 @@ impl EdgeRecord {
         }
     }
 
-    fn write_le(&self, out: &mut Vec<u8>) {
+    /// Reject an inverted business interval before it can reach a CSR.
+    pub fn validate_interval(&self) -> Result<()> {
+        if self.valid_from >= self.valid_to {
+            return Err(err(format!(
+                "edge interval [{}, {}) is inverted or empty",
+                self.valid_from, self.valid_to
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_le(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.src.to_le_bytes());
         out.extend_from_slice(&self.dst.to_le_bytes());
         out.extend_from_slice(&self.valid_from.to_le_bytes());
@@ -114,7 +131,7 @@ impl EdgeRecord {
     }
 
     /// Caller guarantees `b.len() >= EDGE_RECORD_SIZE`.
-    fn read_le(b: &[u8]) -> Self {
+    pub(crate) fn read_le(b: &[u8]) -> Self {
         Self {
             src: read_u64(b, 0),
             dst: read_u64(b, 8),
@@ -126,7 +143,9 @@ impl EdgeRecord {
     }
 }
 
-/// A single durable ingest transaction.
+/// A single durable transaction: either an ingest batch or one published
+/// `SnapshotDelta`. The two variants never share a frame, so a torn write can
+/// only lose a whole transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalFrame {
     pub txn_id: u64,
@@ -134,6 +153,8 @@ pub struct WalFrame {
     pub table_id: u32,
     pub partition_id: u32,
     pub edges: Vec<EdgeRecord>,
+    /// Present iff `op == OP_MUTATION`.
+    pub mutation: Option<SnapshotDelta>,
 }
 
 impl WalFrame {
@@ -148,19 +169,43 @@ impl WalFrame {
             op: OP_INSERT,
             table_id,
             partition_id,
-            edges,
+            edges: edges.to_vec(),
+            mutation: None,
+        }
+    }
+
+    /// A published correction. Payload is the complete after-image + retract
+    /// set — no field patch chain, so replay never depends on a base state.
+    pub fn mutation(txn_id: u64, delta: SnapshotDelta) -> Self {
+        Self {
+            txn_id,
+            op: OP_MUTATION,
+            table_id: 0,
+            partition_id: 0,
+            edges: Vec::new(),
+            mutation: Some(delta),
         }
     }
 
     fn encode(&self) -> Result<Vec<u8>> {
-        if self.op != OP_INSERT {
-            return Err(err(format!("WAL op {} is not supported", self.op)));
+        let mut payload = Vec::new();
+        match self.op {
+            OP_INSERT => {
+                payload.reserve(self.edges.len() * EDGE_RECORD_SIZE);
+                for e in &self.edges {
+                    e.write_le(&mut payload);
+                }
+            }
+            OP_MUTATION => {
+                let d = self
+                    .mutation
+                    .as_ref()
+                    .ok_or_else(|| err("OP_MUTATION frame has no delta"))?;
+                payload = encode_delta(d)?;
+            }
+            other => return Err(err(format!("WAL op {other} is not supported"))),
         }
-        let payload_len = self
-            .edges
-            .len()
-            .checked_mul(EDGE_RECORD_SIZE)
-            .ok_or_else(|| err("WAL frame payload length overflow"))?;
+        let payload_len = payload.len();
         if payload_len > MAX_FRAME_PAYLOAD {
             return Err(err(format!(
                 "WAL frame payload {payload_len} B exceeds the {MAX_FRAME_PAYLOAD} B limit; split the batch"
@@ -175,9 +220,7 @@ impl WalFrame {
         buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
         buf.extend_from_slice(&[0u8; 3]); // reserved, header is 24 B
         debug_assert_eq!(buf.len(), FRAME_HEADER_SIZE);
-        for e in &self.edges {
-            e.write_le(&mut buf);
-        }
+        buf.extend_from_slice(&payload);
         let checksum = blake3::hash(&buf);
         buf.extend_from_slice(checksum.as_bytes());
         Ok(buf)
@@ -218,9 +261,9 @@ fn validate_header(b: &[u8]) -> Result<()> {
         return Err(err("WAL bad magic (not a GTV WAL, or truncated)"));
     }
     let version = read_u16(b, 8);
-    if version != WAL_VERSION {
+    if version != WAL_VERSION && version != WAL_VERSION_V1 {
         return Err(err(format!(
-            "unsupported WAL version {version} (reader supports {WAL_VERSION})"
+            "unsupported WAL version {version} (reader supports {WAL_VERSION_V1}..={WAL_VERSION})"
         )));
     }
     if read_u16(b, 10) as usize != EDGE_RECORD_SIZE
@@ -248,8 +291,18 @@ fn scan_frames(b: &[u8]) -> Result<WalScan> {
         if remaining < FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE {
             break;
         }
+        let op = b[at + 8];
         let payload_len = read_u32(b, at + 17) as usize;
-        if payload_len > MAX_FRAME_PAYLOAD || payload_len % EDGE_RECORD_SIZE != 0 {
+        let shape_ok = match op {
+            OP_INSERT => payload_len % EDGE_RECORD_SIZE == 0,
+            OP_MUTATION => payload_len >= DELTA_HEADER_SIZE + DELTA_CHECKSUM_SIZE,
+            _ => {
+                return Err(err(format!(
+                    "WAL frame at {at} has unknown op {op}"
+                )))
+            }
+        };
+        if payload_len > MAX_FRAME_PAYLOAD || !shape_ok {
             break;
         }
         let frame_len = match FRAME_HEADER_SIZE
@@ -268,19 +321,27 @@ fn scan_frames(b: &[u8]) -> Result<WalScan> {
         if blake3::hash(&b[at..body_end]).as_bytes() != expected {
             break;
         }
-        let op = b[at + 8];
-        if op != OP_INSERT {
-            return Err(err(format!(
-                "WAL frame at {at} has valid checksum but unknown op {op}"
-            )));
+        let payload = &b[at + FRAME_HEADER_SIZE..body_end];
+
+        let mut edges = Vec::new();
+        let mut mutation = None;
+        match op {
+            OP_INSERT => {
+                let n = payload_len / EDGE_RECORD_SIZE;
+                edges.reserve(n);
+                for i in 0..n {
+                    let off = i * EDGE_RECORD_SIZE;
+                    edges.push(EdgeRecord::read_le(&payload[off..off + EDGE_RECORD_SIZE]));
+                }
+            }
+            OP_MUTATION => {
+                mutation = Some(decode_delta(payload).map_err(|e| {
+                    err(format!("WAL mutation frame at {at} is corrupt: {e}"))
+                })?);
+            }
+            _ => unreachable!("op validated above"),
         }
 
-        let n = payload_len / EDGE_RECORD_SIZE;
-        let mut edges = Vec::with_capacity(n);
-        for i in 0..n {
-            let off = at + FRAME_HEADER_SIZE + i * EDGE_RECORD_SIZE;
-            edges.push(EdgeRecord::read_le(&b[off..off + EDGE_RECORD_SIZE]));
-        }
         let txn_id = read_u64(b, at);
         last_txn = last_txn.max(txn_id);
         frames.push(WalFrame {
@@ -289,6 +350,7 @@ fn scan_frames(b: &[u8]) -> Result<WalScan> {
             table_id: read_u32(b, at + 9),
             partition_id: read_u32(b, at + 13),
             edges,
+            mutation,
         });
         at += frame_len;
     }

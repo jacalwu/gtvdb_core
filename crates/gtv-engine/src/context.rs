@@ -153,6 +153,10 @@ pub struct GtvContext {
     /// Attached `FsCatalog`, the single authority behind `gtv_tables()` /
     /// `gtv_snapshots()` / `gtv_files()` (L1).
     catalog: crate::catalog_meta::CatalogSlot,
+    /// Root of the `SegmentStore` whose published deltas back
+    /// `gtv_invalidations()` (M1). A path, not a cached event list: every call
+    /// re-reads the manifest, so the projection cannot go stale.
+    invalidation_root: crate::invalidation::InvalidationSlot,
 }
 
 impl GtvContext {
@@ -362,6 +366,15 @@ impl GtvContext {
             Arc::new(crate::catalog_meta::FilesTableFunction::new(catalog.clone())),
         );
 
+        // -- core: M1 invalidation projection (manifest commit log) ---------
+        let invalidation_root = crate::invalidation::empty_invalidation_slot();
+        ctx.register_udtf(
+            "gtv_invalidations",
+            Arc::new(crate::invalidation::InvalidationsTableFunction::new(
+                invalidation_root.clone(),
+            )),
+        );
+
         Self {
             ctx,
             knn_collections,
@@ -376,6 +389,7 @@ impl GtvContext {
             segments,
             segment_metas,
             catalog,
+            invalidation_root,
             table_sources: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -585,7 +599,12 @@ impl GtvContext {
         store: &gtv_storage::store::SegmentStore,
         prefix: &str,
     ) -> Result<()> {
-        for entry in store.segments() {
+        // The same store also backs the invalidation projection, so a normal
+        // P1 registration makes `gtv_invalidations()` work with no extra call.
+        self.attach_delta_log(store.root())?;
+        // Retired segments still exist on disk for `AS KNOWN AT` queries, but
+        // they are not part of the head snapshot and must not appear twice.
+        for entry in store.segments().iter().filter(|e| e.superseded_at.is_none()) {
             let path = store.segment_path(entry).to_string_lossy().into_owned();
             let name = format!("{prefix}_{}", entry.id);
             self.register_segment(&path, &name)?;
@@ -630,6 +649,28 @@ impl GtvContext {
     /// The attached catalog, if any.
     pub fn catalog(&self) -> Option<gtv_catalog::FsCatalog> {
         self.catalog.read().ok()?.clone()
+    }
+
+    // -- M1: invalidation projection ---------------------------------------
+
+    /// Point `gtv_invalidations()` at a `SegmentStore` root. The slot holds a
+    /// path only: every call re-reads the manifest and delta files, so the view
+    /// tracks the single atomic publish point without an event bus.
+    ///
+    /// [`Self::register_segment_store`] calls this automatically.
+    pub fn attach_delta_log(&self, root: impl Into<PathBuf>) -> Result<()> {
+        let mut slot = self.invalidation_root.write().map_err(|_| {
+            datafusion::error::DataFusionError::Execution(
+                "invalidation slot lock poisoned".into(),
+            )
+        })?;
+        *slot = Some(root.into());
+        Ok(())
+    }
+
+    /// The attached delta-log root, if any.
+    pub fn delta_log_root(&self) -> Option<PathBuf> {
+        self.invalidation_root.read().ok()?.clone()
     }
 
     /// Publish every committed catalog table into the SQL session, reading

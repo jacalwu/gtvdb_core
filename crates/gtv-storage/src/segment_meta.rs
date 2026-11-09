@@ -57,6 +57,11 @@ pub struct SegmentMeta {
     pub node_id_min: u64,
     /// Largest node id touched as a source or a destination.
     pub node_id_max: u64,
+    /// Tight box over **sources only**. `neighbors(src, t)` never needs to open
+    /// a segment whose `src` run is empty, which `node_id_min/max` (a union
+    /// over src and dst) cannot express.
+    pub src_id_min: u64,
+    pub src_id_max: u64,
     pub edge_type_min: u16,
     pub edge_type_max: u16,
 }
@@ -84,6 +89,8 @@ impl SegmentMeta {
         min_valid_to: i64::MAX,
         node_id_min: u64::MAX,
         node_id_max: 0,
+        src_id_min: u64::MAX,
+        src_id_max: 0,
         edge_type_min: u16::MAX,
         edge_type_max: 0,
     };
@@ -108,6 +115,8 @@ impl SegmentMeta {
             min_valid_to: i64::MAX,
             node_id_min: u64::MAX,
             node_id_max: 0,
+            src_id_min: u64::MAX,
+            src_id_max: 0,
             edge_type_min: u16::MAX,
             edge_type_max: 0,
         };
@@ -125,6 +134,8 @@ impl SegmentMeta {
             let id = s as u64;
             meta.node_id_min = meta.node_id_min.min(id);
             meta.node_id_max = meta.node_id_max.max(id);
+            meta.src_id_min = meta.src_id_min.min(id);
+            meta.src_id_max = meta.src_id_max.max(id);
         }
 
         for e in 0..c.dst.len() {
@@ -172,6 +183,22 @@ impl SegmentMeta {
     #[inline]
     pub fn may_contain(&self, t: i64) -> bool {
         !self.is_empty() && self.valid_from_min <= t && self.valid_to_max > t
+    }
+
+    /// Could this segment hold an edge **originating** at `src`?
+    ///
+    /// `u64::MAX`/`0` (a legacy manifest with unknown src box) is deliberately
+    /// treated as "unknown" and never prunes — an old manifest must not lose
+    /// rows just because a newer reader knows how to skip more.
+    #[inline]
+    pub fn may_contain_src(&self, src: u64) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        if self.src_id_min == u64::MAX && self.src_id_max == 0 {
+            return true;
+        }
+        self.src_id_min <= src && src <= self.src_id_max
     }
 
     /// Is *every* edge in the segment active at `t`? Reads the **intersection**

@@ -138,6 +138,12 @@ impl NodeLifetime {
         self.valid_from.is_empty()
     }
 
+    /// Borrow both fixed-width columns (used by the on-disk snapshot codec).
+    #[inline]
+    pub fn columns(&self) -> (&[i64], &[i64]) {
+        (&self.valid_from, &self.valid_to)
+    }
+
     #[inline]
     pub fn range(&self, node: u64) -> Option<(i64, i64)> {
         let i = node as usize;

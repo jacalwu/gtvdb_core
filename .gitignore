@@ -32,6 +32,10 @@
 # GTVSeg immutable segments are generated data, never source. `write_segment`
 # publishes *.seg via atomic rename; keep them out of version control.
 *.seg
+# M1 correction artefacts: SnapshotDelta files and node-lifetime snapshots.
+# Immutable, checksummed, always regenerated from a manifest — never source.
+*.gtvd
+nodes_c*.bin
 # WorkBuddy session data (local work logs). Keep on disk, do not publish.
 /.workbuddy/
 # tool-local cache (not project data; bifrost.json.bak is the only copy of that
