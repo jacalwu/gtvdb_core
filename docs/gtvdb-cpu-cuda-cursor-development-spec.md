@@ -496,7 +496,7 @@ workbuddy 不得自行引入新的 CUDA 框架，除非先提交依赖比较和�
 
 ---
 
-## Phase E：CUDA rolling/window reduce
+## Phase E：CUDA rolling/window reduce （✅ 已交付，门禁未过，见 §16 的 I 行与 `docs/cuda-acceleration-plan.md` §9.8）
 
 ### 任务
 
@@ -789,6 +789,7 @@ E. Phase A 实施顺序
 | 2026-11-10 | 本次 | F（列式 materialize） | 592 | 8 实机通过 | `graph_at` 1e7 边：旧实现 1 508–1 579 ms → **393 ms**（3 个存活段，k 路归并）/ **176 ms**（压实后单段，原样拷贝）；行路径 oracle 同步 1 455 ms。探针拆解：只读 102 ms、+写列 175 ms、完整归并 390 ms，**选择器约 215 ms**（3 条 run 在 src 上交错，分支预测必错） | 不再经 AoS：段内 CSR 已按 `(src, valid_from, valid_to, dst)` 有序，flush 时付过的排序不再付第二次。`tests/graph_at_columnar.rs` 用行路径逐列比对并直接断言排序不变量（9 项）。端到端盈亏 255 → 69 次（未压实）/ 34 次（压实）；压实后已贴住本机拷贝上限（同 260 MiB 的 `fs::read` 78 ms） |
 | 2026-11-10 | 本次 | G（列投影 + 预算预检） | 604 | 10 实机通过 | `bench_residency … topology`：1e7 边窄列 23.00 B/edge / 29–31 ms → 拓扑投影 **5.00 B/edge / 5.9–6.4 ms**，三次带宽都在 7.5–8.8 GB/s 同一档（省下的是字节，不是效率）；4.8 GiB budget 的容量 224M → **1.03B 边（4.6×）**；去掉 label 一档 21.00 B/edge / 25–26 ms | `ColumnSet` 位集合承载投影，`(snapshot_id, projection)` 是缓存键（少这一半就是错答案而不是 miss），`ResidentGraph::check_columns` 让读 `valid_from` 的算子拿到具名错误，`Caps::admit` 在第一次 `cuMemAlloc` 之前用 `OutOfBudget`（`Fallback::Cpu`）拒绝装不下的拷贝。`tests/columns.rs` 11 项 + 设备侧 2 项 |
 | 2026-11-10 | 本次 | H（flat batch KNN 内核，即 §8 Phase D） | 596（+28 设备侧，合计 **624**） | 28 实机通过（8 单测 + 16 设备 + 4 PTX 章校验） | `bench_knn`：100k×128 k=10，语料 51.2 MB、上传 6.8 ms（7.91 GB/s），batch 1 **3.5×** / 8 13.3× / 32 **14.3×** / 64 13.2×；1M×128 上传 65.0 ms，batch 1 2.7× / 8 11.7× / 32 9.3×。阶段表（batch 64）**kernel 99.1%**、upload 0.2%、download 0.5%（15.9 KB）、merge 0.1%。盈亏 **5 次**（100k）/ **7 次**（1M） | `grid=(batch, splits)`、`block=256`、每 warp 一个 shared 升序候选堆（`WARPS×k×12 B`），`__ballot_sync` + leader 选举插入，**无锁**；tie 按 `(distance, id)` 与 CPU `cmp_scored` 一致；`k ≤ 256` 进 `Caps::max_k`（`DecisionReason::KTooLarge` 让 planner 提前避开），超出返回 `LimitExceeded`（`Fallback::Cpu`）。**PTX 入库而不是 NVRTC**：只装驱动、不装 toolkit 的机器是常规部署，那里 NVRTC 会让 C2 静默不可用；`cargo xtask cuda-ptx` 把 `.cu` 的 BLAKE3 写进 PTX 头，`tests/ptx_stamp.rs` 每次 `cargo test` 重算——无 GPU 的 CI 上这是内核唯一可验证的东西。两个坑写进 §9.7：PTX 不得含非 ASCII（含注释），模块属于 primary context 故加载过内核后不再 release |
+| 2026-11-10 | 本次 | I（rolling window，即 §8 Phase E） | 596（+39 设备侧，合计 **635**） | 39 实机通过（12 单测 + 22 设备含 C3 8 项 + 5 PTX 章，两个内核各一组） | `bench_window`：1e7 行 × 窗 100，语料 80 MB。kernel **1.13–1.37 ms（141 GB/s）**；冷 28.85 ms（`0.68×`）、常驻 **20.40 ms（1.03×）**，CPU `msum` 20.62 ms。阶段表（常驻）download **81.0%**、kernel 5.5%。下行分解：预热缓冲 **6.80 ms / 11.8 GB/s**，写入全新 `Vec` **14.59 ms / 5.5 GB/s**——差出的 7.8 ms 是 80 MB 新页缺页。天花板：无状态 0.75×、常驻 1.03×、复用结果缓冲 2.60×（API 拿不到）、不回传 18×（属 C4） | 一个内核五种聚合：`sum`/`mean` 用块内前缀扫描（块 + `window-1` 行晕，无全局前缀、无 carry 链、无 lookback），`min`/`max` 用单调队列（极值不可用前缀相减），`count` 用索引算术。`window ≤ 1024` 进 `Caps::max_window`。精确性分层：`count`/`min`/`max` **逐位相等**（含 NaN 只在窗口首元素时粘住的位置规则），`sum`/`mean` 容差 1e-6、实测最大相对偏差 **3.97e-11**（GPU 比会漂移的参考更准，因每 2048 行重置）。**门禁未过**（端到端 2×），故 `min_window_rows` 默认 `u64::MAX`：按 Phase E 的验收条文，无独立收益只做链式内部算子，不默认启用 |
 **与规范的三处偏离，都有理由：**
 
 1. **没有 `EndpointMask`。** 草案里 `valid_time_filter(…, policy: EndpointMask)` 需要"节点在 t 是否存活"，而 v1 视图只有出边，判断 `DST` 侧存活要转置图。C1 的签名是 `valid_time_filter(&ResidentGraph, t) -> Sel`；端点策略推迟到确实需要它的那一步（C4），届时视图要加节点寿命列，而不是在签名里先放一个算不出来的参数。
