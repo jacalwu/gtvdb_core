@@ -388,10 +388,9 @@ fn the_cache_drives_the_device_lifecycle() {
 #[test]
 fn the_kernels_advertised_are_the_kernels_that_landed() {
     let _serial = exclusive();
-    // C2 boundary, asserted rather than described: `knn_flat` now routes to the
-    // device once the work clears the threshold, while `window_reduce` — not
-    // ported yet — still reports `Unsupported` rather than pretending there is
-    // no GPU.
+    // Asserted rather than described: both kernels are advertised, both limits
+    // are advertised with them, and the policy still refuses to *use* the window
+    // one by default — the operator is not enabled, it is available (§9.8).
     let acc = device_or_skip!();
     let mut reg = gtv_accelerator::AcceleratorRegistry::new();
     reg.register(Arc::new(acc));
@@ -403,13 +402,21 @@ fn the_kernels_advertised_are_the_kernels_that_landed() {
     assert!(decision.is_device(), "{decision:?}");
     assert!(backend.is_some());
 
+    // Landed: the bit is set and a window within the limit is admitted.
+    assert!(caps.supports(Op::WindowReduce));
+    assert!(caps.admits_window(1_024));
     let (decision, backend) =
         reg.route(&policy, &DecisionInputs::new(&caps, Op::WindowReduce, 10_000_000));
     assert!(!decision.is_device());
     assert!(backend.is_none());
+    // ...but not enabled by default: the threshold is deliberately unreachable
+    // standalone, because the operator measured 1.05x end to end.
     assert_eq!(
         decision.reason(),
-        Some(gtv_accelerator::DecisionReason::Unsupported)
+        Some(gtv_accelerator::DecisionReason::BelowThreshold {
+            work: 10_000_000,
+            threshold: u64::MAX,
+        })
     );
 
     // And a k the shared-memory heap cannot hold is refused at plan time, not by
@@ -807,4 +814,221 @@ fn a_second_accelerator_reuses_the_loaded_kernel() {
         "the second accelerator answered differently"
     );
     gpu.release_vectors(&h);
+}
+
+// ---------------------------------------------------------------------------
+// C3: trailing-window aggregates
+// ---------------------------------------------------------------------------
+
+/// A column with the shape of a price series: bounded, no long runs of equal
+/// values, and a non-zero mean so a running sum has something to lose precision
+/// against.
+fn series(rows: usize) -> Vec<f64> {
+    (0..rows)
+        .map(|i| ((i % 977) as f64 * 0.013) - 6.0 + ((i % 7) as f64) * 0.001)
+        .collect()
+}
+
+/// Relative tolerance for `Sum`/`Mean`.
+///
+/// These two cannot be bit-exact: the reference is a running recurrence over the
+/// whole column whose rounding drifts with `n`, while the device differences two
+/// prefixes that restart every chunk. The measured worst case at 1e7 rows is
+/// 4e-11 relative (printed by `examples/bench_window.rs`), so this is four
+/// orders of magnitude of margin — the constant exists to catch a real
+/// regression, not to paper over a boundary.
+const TOLERANCE: f64 = 1e-6;
+
+fn assert_close(op: gtv_accelerator::WindowOp, got: &[f64], want: &[f64]) {
+    use gtv_accelerator::WindowOp;
+    assert_eq!(got.len(), want.len(), "{op:?}: row count");
+    for (i, (a, b)) in got.iter().zip(want).enumerate() {
+        assert_eq!(a.is_nan(), b.is_nan(), "{op:?} row {i}: NaN mismatch");
+        if a.is_nan() {
+            continue;
+        }
+        let exact = matches!(op, WindowOp::Min | WindowOp::Max | WindowOp::Count);
+        let tol = if exact { 0.0 } else { TOLERANCE * b.abs().max(1.0) };
+        assert!(
+            (a - b).abs() <= tol,
+            "{op:?} row {i}: device {a}, reference {b} (|d| {})",
+            (a - b).abs()
+        );
+    }
+}
+
+#[test]
+fn every_window_op_matches_the_reference() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let cpu = CpuAccelerator::new();
+    // 5 000 rows is two and a half chunks, so the straddling windows at the chunk
+    // boundaries are exercised; 1 and 2 hit the halo-less and one-row cases.
+    let values = series(5_000);
+    for op in [
+        gtv_accelerator::WindowOp::Sum,
+        gtv_accelerator::WindowOp::Mean,
+        gtv_accelerator::WindowOp::Min,
+        gtv_accelerator::WindowOp::Max,
+        gtv_accelerator::WindowOp::Count,
+    ] {
+        for w in [1usize, 2, 3, 100, 1_024] {
+            let want = cpu.window_reduce(&values, w, op).unwrap();
+            let got = gpu.window_reduce(&values, w, op).unwrap();
+            assert_close(op, &got, &want);
+        }
+    }
+}
+
+#[test]
+fn the_window_limit_is_advertised_before_it_is_enforced() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let caps = gpu.caps();
+    assert!(caps.admits_window(1_024));
+    assert!(!caps.admits_window(1_025));
+
+    // Over the limit is a limit, not a malformed request: the CPU can still
+    // answer, so this must be `LimitExceeded` with `Fallback::Cpu` rather than a
+    // generic argument error.
+    let err = gpu
+        .window_reduce(&series(2_000), 1_025, gtv_accelerator::WindowOp::Sum)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        AcceleratorError::LimitExceeded {
+            backend: "cuda",
+            what: "window",
+            requested: 1_025,
+            limit: 1_024,
+        }
+    );
+    assert_eq!(err.fallback(), gtv_accelerator::Fallback::Cpu);
+}
+
+#[test]
+fn degenerate_inputs_answer_the_way_the_cpu_does() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let cpu = CpuAccelerator::new();
+    use gtv_accelerator::WindowOp;
+
+    // Empty column: both sides return an empty column, and neither touches the
+    // device.
+    assert!(gpu.window_reduce(&[], 10, WindowOp::Sum).unwrap().is_empty());
+    assert!(cpu.window_reduce(&[], 10, WindowOp::Sum).unwrap().is_empty());
+
+    // Window 0: the reference defines this as "no rows", not "one row".
+    assert!(gpu.window_reduce(&series(100), 0, WindowOp::Sum).unwrap().is_empty());
+    assert!(cpu.window_reduce(&series(100), 0, WindowOp::Sum).unwrap().is_empty());
+
+    // Window wider than the column: the aggregate covers what exists, which is
+    // the cumulative convention, not a truncated window.
+    let values = series(7);
+    for op in [WindowOp::Sum, WindowOp::Mean, WindowOp::Min, WindowOp::Max, WindowOp::Count] {
+        let want = cpu.window_reduce(&values, 100, op).unwrap();
+        let got = gpu.window_reduce(&values, 100, op).unwrap();
+        assert_close(op, &got, &want);
+    }
+
+    // A single row: one window, one answer.
+    let one = [42.5f64];
+    for op in [WindowOp::Sum, WindowOp::Mean, WindowOp::Min, WindowOp::Max, WindowOp::Count] {
+        assert_eq!(
+            gpu.window_reduce(&one, 4, op).unwrap(),
+            cpu.window_reduce(&one, 4, op).unwrap(),
+            "{op:?}"
+        );
+    }
+}
+
+#[test]
+fn the_nan_rule_is_the_reference_fold() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let cpu = CpuAccelerator::new();
+    use gtv_accelerator::WindowOp;
+
+    // The reference fold starts at the window's first element and only replaces
+    // it when the comparison holds, so a NaN is sticky only when it is first and
+    // is ignored everywhere else. The device has to reproduce that positional
+    // rule, not "min skips NaN".
+    let mut values = vec![3.0, 1.0, 2.0, 5.0, 4.0];
+    values[2] = f64::NAN;
+    for op in [WindowOp::Min, WindowOp::Max] {
+        for w in [2usize, 3] {
+            let want = cpu.window_reduce(&values, w, op).unwrap();
+            let got = gpu.window_reduce(&values, w, op).unwrap();
+            assert_close(op, &got, &want);
+        }
+    }
+
+    // Sum propagates NaN arithmetically, which is the one place the two shapes
+    // agree for a different reason. Asserted so a future refactor cannot quietly
+    // change it.
+    let got = gpu.window_reduce(&values, 2, WindowOp::Sum).unwrap();
+    assert!(got[2].is_nan() && got[3].is_nan());
+}
+
+#[test]
+fn a_resident_column_is_uploaded_once_and_gives_the_memory_back() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let values = series(100_000);
+    let bytes = std::mem::size_of_val(&values[..]);
+    let before = gpu.resident_bytes();
+
+    let handle = gpu.load_column(&values).unwrap().expect("cuda keeps columns");
+    assert_eq!(handle.rows(), values.len());
+    assert_eq!(handle.bytes(), bytes);
+    assert_eq!(gpu.resident_bytes(), before + bytes);
+
+    let first = gpu
+        .window_reduce_resident(&handle, 100, gtv_accelerator::WindowOp::Sum)
+        .unwrap();
+    let m = gpu.last_window_metrics().unwrap();
+    assert!(m.resident);
+    // The whole point of the handle: no upload on a resident call, and the same
+    // bytes back.
+    assert_eq!(m.upload_bytes, 0);
+    assert_eq!(m.upload_ns, 0);
+    assert_eq!(m.result_bytes, bytes);
+    assert_eq!(m.rows, values.len());
+
+    let second = gpu
+        .window_reduce_resident(&handle, 100, gtv_accelerator::WindowOp::Sum)
+        .unwrap();
+    assert_eq!(first, second, "two calls over one resident column disagreed");
+
+    gpu.release_column(&handle);
+    assert_eq!(gpu.resident_bytes(), before);
+    // Releasing twice is not an error: eviction and drop both call it.
+    gpu.release_column(&handle);
+    // A released handle is refused by name rather than by answering from a
+    // dangling pointer.
+    let err = gpu
+        .window_reduce_resident(&handle, 100, gtv_accelerator::WindowOp::Sum)
+        .unwrap_err();
+    assert!(matches!(err, AcceleratorError::InvalidArgument(_)), "{err:?}");
+}
+
+#[test]
+fn the_stage_table_accounts_for_every_byte() {
+    let _serial = exclusive();
+    let gpu = device_or_skip!();
+    let values = series(50_000);
+    let bytes = std::mem::size_of_val(&values[..]);
+    let _ = gpu
+        .window_reduce(&values, 20, gtv_accelerator::WindowOp::Mean)
+        .unwrap();
+    let m = gpu.last_window_metrics().unwrap();
+    assert!(!m.resident);
+    assert_eq!(m.upload_bytes, bytes);
+    assert_eq!(m.result_bytes, bytes);
+    // A stateless call moves both directions; this operator's whole economics is
+    // that the result is as big as the input.
+    assert_eq!(m.pcie_bytes(), 2 * bytes);
+    assert!(m.kernel_ns > 0 && m.download_ns > 0 && m.upload_ns > 0);
+    assert!(m.kernel_gbps() > 0.0);
+    assert!(!m.dominant_stage().is_empty());
 }

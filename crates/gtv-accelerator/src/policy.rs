@@ -45,7 +45,19 @@ impl Default for ExecutionPolicy {
             // N=32..128 seeds measured at 268–316 µs on the CPU; a kernel plus
             // transfer cannot beat that (cuda-acceleration-plan §6.2).
             min_khop_seeds: 10_000,
-            min_window_rows: 100_000,
+            // Off by default, and the threshold is what switches it off.
+            //
+            // C3's kernel is 15x the CPU's arithmetic (1.35 ms against 19-20 ms
+            // at 1e7 rows), but this operator's result is the same size as its
+            // input: a stateless call moves 8n up and 8n back, and even the
+            // resident form measures 1.05x end to end — the read back plus the
+            // materialisation of a fresh 80 MB result costs as much as the whole
+            // CPU reference (§9.8). So it is not a default, it is a building
+            // block: a chained plan that never ships the column back gets the
+            // 15x, and that plan has to opt in explicitly. This is exactly the
+            // condition spec Phase E sets — "no end-to-end win on its own means
+            // internal operator only, never enabled by default".
+            min_window_rows: u64::MAX,
             max_device_bytes: None,
             allow_upload: true,
         }

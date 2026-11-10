@@ -621,6 +621,84 @@ impl KnnMetrics {
     }
 }
 
+/// Stage breakdown of one rolling-window call.
+///
+/// This operator's cost model is unusual and the record has to show it: the
+/// **result is the same size as the input**, so the read back is not a receipt
+/// but half the traffic. A rolling reduce can therefore be fast on the device
+/// and still lose end to end, and only a stage table says which is happening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowMetrics {
+    pub rows: usize,
+    pub window: usize,
+    /// `true` when the column was already on the device, so `upload_ns` is zero
+    /// and `total_ns` is the rate a repeated call actually achieves.
+    pub resident: bool,
+    /// Column bytes, host to device. Zero for a resident call.
+    pub upload_bytes: usize,
+    /// Result bytes, device to host: `8 * rows`, always.
+    pub result_bytes: usize,
+    pub upload_ns: u64,
+    pub kernel_ns: u64,
+    pub download_ns: u64,
+    pub total_ns: u64,
+}
+
+impl WindowMetrics {
+    pub fn new(rows: usize, window: usize) -> Self {
+        Self {
+            rows,
+            window,
+            resident: false,
+            upload_bytes: 0,
+            result_bytes: 0,
+            upload_ns: 0,
+            kernel_ns: 0,
+            download_ns: 0,
+            total_ns: 0,
+        }
+    }
+
+    /// Input plus output bytes the kernel had to touch, which is what its
+    /// achieved bandwidth is measured against.
+    pub fn kernel_bytes(&self) -> usize {
+        // Read the chunk and its halo once, write one output per row. The halo
+        // re-read (`window-1` rows per chunk) is counted because it is real
+        // traffic when the chunk is smaller than L2.
+        (self.rows + self.rows.min(self.window.saturating_sub(1))) * std::mem::size_of::<f64>()
+            + self.rows * std::mem::size_of::<f64>()
+    }
+
+    pub fn kernel_gbps(&self) -> f64 {
+        if self.kernel_ns == 0 {
+            0.0
+        } else {
+            self.kernel_bytes() as f64 / (self.kernel_ns as f64 / 1e9) / 1e9
+        }
+    }
+
+    /// Bytes moved across PCIe, both directions. The number that decides
+    /// whether residency is worth having, and the one a stage table alone does
+    /// not make obvious.
+    pub fn pcie_bytes(&self) -> usize {
+        self.upload_bytes + self.result_bytes
+    }
+
+    pub fn dominant_stage(&self) -> &'static str {
+        let mut best = ("none", 0u64);
+        for (name, ns) in [
+            ("upload", self.upload_ns),
+            ("kernel", self.kernel_ns),
+            ("download", self.download_ns),
+        ] {
+            if ns > best.1 {
+                best = (name, ns);
+            }
+        }
+        best.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

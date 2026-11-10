@@ -31,12 +31,20 @@ use std::process::Command;
 /// The entry point is not decoration — a module loads successfully even if the
 /// function inside it was renamed, so the only way to catch that at build time
 /// is to look for the symbol in the generated PTX.
-const KERNELS: &[(&str, &str, &str, &str)] = &[(
-    "crates/gtv-accelerator-cuda",
-    "kernels/knn_flat.cu",
-    "kernels/knn_flat.ptx",
-    "gtv_knn_flat",
-)];
+const KERNELS: &[(&str, &str, &str, &str)] = &[
+    (
+        "crates/gtv-accelerator-cuda",
+        "kernels/knn_flat.cu",
+        "kernels/knn_flat.ptx",
+        "gtv_knn_flat",
+    ),
+    (
+        "crates/gtv-accelerator-cuda",
+        "kernels/window_scan.cu",
+        "kernels/window_scan.ptx",
+        "gtv_window_scan",
+    ),
+];
 
 /// The virtual architecture the PTX targets.
 ///

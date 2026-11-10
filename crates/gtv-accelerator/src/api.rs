@@ -17,7 +17,9 @@
 use gtv_core::{CsrColumns, Metric, Sel, TemporalCSR, VectorHit};
 
 use crate::error::AcceleratorError;
-use crate::metrics::{Column, ColumnSet, GraphLoadMetrics, KnnMetrics, VectorLoadMetrics};
+use crate::metrics::{
+    Column, ColumnSet, GraphLoadMetrics, KnnMetrics, VectorLoadMetrics, WindowMetrics,
+};
 
 /// Identifies one immutable version of the whole database.
 ///
@@ -92,6 +94,14 @@ pub struct Caps {
     /// number is advertised so a planner can send a 10 000-neighbour query to
     /// the CPU *before* the call instead of learning it from an error.
     pub max_k: usize,
+    /// Largest trailing window [`Accelerator::window_reduce`] serves; `0` = no
+    /// window operator at all.
+    ///
+    /// Same shape of limit as [`Caps::max_k`] and for the same reason: a block
+    /// has to hold the window in shared memory (the C3 kernel keeps the chunk
+    /// plus `window-1` halo rows), so the window is bounded by construction.
+    /// The CPU reference is bounded by nothing.
+    pub max_window: usize,
     supported: u8,
 }
 
@@ -103,6 +113,7 @@ impl Caps {
             resident: true,
             max_device_bytes: None,
             max_k: usize::MAX,
+            max_window: usize::MAX,
             supported: Op::ValidTimeFilter.bit()
                 | Op::KnnFlat.bit()
                 | Op::BatchKhop.bit()
@@ -117,6 +128,7 @@ impl Caps {
             resident: false,
             max_device_bytes,
             max_k: 0,
+            max_window: 0,
             supported: 0,
         }
     }
@@ -132,6 +144,13 @@ impl Caps {
         self
     }
 
+    /// Advertise the largest trailing window this backend's rolling reduce
+    /// accepts.
+    pub fn with_max_window(mut self, max_window: usize) -> Self {
+        self.max_window = max_window;
+        self
+    }
+
     pub fn with_op(mut self, op: Op) -> Self {
         self.supported |= op.bit();
         self
@@ -144,6 +163,12 @@ impl Caps {
     /// Whether a `k`-neighbour query is within this backend's limit.
     pub fn admits_k(&self, k: usize) -> bool {
         k <= self.max_k
+    }
+
+    /// Whether a trailing window of `window` rows is within this backend's
+    /// limit.
+    pub fn admits_window(&self, window: usize) -> bool {
+        window <= self.max_window
     }
 
     /// Refuse a copy that cannot fit, before a byte is allocated.
@@ -693,6 +718,45 @@ impl ResidentVectors {
     }
 }
 
+/// Receipt for a value column held in a backend's own memory.
+///
+/// The rolling-window operator is the one place where the input is not part of
+/// the graph: it is a caller-supplied column, and a stateless call has to ship
+/// `8n` bytes up and `8n` bytes back down for one pass over it. At 1e7 rows that
+/// is 6.9 + 6.5 ms of PCIe against a 19 ms CPU reference — a ceiling of 1.44x
+/// before the kernel does anything, which is below the gate this stage was given.
+/// Keeping the column resident removes the 6.9 ms from every call after the
+/// first, and that is what makes the operator worth having at all.
+///
+/// Deliberately *not* keyed by snapshot: a value column is not graph state, and
+/// there is nothing here that can silently go stale — the caller owns the handle
+/// and releases it. Binding it to a snapshot id would invent a staleness failure
+/// that cannot happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentColumn {
+    token: Token,
+    rows: usize,
+    bytes: usize,
+}
+
+impl ResidentColumn {
+    pub fn new(token: Token, rows: usize, bytes: usize) -> Self {
+        Self { token, rows, bytes }
+    }
+
+    pub fn token(&self) -> Token {
+        self.token
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 /// Aggregation performed by [`Accelerator::window_reduce`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowOp {
@@ -796,6 +860,10 @@ pub trait Accelerator: Send + Sync {
 
     /// Trailing-window aggregate over one column. Stateless: no handle, because
     /// the value column is not part of the graph.
+    ///
+    /// This form ships the column up and the result back down on every call,
+    /// which for this operator is the whole cost — see [`ResidentColumn`] and
+    /// [`Accelerator::window_reduce_resident`] for the form that does not.
     fn window_reduce(
         &self,
         _values: &[f64],
@@ -803,6 +871,37 @@ pub trait Accelerator: Send + Sync {
         _op: WindowOp,
     ) -> Result<Vec<f64>, AcceleratorError> {
         Err(self.unsupported(Op::WindowReduce))
+    }
+
+    /// Upload a value column. `Ok(None)` = this backend does not keep columns,
+    /// and the caller should use the stateless form.
+    fn load_column(
+        &self,
+        _values: &[f64],
+    ) -> Result<Option<ResidentColumn>, AcceleratorError> {
+        Ok(None)
+    }
+
+    /// Drop a resident column. Idempotent for unknown tokens, like
+    /// [`Accelerator::release_graph`].
+    fn release_column(&self, _handle: &ResidentColumn) {}
+
+    /// Trailing-window aggregate over a resident column: the upload is paid
+    /// once, so repeated windows over the same series cost the kernel plus the
+    /// read back.
+    fn window_reduce_resident(
+        &self,
+        _handle: &ResidentColumn,
+        _window: usize,
+        _op: WindowOp,
+    ) -> Result<Vec<f64>, AcceleratorError> {
+        Err(self.unsupported(Op::WindowReduce))
+    }
+
+    /// Stage breakdown of the last [`Accelerator::window_reduce`] or
+    /// [`Accelerator::window_reduce_resident`] call.
+    fn last_window_metrics(&self) -> Option<WindowMetrics> {
+        None
     }
 
     fn unsupported(&self, op: Op) -> AcceleratorError {

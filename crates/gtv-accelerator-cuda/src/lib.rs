@@ -1,19 +1,29 @@
 //! The CUDA backend — residency and the flat KNN kernel.
 //!
-//! # What this crate does today (C2)
+//! # What this crate does today (C3)
 //!
 //! It enumerates the device, reports its limits, makes a snapshot *actually*
 //! resident (`cuMemAlloc` + `cuMemcpyHtoD` per column, `cuMemFree` on release),
-//! and runs **one** operator on the device: [`Accelerator::knn_flat`], over
-//! vectors loaded by [`CudaAccelerator::load_vectors`]. Everything else reports
+//! and runs **two** operators: [`Accelerator::knn_flat`] over resident vectors,
+//! and the rolling-window aggregates over a column that may be resident
+//! ([`Accelerator::load_column`]) or uploaded per call. Everything else reports
 //! [`gtv_accelerator::AcceleratorError::Unsupported`] and the policy sends it to
 //! the CPU.
 //!
-//! Measured on this machine (RTX 4060 Laptop, release, 100k x 128, k=10): 3.5x
-//! against the CPU at batch 1 with the upload included, 14.3x at batch 32,
+//! KNN, measured on this machine (RTX 4060 Laptop, release, 100k x 128, k=10):
+//! 3.5x against the CPU at batch 1 with the upload included, 14.3x at batch 32,
 //! break-even after five queries. The stage table for batch 64 is kernel 99.1%,
 //! upload 0.2%, download 0.5% (15.9 KB), merge 0.1% — the transfer has stopped
 //! being the story, which is the whole point of having done residency first.
+//!
+//! The window aggregates are the counter-example, and they are here because the
+//! negative result is worth more than the operator. The kernel is 18x the CPU's
+//! arithmetic (1.13 ms against 20.6 ms at 1e7 rows) and the operator is still
+//! *off* by default: its result is the same size as its input, so `8n` up and
+//! `8n` down is not a cost the kernel can pay back, and returning a fresh 80 MB
+//! `Vec` adds 7.8 ms of page faults on top. Read `docs/cuda-acceleration-plan.md`
+//! §9.8 before touching it, and `ExecutionPolicy::min_window_rows` before
+//! enabling it.
 //!
 //! # Why residency came before kernels
 //!
@@ -49,11 +59,11 @@
 //!
 //! # PTX is checked in, not compiled here
 //!
-//! `kernels/knn_flat.ptx` is a generated artefact: `cargo xtask cuda-ptx`
-//! compiles the `.cu` and stamps its BLAKE3 into the header, and
-//! `tests/ptx_stamp.rs` recomputes it on every `cargo test`. That test is the
-//! only thing about the kernel verifiable on the GPU-less CI, which is why the
-//! stamp exists rather than a comment asking people to remember.
+//! `kernels/*.ptx` are generated artefacts: `cargo xtask cuda-ptx` compiles each
+//! `.cu` and stamps its BLAKE3 into the header, and `tests/ptx_stamp.rs`
+//! recomputes every stamp on every `cargo test`. That test is the only thing
+//! about the kernels verifiable on the GPU-less CI, which is why the stamp
+//! exists rather than a comment asking people to remember.
 //!
 //! # `Caps` advertises exactly what landed
 //!
@@ -73,6 +83,7 @@
 
 pub mod driver;
 pub mod knn;
+pub mod window;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -80,7 +91,8 @@ use std::time::Instant;
 
 use gtv_accelerator::{
     Accelerator, AcceleratorError, BackendKind, Caps, Column, GraphLoadMetrics, KnnMetrics, Op,
-    ResidentGraph, ResidentVectors, SnapshotView, VectorLoadMetrics, VectorView,
+    ResidentColumn, ResidentGraph, ResidentVectors, SnapshotView, VectorLoadMetrics, VectorView,
+    WindowMetrics, WindowOp,
 };
 use gtv_core::{Metric, Sel, VectorHit};
 
@@ -126,6 +138,23 @@ impl DeviceVectors {
     }
 }
 
+/// One resident value column, as a device pointer.
+///
+/// A single allocation, unlike vectors: the rolling-window kernel reads the
+/// column and writes a separate result buffer, so there is no companion array to
+/// keep together with it.
+struct DeviceColumn {
+    rows: usize,
+    data: u64,
+    bytes: usize,
+}
+
+impl DeviceColumn {
+    fn free(&self, driver: &Driver) {
+        driver.free(self.data);
+    }
+}
+
 /// Device allocations owned for the length of one call.
 ///
 /// The KNN path allocates five buffers and has a dozen early returns; freeing by
@@ -167,12 +196,14 @@ pub struct CudaAccelerator {
     budget: usize,
     graphs: Mutex<HashMap<u64, DeviceGraph>>,
     vectors: Mutex<HashMap<u64, DeviceVectors>>,
+    columns: Mutex<HashMap<u64, DeviceColumn>>,
     /// Receipt for the most recent upload, kept so a benchmark can read the
     /// stage breakdown after the fact instead of being handed a second return
     /// value it does not want.
     last_load: Mutex<Option<GraphLoadMetrics>>,
     last_vector_load: Mutex<Option<VectorLoadMetrics>>,
     last_knn: Mutex<Option<KnnMetrics>>,
+    last_window: Mutex<Option<WindowMetrics>>,
 }
 
 impl CudaAccelerator {
@@ -217,9 +248,11 @@ impl CudaAccelerator {
             budget,
             graphs: Mutex::new(HashMap::new()),
             vectors: Mutex::new(HashMap::new()),
+            columns: Mutex::new(HashMap::new()),
             last_load: Mutex::new(None),
             last_vector_load: Mutex::new(None),
             last_knn: Mutex::new(None),
+            last_window: Mutex::new(None),
         })
     }
 
@@ -271,14 +304,20 @@ impl CudaAccelerator {
             .lock()
             .map(|g| g.values().map(|e| e.bytes).sum())
             .unwrap_or(0);
-        // Both kinds share one budget, so both kinds have to be counted; a
-        // report that forgets vectors understates what the card is holding.
+        // All three kinds share one budget, so all three have to be counted; a
+        // report that forgets one understates what the card is holding, and the
+        // admission check would then let an upload through that does not fit.
         let vectors: usize = self
             .vectors
             .lock()
             .map(|v| v.values().map(|e| e.bytes).sum())
             .unwrap_or(0);
-        graphs + vectors
+        let columns: usize = self
+            .columns
+            .lock()
+            .map(|c| c.values().map(|e| e.bytes).sum())
+            .unwrap_or(0);
+        graphs + vectors + columns
     }
 
     /// Resident snapshots, for tests and for a pre-warm loop.
@@ -371,6 +410,16 @@ impl CudaAccelerator {
             message: "resident table poisoned".into(),
         })
     }
+
+    fn columns(&self) -> Result<std::sync::MutexGuard<'_, HashMap<u64, DeviceColumn>>, AcceleratorError>
+    {
+        self.columns.lock().map_err(|_| AcceleratorError::Backend {
+            backend: "cuda",
+            op: "lock",
+            code: -1,
+            message: "column table poisoned".into(),
+        })
+    }
 }
 
 // SAFETY: the only raw pointer held is the `CUcontext`. It is never dereferenced
@@ -391,18 +440,22 @@ impl Accelerator for CudaAccelerator {
     }
 
     fn caps(&self) -> Caps {
-        // C2 flips exactly one bit. The policy needs no change to follow: it
-        // gates on `supports(op)`, so `knn_flat` now goes to the device when the
-        // work clears `min_knn_work` and the CPU otherwise.
+        // One bit per landed kernel. The policy needs no change to follow: it
+        // gates on `supports(op)`, so `knn_flat` and `window_reduce` go to the
+        // device when the work clears their thresholds and to the CPU otherwise.
         //
-        // `max_k` is advertised rather than only enforced, because it is a
-        // property of the kernel's shared-memory budget (8 warps x k x 12 B) and
-        // a planner should be able to route a 10 000-neighbour query to the CPU
-        // without making a call that can only fail.
+        // Both limits are advertised rather than only enforced, because both are
+        // properties of a block's shared-memory budget (`8 warps x k x 12 B` for
+        // the heap, `chunk + window - 1` rows for the scan) rather than of the
+        // arithmetic. A planner should be able to route a 10 000-neighbour query
+        // or a 100 000-row window to the CPU without making a call that can only
+        // fail.
         Caps::new(BackendKind::Cuda, "cuda-0", Some(self.budget))
             .with_resident(true)
             .with_op(Op::KnnFlat)
+            .with_op(Op::WindowReduce)
             .with_max_k(knn::MAX_K)
+            .with_max_window(window::MAX_WINDOW)
     }
 
     fn load_graph(&self, view: SnapshotView<'_>) -> Result<Option<ResidentGraph>, AcceleratorError> {
@@ -930,6 +983,228 @@ impl Accelerator for CudaAccelerator {
     fn last_knn_metrics(&self) -> Option<KnnMetrics> {
         CudaAccelerator::last_knn_metrics(self)
     }
+
+    fn window_reduce(
+        &self,
+        values: &[f64],
+        window: usize,
+        op: WindowOp,
+    ) -> Result<Vec<f64>, AcceleratorError> {
+        let started = Instant::now();
+        // Order matters: the limit is a limit (fall back), not a malformed
+        // request. `window == 0` and an empty column are the CPU's answers,
+        // computed without touching the device at all.
+        self.check_window(window)?;
+        if window == 0 || values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = values.len();
+        let bytes = std::mem::size_of_val(values);
+        let mut m = WindowMetrics::new(rows, window);
+        m.upload_bytes = bytes;
+        m.result_bytes = bytes;
+        self.bind()?;
+
+        let mut scratch = Scratch::new(self.driver);
+        let t = Instant::now();
+        let d_in = scratch
+            .alloc(bytes)
+            .map_err(|reason| self.backend_error("cuMemAlloc(column)", reason))?;
+        let d_out = scratch
+            .alloc(bytes)
+            .map_err(|reason| self.backend_error("cuMemAlloc(window out)", reason))?;
+        // SAFETY: both sides are `bytes` long; `d_in` came from `alloc(bytes)`.
+        unsafe {
+            self.driver
+                .copy_htod(d_in, values.as_ptr() as *const u8, bytes)
+                .map_err(|reason| self.backend_error("cuMemcpyHtoD(column)", reason))?;
+        }
+        m.upload_ns = nanos(t.elapsed());
+
+        let mut out = vec![0f64; rows];
+        self.window_launch(d_in, d_out, rows, window, op, &mut out, &mut m)?;
+        m.total_ns = nanos(started.elapsed());
+        self.remember_window(m);
+        Ok(out)
+    }
+
+    fn load_column(
+        &self,
+        values: &[f64],
+    ) -> Result<Option<ResidentColumn>, AcceleratorError> {
+        if values.is_empty() {
+            return Err(AcceleratorError::InvalidArgument(
+                "a resident column needs at least one row".into(),
+            ));
+        }
+        let bytes = std::mem::size_of_val(values);
+        // Same pre-flight the graph upload does: refuse before a byte is
+        // allocated, so an over-budget column is a size, not a driver code in
+        // the middle of a copy.
+        self.caps().admit(bytes)?;
+        self.bind()?;
+        let d = self
+            .driver
+            .alloc(bytes)
+            .map_err(|reason| self.backend_error("cuMemAlloc(resident column)", reason))?;
+        // SAFETY: destination is `bytes` from `alloc(bytes)`, source is a live
+        // slice of exactly that length.
+        if let Err(reason) = unsafe {
+            self.driver
+                .copy_htod(d, values.as_ptr() as *const u8, bytes)
+        } {
+            self.driver.free(d);
+            return Err(self.backend_error("cuMemcpyHtoD(resident column)", reason));
+        }
+        let token = next_token();
+        let mut table = self.columns()?;
+        table.insert(
+            token,
+            DeviceColumn {
+                rows: values.len(),
+                data: d,
+                bytes,
+            },
+        );
+        Ok(Some(ResidentColumn::new(token, values.len(), bytes)))
+    }
+
+    fn release_column(&self, handle: &ResidentColumn) {
+        if self.bind().is_err() {
+            return;
+        }
+        if let Ok(mut table) = self.columns() {
+            if let Some(c) = table.remove(&handle.token()) {
+                c.free(self.driver);
+            }
+        }
+    }
+
+    fn window_reduce_resident(
+        &self,
+        handle: &ResidentColumn,
+        window: usize,
+        op: WindowOp,
+    ) -> Result<Vec<f64>, AcceleratorError> {
+        let started = Instant::now();
+        self.check_window(window)?;
+        let (rows, d_in) = {
+            let table = self.columns()?;
+            let c = table.get(&handle.token()).ok_or_else(|| {
+                AcceleratorError::InvalidArgument(format!(
+                    "resident column {} is not loaded (released?)",
+                    handle.token()
+                ))
+            })?;
+            (c.rows, c.data)
+        };
+        if window == 0 || rows == 0 {
+            return Ok(Vec::new());
+        }
+        let mut m = WindowMetrics::new(rows, window);
+        m.resident = true;
+        m.result_bytes = rows * std::mem::size_of::<f64>();
+        self.bind()?;
+
+        let mut scratch = Scratch::new(self.driver);
+        let d_out = scratch
+            .alloc(m.result_bytes)
+            .map_err(|reason| self.backend_error("cuMemAlloc(window out)", reason))?;
+        let mut out = vec![0f64; rows];
+        self.window_launch(d_in, d_out, rows, window, op, &mut out, &mut m)?;
+        m.total_ns = nanos(started.elapsed());
+        self.remember_window(m);
+        Ok(out)
+    }
+
+    fn last_window_metrics(&self) -> Option<WindowMetrics> {
+        CudaAccelerator::last_window_metrics(self)
+    }
+}
+
+impl CudaAccelerator {
+    /// Shared between the stateless and the resident form: launch, time the
+    /// kernel with events, read the result back.
+    ///
+    /// One implementation because the two forms differ only in whether `d_in`
+    /// arrived on this call — and a second copy of this code would be a second
+    /// place for the event timing to go wrong.
+    #[allow(clippy::too_many_arguments)]
+    fn window_launch(
+        &self,
+        d_in: u64,
+        d_out: u64,
+        rows: usize,
+        window: usize,
+        op: WindowOp,
+        out: &mut [f64],
+        m: &mut WindowMetrics,
+    ) -> Result<(), AcceleratorError> {
+        let shared = window::shared_bytes(op, window, rows);
+        let e0 = self
+            .driver
+            .event()
+            .map_err(|reason| self.backend_error("cuEventCreate", reason))?;
+        let e1 = self
+            .driver
+            .event()
+            .map_err(|reason| self.backend_error("cuEventCreate", reason))?;
+        let launch = window::Launch {
+            values: d_in,
+            rows: rows as i64,
+            window: window as i32,
+            op: window::op_code(op),
+            out: d_out,
+        };
+        e0.record()
+            .map_err(|reason| self.backend_error("cuEventRecord", reason))?;
+        window::launch(&launch, shared)
+            .map_err(|reason| self.backend_error("cuLaunchKernel(window)", reason))?;
+        e1.record()
+            .map_err(|reason| self.backend_error("cuEventRecord", reason))?;
+        e1.synchronize()
+            .map_err(|reason| self.backend_error("cuEventSynchronize", reason))?;
+        m.kernel_ns = (e0
+            .elapsed_ms(&e1)
+            .map_err(|reason| self.backend_error("cuEventElapsedTime", reason))?
+            * 1e6) as u64;
+
+        let t = Instant::now();
+        // SAFETY: destination is a live `Vec` of exactly `rows` elements, source
+        // is the `d_out` buffer the kernel just wrote, sized the same.
+        unsafe {
+            self.driver
+                .copy_dtoh(out.as_mut_ptr() as *mut u8, d_out, std::mem::size_of_val(out))
+                .map_err(|reason| self.backend_error("cuMemcpyDtoH(window)", reason))?;
+        }
+        m.download_ns = nanos(t.elapsed());
+        Ok(())
+    }
+
+    /// Reject the two cases the kernel cannot serve, in the order that keeps
+    /// them distinguishable: `0` is a request with a defined answer (the CPU
+    /// returns an empty column), a large window is a limit.
+    fn check_window(&self, window: usize) -> Result<(), AcceleratorError> {
+        if window > window::MAX_WINDOW {
+            return Err(AcceleratorError::LimitExceeded {
+                backend: "cuda",
+                what: "window",
+                requested: window,
+                limit: window::MAX_WINDOW,
+            });
+        }
+        Ok(())
+    }
+
+    fn remember_window(&self, m: WindowMetrics) {
+        if let Ok(mut slot) = self.last_window.lock() {
+            *slot = Some(m);
+        }
+    }
+
+    pub fn last_window_metrics(&self) -> Option<WindowMetrics> {
+        self.last_window.lock().ok().and_then(|m| *m)
+    }
 }
 
 impl Drop for CudaAccelerator {
@@ -947,6 +1222,11 @@ impl Drop for CudaAccelerator {
                     entry.free(self.driver);
                 }
             }
+            if let Ok(mut c) = self.columns.lock() {
+                for (_, entry) in c.drain() {
+                    entry.free(self.driver);
+                }
+            }
         }
         // Release our retain of the primary context — unless a kernel module is
         // cached. The module lives *in* the context, and it is process-wide (one
@@ -956,7 +1236,7 @@ impl Drop for CudaAccelerator {
         // promotes the context to process lifetime. That is a leak of exactly one
         // context, at exit, in exchange for the kernel staying loaded; the
         // allocations inside it were freed above.
-        if !knn::loaded() {
+        if !(knn::loaded() || window::loaded()) {
             self.driver.release_context(self.device.handle);
         }
     }
@@ -1044,10 +1324,12 @@ mod tests {
                 assert_eq!(caps.backend, BackendKind::Cuda);
                 assert!(caps.resident);
                 assert!(caps.max_device_bytes.unwrap() > 0);
-                // C2: exactly one operator, and the `k` its kernel can hold.
+                // One bit per landed kernel, and the limit each one carries.
                 assert!(caps.supports(Op::KnnFlat));
-                assert!(!caps.supports(Op::WindowReduce));
+                assert!(caps.supports(Op::WindowReduce));
+                assert!(!caps.supports(Op::BatchKhop));
                 assert_eq!(caps.max_k, knn::MAX_K);
+                assert_eq!(caps.max_window, window::MAX_WINDOW);
                 assert!(acc.budget_bytes() > 0);
                 assert!(acc.resident_snapshots().is_empty());
             }

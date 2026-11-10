@@ -1,7 +1,7 @@
 //! Backend abstraction for the optional CUDA path — and the residency rules
 //! that decide whether a device copy is worth having at all.
 //!
-//! # Scope (C1–C2)
+//! # Scope (C1–C3)
 //!
 //! This crate is the *contract*: one trait, one cache, one policy, one error
 //! type. It contains no kernel. That ordering is deliberate and measured: a
@@ -31,6 +31,14 @@
 //! request the hardware cannot serve. The kernel stays in
 //! `gtv-accelerator-cuda`, so this crate still compiles and tests on a machine
 //! without a GPU.
+//!
+//! C3 adds the same shape for the rolling window — [`Accelerator::window_reduce`],
+//! [`Accelerator::load_column`] / [`Accelerator::window_reduce_resident`],
+//! [`Caps::max_window`], [`WindowMetrics`] — plus one thing the contract had to
+//! learn: an operator whose output is as big as its input cannot be judged by its
+//! kernel, only by what has to cross the bus. That is why `min_window_rows`
+//! defaults to `u64::MAX` and the doc in §9.8 of the plan is a page of transfer
+//! arithmetic rather than a speedup table.
 //!
 //! # Invariants
 //!
@@ -83,14 +91,14 @@ pub mod registry;
 pub mod resident;
 
 pub use api::{
-    Accelerator, BackendKind, Caps, DstLayout, Op, ResidentGraph, ResidentVectors, SnapshotId,
-    SnapshotView, VectorView, WindowOp,
+    Accelerator, BackendKind, Caps, DstLayout, Op, ResidentColumn, ResidentGraph, ResidentVectors,
+    SnapshotId, SnapshotView, VectorView, WindowOp,
 };
 pub use cpu::{live_at, CpuAccelerator};
 pub use error::{AcceleratorError, Fallback};
 pub use metrics::{
     AcceleratorMetrics, Column, ColumnLoad, ColumnSet, GraphLoadMetrics, KnnMetrics, OpRecord,
-    VectorLoadMetrics,
+    VectorLoadMetrics, WindowMetrics,
 };
 pub use policy::{BackendDecision, DecisionInputs, DecisionReason, ExecutionPolicy};
 pub use registry::AcceleratorRegistry;
