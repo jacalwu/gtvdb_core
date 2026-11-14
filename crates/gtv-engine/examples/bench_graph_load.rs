@@ -1,19 +1,16 @@
-//! Stage A–D of the graph-load pipeline, measured where each stage lives.
+//! Stage A–B of the graph-load pipeline, measured where each stage lives.
 //!
 //! `cargo run --release -p gtv-engine --example bench_graph_load -- 10000000`
-//! `cargo run --release -p gtv-engine --example bench_graph_load --features cuda -- 10000000`
 //!
 //! # What this exists to answer
 //!
 //! "The upload is 30 ms" is only actionable if the upload is the largest thing
-//! in the cold path. This walks the stages that precede a kernel and prices each
-//! one:
+//! in the cold path. This walks the storage stages that precede a kernel and
+//! prices each one:
 //!
 //! ```text
 //! A  live_rows_at(t)      mmap the segments, walk the system-time versions
 //! B  graph_at(t)          the same answer as columns, not rows
-//! C  CSR -> SnapshotView  a borrow; must be O(1)
-//! D  upload               per column, measured by the backend's own receipt
 //! ```
 //!
 //! Stage B is measured **twice on purpose**: materialisation cost is not a
@@ -32,12 +29,15 @@
 //! The store is real (segments on disk, a manifest, a WAL) because the mmap read
 //! is part of stage A. The graph is synthetic: out-degree 4, one interval, all
 //! live at the flush point. Shape does not change a copy's cost — only bytes do.
+//!
+//! The old Stage C/D (CSR -> SnapshotView, device upload receipt) measured the
+//! retired C1 accelerator decision layer; that surface was replaced by
+//! `AcceleratorRegistry` (see `docs/acceleration.md`), so those stages are no
+//! longer printed here.
 
 use std::time::Instant;
 
-use gtv_accelerator::SnapshotView;
 use gtv_core::csr::TemporalCSR;
-use gtv_engine::accelerator::registry;
 use gtv_storage::{EdgeRecord, MemSegment, SegmentStore};
 
 fn main() {
@@ -186,76 +186,10 @@ fn main() {
         plain_ms
     };
 
-    // -- C: the upload view -------------------------------------------------
-    // Must be O(1): a borrow of the CSR's own columns, no per-edge loop. If this
-    // ever grows with `edges`, the loader is copying and the copy is the bug.
-    let csr = store.graph_at(head).unwrap().with_snapshot_id(7);
-    let t = Instant::now();
-    let view = SnapshotView::from_csr(&csr).unwrap();
-    let view_us = t.elapsed().as_secs_f64() * 1e6;
     println!(
-        "C  view                {:>8.2} us  {} B priced, no allocation (O(1) by construction)",
-        view_us,
-        view.bytes()
-    );
-    assert!(
-        view_us < 1_000.0,
-        "building the upload view took {view_us} us: it is copying"
-    );
-
-    // -- D: upload, from the backend's own receipt -------------------------
-    let reg = registry();
-    let Some(dev) = reg.devices().first() else {
-        println!(
-            "D  upload                    n/a  no device registered (build with --features cuda)"
-        );
-        println!(
-            "\ncold path here: {:.2} ms of CPU materialisation (compacted) and no transfer at all.",
-            plain_ms
-        );
-        cleanup(&root);
-        return;
-    };
-    let t = Instant::now();
-    let handle = dev.load_graph(view).unwrap().expect("residency supported");
-    let load_ms = ms(t.elapsed());
-    let m = dev
-        .last_load_metrics()
-        .expect("a device upload leaves a receipt")
-        .with_materialize_ns((plain_ms * 1e6) as u64);
-    dev.release_graph(&handle);
-
-    println!(
-        "D  upload              {:>8.2} ms  {:.1} B/edge at {:.2} GB/s ({:.1}% of the load is PCIe)",
-        load_ms,
-        m.uploaded_bytes_per_edge(),
-        m.upload_gbps(),
-        m.upload_share() * 100.0
-    );
-    println!(
-        "   stages: bind {:.3} + alloc {:.2} + copy {:.2} + sync {:.3} = {:.2} ms; \
-         pack/transform/staging {} / {} / {}",
-        m.bind_ns as f64 / 1e6,
-        m.device_alloc_ns as f64 / 1e6,
-        m.upload_ns() as f64 / 1e6,
-        m.device_sync_ns as f64 / 1e6,
-        m.total_ns as f64 / 1e6,
-        m.host_pack_ns,
-        m.layout_transform_ns,
-        m.staging_bytes
-    );
-
-    let cold = plain_ms + load_ms;
-    let scale = edges as f64 / 1e7;
-    let saving = (6.86 * scale - 0.556 * scale).max(1e-9);
-    println!(
-        "\ncold path: {:.2} ms = {:.2} materialise + {:.2} upload ({:.0}% materialise); \
-         break-even {:.1} queries",
-        cold,
-        plain_ms,
-        load_ms,
-        plain_ms / cold * 100.0,
-        cold / saving
+        "\ncold path here: {:.2} ms of CPU materialisation (compacted), no transfer measured \
+         (the device upload stage moved to `AcceleratorRegistry`; see docs/acceleration.md).",
+        plain_ms
     );
 
     cleanup(&root);
