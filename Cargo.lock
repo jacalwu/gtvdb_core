@@ -2016,6 +2016,7 @@ name = "gtv-index"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "blake3",
  "gtv-core",
  "rayon",
  "serde",
@@ -2032,6 +2033,7 @@ dependencies = [
  "gtv-core",
  "gtv-index",
  "gtv-storage",
+ "memmap2",
  "serde",
  "serde_json",
  "thiserror",
