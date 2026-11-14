@@ -188,6 +188,25 @@ impl Drop for Scratch<'_> {
     }
 }
 
+/// Selection passed to [`CudaAccelerator::open_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct OpenOptions {
+    /// Which CUDA device ordinal to open (default 0).
+    pub device: usize,
+    /// Residency budget in bytes. `None` => the crate default (60% of device
+    /// VRAM); a parameter file supplies 80% via `CUDA_VRAM`.
+    pub budget: Option<usize>,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        OpenOptions {
+            device: 0,
+            budget: None,
+        }
+    }
+}
+
 /// The CUDA backend.
 pub struct CudaAccelerator {
     driver: &'static Driver,
@@ -212,6 +231,16 @@ impl CudaAccelerator {
     /// The only function in this crate that can be called before a decision is
     /// made: everything below it needs a context.
     pub fn open() -> Result<Self, AcceleratorError> {
+        Self::open_with(OpenOptions::default())
+    }
+
+    /// Open with explicit device selection and an optional residency budget.
+    ///
+    /// `budget: None` keeps the in-crate default (60% of device VRAM, leaving
+    /// headroom for the driver/context/workspace). A parameter-file-driven caller
+    /// passes `Some(bytes)` — typically 80% of device VRAM per `CUDA_VRAM` — so
+    /// the operator's intent wins over the crate fallback.
+    pub fn open_with(opts: OpenOptions) -> Result<Self, AcceleratorError> {
         let driver = driver::driver().map_err(|reason| AcceleratorError::DeviceUnavailable {
             backend: "cuda",
             reason,
@@ -228,8 +257,14 @@ impl CudaAccelerator {
                 reason: "no CUDA device".into(),
             });
         }
+        if opts.device >= count {
+            return Err(AcceleratorError::DeviceUnavailable {
+                backend: "cuda",
+                reason: format!("device ordinal {} out of range (have {count})", opts.device),
+            });
+        }
         let device = driver
-            .device(0)
+            .device(opts.device as i32)
             .map_err(|reason| AcceleratorError::DeviceUnavailable {
                 backend: "cuda",
                 reason,
@@ -240,7 +275,9 @@ impl CudaAccelerator {
                 backend: "cuda",
                 reason,
             })?;
-        let budget = (device.total_mem_bytes as f64 * DEFAULT_BUDGET_FRACTION) as usize;
+        let budget = opts
+            .budget
+            .unwrap_or((device.total_mem_bytes as f64 * DEFAULT_BUDGET_FRACTION) as usize);
         Ok(Self {
             driver,
             device,
