@@ -19,12 +19,12 @@ use std::path::{Path, PathBuf};
 
 use gtv_catalog::{DataFileId, IndexId, SnapshotId, TableId};
 use gtv_core::VectorIndex;
-use gtv_index::{encode_vector_segment, AnyIndex, BuildOptions, FlatIndex};
+use gtv_index::{encode_ivf_payload, encode_vector_segment, AnyIndex, BuildOptions};
 use gtv_storage::write_atomic;
 
 use crate::container::{decode, encode};
 use crate::manifest::IndexManifest;
-use crate::vector_segment_io::{container_payload_is_gtvvec, open_vector_segment_from_container};
+use crate::payload::{open_mapped_payload, verify_mapped_payload};
 use crate::{IndexStoreError, Result};
 
 /// Caller-supplied provenance for an index build (all optional except the model).
@@ -181,11 +181,12 @@ impl IndexStore {
         let version = self.versions(name)?.last().copied().unwrap_or(0) + 1;
         fs::create_dir_all(self.version_dir(id, version))?;
 
-        // Flat indexes are serialized as a GTVVEC payload so `load` can mmap
-        // them (O(1) cold open, zero-copy corpus). IVF / HNSW keep their
-        // native payload encodings.
-        let payload = match index.as_flat() {
-            Some(flat) => encode_vector_segment(
+        // Flat indexes are serialized as a GTVVEC payload and IVF indexes as a
+        // compound `GIVFCMP` payload (IVF cell layout + GTVVEC corpus), so
+        // `load` can mmap them (O(1) cold open, zero-copy corpus). HNSW keeps
+        // its native payload encoding.
+        let payload = match index {
+            AnyIndex::Flat(flat) => encode_vector_segment(
                 flat.ids(),
                 flat.data(),
                 flat.dim(),
@@ -193,7 +194,8 @@ impl IndexStore {
                 flat.is_normalized(),
             )
             .map_err(IndexStoreError::Index)?,
-            None => index.to_bytes(),
+            AnyIndex::Ivf(ivf) => encode_ivf_payload(ivf).map_err(IndexStoreError::Index)?,
+            AnyIndex::Hnsw(_) => index.to_bytes(),
         };
         let payload_checksum = blake3::hash(&payload).to_hex().to_string();
         let manifest = IndexManifest {
@@ -267,11 +269,12 @@ impl IndexStore {
     /// Load an index version (`None` = the active one), verifying the container
     /// and payload checksums.
     ///
-    /// When the payload is a GTVVEC segment (the mmap-friendly vector-corpus
-    /// format) this takes the cold-open path: the container is memory-mapped,
-    /// the manifest is read from its sidecar file, and the corpus columns are
-    /// zero-copy views — O(1) in corpus size, no `rows × dim` materialization.
-    /// Legacy `GFLATv1` payloads keep the decode path unchanged.
+    /// When the payload is a mmap-friendly one (a GTVVEC segment for a flat
+    /// index, a compound `GIVFCMP` for an IVF index) this takes the cold-open
+    /// path: the container is memory-mapped, the manifest is read from its
+    /// sidecar file, and the corpus columns are zero-copy views — O(1) in
+    /// corpus size, no `rows × dim` materialization. Legacy `GFLATv1` /
+    /// `GIVFv1` / `GIVFv2` payloads keep the decode path unchanged.
     pub fn load(&self, name: &str, version: Option<u32>) -> Result<LoadedIndex> {
         let id = self.resolve(name)?;
         let v = match version {
@@ -282,11 +285,10 @@ impl IndexStore {
         };
         let path = self.container_path(id, v);
 
-        // Cold-open dispatch on the payload magic (O(1)).
-        if container_payload_is_gtvvec(&path)? {
+        // Cold-open dispatch on the payload magic (O(1)); `None` means the
+        // payload is a legacy encoding and needs the decode path.
+        if let Some(index) = open_mapped_payload(&path)? {
             let manifest = self.manifest(name, Some(v))?;
-            let segment = open_vector_segment_from_container(&path)?;
-            let index = AnyIndex::Flat(FlatIndex::from_segment(segment));
             return Ok(LoadedIndex { manifest, index });
         }
 
@@ -325,16 +327,13 @@ impl IndexStore {
 
     /// Verify container + payload checksums and that the payload decodes.
     ///
-    /// For a GTVVEC payload this also runs the full O(file size) data-integrity
-    /// check (`VectorSegment::verify_data`), which `load` deliberately skips to
+    /// For a mmap-friendly payload (GTVVEC / GIVFCMP) this also runs the full
+    /// O(file size) data-integrity check, which `load` deliberately skips to
     /// keep the cold-open path O(1). Legacy payloads are verified by `decode`.
     pub fn verify(&self, name: &str, version: u32) -> Result<()> {
         let id = self.resolve(name)?;
         let path = self.container_path(id, version);
-        if container_payload_is_gtvvec(&path)? {
-            let segment = open_vector_segment_from_container(&path)?;
-            segment.verify_data().map_err(IndexStoreError::Index)?;
-        }
+        verify_mapped_payload(&path)?;
         let loaded = self.load(name, Some(version))?;
         if loaded.index.len() as u64 != loaded.manifest.row_count {
             return Err(IndexStoreError::Corrupt(format!(

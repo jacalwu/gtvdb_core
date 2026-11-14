@@ -165,7 +165,7 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 | **V-1** | GTVVEC v1 格式模块：`encode`/`open`（header 校验 + 列目录 + blake3）+ index-store 落盘（`write_atomic`）/ mmap 读回（`memmap2`） | ✅ 已交付 | `gtv-index/src/vector_segment.rs`（6 单测）+ `gtv-index-store/src/vector_segment_io.rs`（3 单测）；旧 `GFLATv1`/`.gtvidx` 路径未动 |
 | **V-2** | `FlatIndex` `Col<f32>` 化（镜像 TemporalCSR）+ `gtv-index-store` load mmap 化 + 引擎 save/load 接线 | ✅ 已交付 | 冷打开 O(1)、3 份拷贝→1 份 mmap 视图；旧 `.gtvidx` 兼容 |
 | **V-3** | `cudaHostRegister` 封装（mmap 页直接 DMA）+ 基准 + fallback | ✅ 已交付 | `register_and_upload` + `HostRegister` RAII；`Col::stable_bytes()`；**平台发现**：Windows WDDM 拒绝 register 文件映射页，零拷贝仅 Linux/TCC 可达，register 失败回落 P1b-1 staging |
-| **V-4** | IVF 语料落盘复用 + 冷打开 / 常驻 pinned 占用端到端基准 | ⏳ 待做 | 对比表 |
+| **V-4** | IVF 语料落盘复用（`GIVFCMP` compound payload）+ 冷打开 / 常驻 pinned 占用端到端基准 | ✅ 已交付 | `IvfIndex` `Col` 化 + `from_columns`；store 三路分派（GTVVEC / GIVFCMP / Legacy）。**实测**：1e6×128 冷开 885 ms → **0.85 ms**（1040×），常驻增量 1487.7 → **495.8 MiB**（3.0×）；IVF 1e5×128 冷开 75 ms → **1.1 ms** |
 
 **P1a 现状表（Windows 本机 RTX 4060 Laptop，`bench_pcie_transfer`，`--features cuda --release`，warm-up 后）**：
 

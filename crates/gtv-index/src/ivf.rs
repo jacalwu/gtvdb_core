@@ -20,6 +20,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use arrow::array::BooleanArray;
+use gtv_core::column::Col;
 use gtv_core::{GtvError, Metric, Result, VectorHit, VectorIndex};
 
 use crate::bytes::{metric_code, metric_from_code, Reader, Writer};
@@ -205,9 +206,13 @@ pub struct TuneResult {
 pub struct IvfIndex {
     /// Row-major `f32` corpus, reordered so cell `l` occupies the contiguous
     /// vector range `list_offsets[l]..list_offsets[l+1]`.
-    data: Vec<f32>,
+    ///
+    /// Stored as a [`Col`] so an IVF index can be served zero-copy from a
+    /// mapped GTVVEC segment — the corpus is the bulk of the payload and the
+    /// same "disk bytes == memory bytes" contract as [`crate::FlatIndex`].
+    data: Col<f32>,
     /// Ids reordered to match `data`.
-    ids: Vec<u64>,
+    ids: Col<u64>,
     /// Original input position of each reordered vector (the `BooleanArray`
     /// filter-mask domain, kept consistent with [`crate::FlatIndex`]).
     orig_pos: Vec<u32>,
@@ -352,8 +357,8 @@ impl IvfIndex {
         }
 
         Ok(Self {
-            data: reordered,
-            ids: reordered_ids,
+            data: Col::Owned(reordered),
+            ids: Col::Owned(reordered_ids),
             orig_pos,
             dim,
             metric,
@@ -454,8 +459,8 @@ impl IvfIndex {
         }
 
         Ok(Self {
-            data: reordered,
-            ids: reordered_ids,
+            data: Col::Owned(reordered),
+            ids: Col::Owned(reordered_ids),
             orig_pos,
             dim,
             metric,
@@ -554,6 +559,11 @@ impl IvfIndex {
         &self.list_offsets
     }
 
+    /// The coarse quantizer: `nlist × dim` centroids, row-major.
+    pub fn centroids(&self) -> &[f32] {
+        &self.centroids
+    }
+
     /// Whether the stored rows are unit-normalized (true exactly for cosine).
     pub fn is_normalized(&self) -> bool {
         self.metric.requires_normalization()
@@ -573,7 +583,7 @@ impl IvfIndex {
 
     /// The stored vector for `id`, if present (used by exact rerank).
     pub fn vector_for_id(&self, id: u64) -> Option<&[f32]> {
-        let pos = self.ids.iter().position(|&x| x == id)?;
+        let pos = self.ids[..].iter().position(|&x| x == id)?;
         Some(&self.data[pos * self.dim..(pos + 1) * self.dim])
     }
 
@@ -633,6 +643,39 @@ impl IvfIndex {
     pub fn from_raw_with_training(
         data: Vec<f32>,
         ids: Vec<u64>,
+        orig_pos: Vec<u32>,
+        dim: usize,
+        metric: Metric,
+        nlist: usize,
+        nprobe: usize,
+        centroids: Vec<f32>,
+        list_offsets: Vec<u32>,
+        training: Option<IvfTrainingMeta>,
+    ) -> Result<Self> {
+        Self::from_columns(
+            Col::Owned(data),
+            Col::Owned(ids),
+            orig_pos,
+            dim,
+            metric,
+            nlist,
+            nprobe,
+            centroids,
+            list_offsets,
+            training,
+        )
+    }
+
+    /// Assemble an index from already-reordered columns that may be backed by
+    /// an immutable memory mapping.
+    ///
+    /// This is the seam that lets a persisted IVF index be reopened as an
+    /// O(1) cold open: the corpus columns arrive as `Col::Mapped` views into a
+    /// GTVVEC segment, so the vectors are never copied out of the mapping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_columns(
+        data: Col<f32>,
+        ids: Col<u64>,
         orig_pos: Vec<u32>,
         dim: usize,
         metric: Metric,
@@ -742,13 +785,13 @@ impl IvfIndex {
             .u32(self.nlist as u32)
             .u32(self.nprobe as u32)
             .u64(n as u64);
-        for id in &self.ids {
+        for id in &self.ids[..] {
             w.u64(*id);
         }
         for p in &self.orig_pos {
             w.u32(*p);
         }
-        for v in &self.data {
+        for v in &self.data[..] {
             w.f32(*v);
         }
         for c in &self.centroids {
@@ -914,8 +957,8 @@ impl IvfIndex {
         let plan = self.probe_positions(query, probe, mask);
         exact_topk_positions(
             CorpusView {
-                ids: &self.ids,
-                data: &self.data,
+                ids: &self.ids[..],
+                data: &self.data[..],
                 dim: self.dim,
                 metric: self.metric,
                 normalized: self.is_normalized(),

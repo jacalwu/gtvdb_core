@@ -228,6 +228,98 @@ fn unknown_version_and_name_are_typed_errors() {
     assert!(store.activate("x", 99).is_err());
 }
 
+/// V-4: an IVF index is persisted as a compound `GIVFCMP` payload (cell layout
+/// + GTVVEC corpus), so `load` must take the mmap cold-open path and still
+/// produce bit-identical query results.
+#[test]
+fn ivf_uses_the_compound_mmap_payload() {
+    let tag = "ivfcompound";
+    let store = IndexStore::open(root(tag)).unwrap();
+    let (ids, vs) = vectors(256, 8, 11);
+    let opts = BuildOptions::Ivf {
+        nlist: 8,
+        nprobe: 8,
+    };
+    let index = AnyIndex::build(ids, vs.clone(), Metric::L2, &opts).unwrap();
+    store.save(tag, &index, &opts, &meta()).unwrap();
+
+    // The container payload must carry the compound magic.
+    let id = store.resolve(tag).unwrap();
+    let path = store
+        .root()
+        .join(id.to_string())
+        .join("v1")
+        .join("index.gtvidx");
+    let bytes = std::fs::read(&path).unwrap();
+    let manifest_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let payload_offset = 16 + manifest_len;
+    assert_eq!(&bytes[payload_offset..payload_offset + 8], b"GIVFCMP\0");
+
+    // The store recognizes it and mmaps it.
+    let kind = gtv_index_store::container_payload_kind(&path).unwrap();
+    assert_eq!(kind, gtv_index_store::PayloadKind::IvfCompound);
+
+    // Reopening must reproduce the index exactly (corpus order included).
+    let loaded = store.load(tag, None).unwrap();
+    let original = index.as_ivf().unwrap();
+    let reopened = loaded.index.as_ivf().unwrap();
+    assert_eq!(reopened.ids(), original.ids());
+    assert_eq!(reopened.data(), original.data());
+    assert_eq!(reopened.centroids(), original.centroids());
+    assert_eq!(reopened.list_offsets(), original.list_offsets());
+    assert_eq!(reopened.orig_pos(), original.orig_pos());
+    assert_eq!(reopened.nlist(), original.nlist());
+    assert_eq!(reopened.nprobe(), original.nprobe());
+
+    // And the query answers must be identical.
+    let q = vs[17].clone();
+    let a: Vec<u64> = index
+        .search(&q, 10, None)
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    let b: Vec<u64> = loaded
+        .index
+        .search(&q, 10, None)
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(a, b);
+
+    // `verify` runs the full data-integrity check over the mapped corpus.
+    assert!(store.verify(tag, 1).is_ok());
+}
+
+/// V-4: corrupting the IVF corpus must be caught by `verify` (the cold open
+/// deliberately only validates the header).
+#[test]
+fn ivf_corpus_corruption_is_caught_by_verify() {
+    let tag = "ivfcorrupt";
+    let store = IndexStore::open(root(tag)).unwrap();
+    let (ids, vs) = vectors(64, 4, 3);
+    let opts = BuildOptions::Ivf {
+        nlist: 4,
+        nprobe: 4,
+    };
+    let index = AnyIndex::build(ids, vs, Metric::L2, &opts).unwrap();
+    store.save(tag, &index, &opts, &meta()).unwrap();
+
+    let id = store.resolve(tag).unwrap();
+    let path = store
+        .root()
+        .join(id.to_string())
+        .join("v1")
+        .join("index.gtvidx");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let n = bytes.len();
+    bytes[n - 40] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(store.verify(tag, 1).is_err());
+}
+
 /// B2-2: a shadow build + atomic swap must never break a live reader. Four
 /// reader threads hammer `load(name, None)` (always the active version) while
 /// v2 is built and `CURRENT` is swapped; every read must succeed and return

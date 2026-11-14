@@ -135,6 +135,84 @@ fn main() {
     println!("  register = N/A        => this driver/OS cannot pin file-mapped pages (Windows");
     println!("                           WDDM). The register path falls back to staging; the");
     println!("                           residual value of register is Linux/TCC only.");
+
+    resident_pinned_footprint(&ctx, &stream);
+}
+
+/// V-4: the **host pinned budget** a resident (hot) corpus costs on each path.
+///
+/// This is the half of the tiering story the bandwidth table does not show.
+/// A resident corpus lives on the host (an mmap'd GTVVEC column after V-2/V-4),
+/// and the GPU needs a device-side copy of it. The question is how much
+/// *extra, non-swappable host memory* that costs:
+///
+/// * **staging (P1b-1)** allocates a write-combined `cudaHostAlloc` buffer the
+///   size of the corpus. Those pages are locked out of the page cache and
+///   cannot be evicted — the corpus is effectively resident twice.
+/// * **register (P1b-2)** locks the *existing* mapped pages in place. It
+///   allocates nothing, so the extra host pinned footprint is zero; what it
+///   does spend is the pages' evictability.
+fn resident_pinned_footprint(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) {
+    println!("\n=== V-4: resident-corpus host pinned footprint ===");
+
+    for &mib in &[64u64, 256] {
+        let n = (mib * MIB / 4) as usize;
+        let corpus_bytes = (n * 4) as u64;
+
+        // Staging path: the buffer the production upload path allocates.
+        let staging_pinned = match unsafe { ctx.alloc_pinned::<f32>(n) } {
+            Ok(p) => {
+                let bytes = std::mem::size_of_val(p.as_slice().expect("pinned slice"));
+                drop(p);
+                Some(bytes)
+            }
+            Err(e) => {
+                eprintln!("pinned alloc failed at {mib} MiB: {e}");
+                None
+            }
+        };
+
+        // Register path: try to lock a file-backed mapping in place. Success
+        // means zero extra pinned bytes; failure means the driver will not
+        // pin file-mapped pages and the caller must fall back to staging.
+        let src: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let register_ok = {
+            let mapped = scratch_mmap(n, &src);
+            let view: &[f32] =
+                unsafe { std::slice::from_raw_parts(mapped.as_ptr() as *const f32, n) };
+            gtv_accelerator::cuda::register_and_upload(stream, view).is_ok()
+        };
+
+        println!("  corpus {} MiB", mib);
+        match staging_pinned {
+            Some(bytes) => println!(
+                "    staging  (P1b-1): {:>8.1} MiB pinned (cudaHostAlloc write-combined; not swappable)",
+                bytes as f64 / (1024.0 * 1024.0)
+            ),
+            None => println!("    staging  (P1b-1): allocation failed"),
+        }
+        if register_ok {
+            println!(
+                "    register (P1b-2): {:>8.1} MiB extra pinned (existing pages locked in place)",
+                0.0
+            );
+        } else {
+            println!(
+                "    register (P1b-2): {:>8} extra pinned (driver refused to pin file pages)",
+                "N/A"
+            );
+        }
+        println!(
+            "    device copy        : {:>8.1} MiB (column-major corpus; same on both paths)",
+            corpus_bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    println!("\n  The staging path's pinned buffer is a second copy of the corpus that");
+    println!("  the OS cannot reclaim; the register path reuses the mapping's own");
+    println!("  pages, so a resident hot corpus costs no extra host pinned memory.");
+    println!("  On Windows WDDM the register path is unavailable, so the staging");
+    println!("  budget is what a resident corpus actually costs there.");
 }
 
 /// Upload `src` to the device and return the wall-clock cost of a single

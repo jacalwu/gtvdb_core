@@ -12,8 +12,10 @@ pub mod flat;
 pub mod hnsw;
 pub mod index;
 pub mod ivf;
+pub mod ivf_segment;
 pub mod vector_segment;
 
+pub use ivf_segment::{decode_ivf_payload, encode_ivf_payload, open_ivf_payload, IvfMeta};
 pub use vector_segment::{encode_vector_segment, open_vector_segment, VectorHeader, VectorSegment};
 
 pub use ann::{

@@ -91,6 +91,89 @@ pub trait MappedRegion: fmt::Debug + Send + Sync {
     fn as_bytes(&self) -> &[u8];
 }
 
+/// A view of `region` starting at `offset` bytes, running to the end of the
+/// parent region.
+///
+/// Used to carve a sub-format (e.g. the GTVVEC segment inside a compound
+/// index payload) out of an already-mapped container without a second `mmap`
+/// and without copying. The returned view keeps the parent alive.
+///
+/// This is a free function rather than a trait method because the trait is
+/// used as a trait object (`Arc<dyn MappedRegion>`), and a method taking
+/// `self: Arc<Self>` would require `Self: Sized`.
+///
+/// # Panics
+///
+/// Panics if `offset` is past the end of the region.
+pub fn subrange(region: Arc<dyn MappedRegion>, offset: usize) -> Arc<dyn MappedRegion> {
+    subregion(region, offset, None)
+}
+
+/// A view of `region` covering `offset .. offset + len`.
+///
+/// `len = None` means "to the end of the parent". A bounded view matters when
+/// the parent holds trailing bytes that are *not* part of the sub-format — a
+/// container's trailing checksum, for instance — because a checksum computed
+/// over the sub-format must not see them.
+///
+/// # Panics
+///
+/// Panics if the requested range is past the end of the region.
+pub fn subregion(
+    region: Arc<dyn MappedRegion>,
+    offset: usize,
+    len: Option<usize>,
+) -> Arc<dyn MappedRegion> {
+    let total = region.as_bytes().len();
+    assert!(
+        offset <= total,
+        "subregion offset {offset} past region end {total}"
+    );
+    if let Some(l) = len {
+        assert!(
+            offset + l <= total,
+            "subregion length {l} at offset {offset} past region end {total}"
+        );
+    }
+    Arc::new(SubRegion {
+        inner: region,
+        offset,
+        len,
+    })
+}
+
+/// A bounded byte-range view over a parent region.
+#[derive(Debug)]
+pub struct SubRegion {
+    inner: Arc<dyn MappedRegion>,
+    offset: usize,
+    /// `None` = run to the end of the parent region.
+    len: Option<usize>,
+}
+
+impl SubRegion {
+    /// The byte offset this view starts at within its parent.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// The byte length of this view, if it is bounded.
+    pub fn len(&self) -> Option<usize> {
+        self.len
+    }
+}
+
+impl MappedRegion for SubRegion {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        let tail = &self.inner.as_bytes()[self.offset..];
+        match self.len {
+            Some(l) => &tail[..l],
+            None => tail,
+        }
+    }
+}
+
 /// A typed view over a byte range owned by an [`Arc<dyn MappedRegion>`].
 pub struct MappedCol<T: Pod> {
     /// Keeps the mapping alive. Never read after construction — its only job
@@ -401,5 +484,43 @@ mod tests {
         let d = c.clone();
         assert_eq!(c[0], 42);
         assert_eq!(d[0], 42);
+    }
+
+    #[test]
+    fn subrange_views_a_suffix_without_copying() {
+        let mut bytes = vec![0u8; 64];
+        bytes[16..24].copy_from_slice(&7u64.to_le_bytes());
+        let region: Arc<dyn MappedRegion> = Arc::new(FakeRegion(bytes));
+        let sub = subrange(region, 16);
+        assert_eq!(sub.as_bytes().len(), 48);
+        assert_eq!(u64::from_le_bytes(sub.as_bytes()[0..8].try_into().unwrap()), 7);
+        // The sub-view keeps the parent alive and stays a valid column source.
+        let col = MappedCol::<u64>::new(sub, 0, 1).unwrap();
+        assert_eq!(col[0], 7);
+    }
+
+    #[test]
+    fn subrange_at_end_is_empty_but_valid() {
+        let region: Arc<dyn MappedRegion> = Arc::new(FakeRegion(vec![1u8; 16]));
+        let sub = subrange(region, 16);
+        assert!(sub.as_bytes().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "past region end")]
+    fn subrange_past_the_end_panics() {
+        let region: Arc<dyn MappedRegion> = Arc::new(FakeRegion(vec![1u8; 16]));
+        let _ = subrange(region, 17);
+    }
+
+    #[test]
+    fn bounded_subregion_excludes_trailing_bytes() {
+        let region: Arc<dyn MappedRegion> = Arc::new(FakeRegion(vec![7u8; 16]));
+        let bounded = subregion(region, 4, Some(8));
+        assert_eq!(bounded.as_bytes().len(), 8);
+        assert_eq!(bounded.as_bytes()[0], 7);
+        // An unbounded view of the same offset would include the trailing bytes.
+        let unbounded = subrange(Arc::new(FakeRegion(vec![7u8; 16])), 4);
+        assert_eq!(unbounded.as_bytes().len(), 12);
     }
 }

@@ -20,7 +20,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gtv_core::column::MappedRegion;
+use gtv_core::column::{subregion, MappedRegion};
 use gtv_index::{encode_vector_segment, open_vector_segment, VectorSegment};
 use gtv_storage::write_atomic;
 use memmap2::Mmap;
@@ -40,30 +40,6 @@ impl MappedRegion for MappedFile {
     #[inline]
     fn as_bytes(&self) -> &[u8] {
         &self.0[..]
-    }
-}
-
-/// A [`MappedRegion`] view over a byte sub-range of an enclosing region.
-///
-/// Used to hand the payload slice of a `.gtvidx` container to
-/// [`open_vector_segment`] as if it were a standalone GTVVEC file: the container
-/// header (magic + version + flags + manifest) precedes the payload, so the
-/// GTVVEC magic sits at `payload_offset`, not at byte 0.
-struct SubRegion {
-    inner: Arc<dyn MappedRegion>,
-    offset: usize,
-}
-
-impl fmt::Debug for SubRegion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SubRegion").field("offset", &self.offset).finish()
-    }
-}
-
-impl MappedRegion for SubRegion {
-    #[inline]
-    fn as_bytes(&self) -> &[u8] {
-        &self.inner.as_bytes()[self.offset..]
     }
 }
 
@@ -132,11 +108,10 @@ pub fn open_vector_segment_from_container(
     let map = unsafe { Mmap::map(&file) }.map_err(IndexStoreError::Io)?;
     let region: Arc<dyn MappedRegion> = Arc::new(MappedFile(map));
 
-    let (payload_offset, _payload_end) = split_container_header(region.as_bytes())?;
-    let sub: Arc<dyn MappedRegion> = Arc::new(SubRegion {
-        inner: region,
-        offset: payload_offset,
-    });
+    let (payload_offset, payload_end) = split_container_header(region.as_bytes())?;
+    // Bound the view so the container's trailing checksum is not visible to
+    // the segment (its own data checksum covers exactly the segment's bytes).
+    let sub = subregion(region, payload_offset, Some(payload_end - payload_offset));
     open_vector_segment(sub).map_err(IndexStoreError::Index)
 }
 
@@ -145,28 +120,7 @@ pub fn open_vector_segment_from_container(
 /// dispatch between the mmap cold-open path and the legacy decode path without
 /// materializing the payload.
 pub fn container_payload_is_gtvvec(path: impl AsRef<Path>) -> Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let path = path.as_ref().to_path_buf();
-    let mut f = std::fs::File::open(&path).map_err(IndexStoreError::Io)?;
-
-    let mut header = [0u8; crate::container::HEADER_LEN];
-    if f.read_exact(&mut header).is_err() {
-        return Ok(false); // too short to be a valid container
-    }
-    if header[0..8] != *crate::container::CONTAINER_MAGIC {
-        return Ok(false);
-    }
-    let manifest_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
-    let payload_offset = crate::container::HEADER_LEN + manifest_len;
-
-    f.seek(SeekFrom::Start(payload_offset as u64))
-        .map_err(IndexStoreError::Io)?;
-    let mut magic = [0u8; 8];
-    if f.read_exact(&mut magic).is_err() {
-        return Ok(false);
-    }
-    Ok(magic == gtv_index::vector_segment::MAGIC)
+    Ok(crate::payload::container_payload_kind(path)? == crate::payload::PayloadKind::GtvVec)
 }
 
 /// Open a GTVVEC file and run a full data-integrity check in one step.
