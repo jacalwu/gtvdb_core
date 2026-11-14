@@ -790,3 +790,90 @@ pub fn mem_get_info(ordinal: usize) -> Option<(u64, u64)> {
 pub fn device_count() -> usize {
     CudaContext::device_count().unwrap_or(0).max(0) as usize
 }
+
+/// A host-memory span pinned with [`cudaHostRegister`] (P1b-2 / V-3).
+///
+/// This is the one place the `unsafe` FFI for `cuMemHostRegister_v2` /
+/// `cuMemHostUnregister` lives. Unlike [`PinnedHostSlice`] (which *allocates*
+/// locked pages with `cudaHostAlloc`), registering pins pages the OS already
+/// mapped — exactly what a `Col::Mapped` backed by `memmap2` hands us. The
+/// pointer is unchanged, so the mapping stays a zero-copy source: DMA reads the
+/// file's pages directly, no staging copy.
+///
+/// # Safety contract
+///
+/// 1. The caller guarantees the `[ptr, ptr + len)` span is a valid, immutable,
+///    mapped host range that stays alive (and un-`munmap`-ed) until this value
+///    is dropped — a `Col::Mapped`'s `Arc<dyn MappedRegion>` provides exactly
+///    that (see `gtv_core::column::MappedRegion`).
+/// 2. `unregister` runs on drop and is safe to call only after the driver has
+///    stopped reading the pages; the upload path synchronizes the stream first,
+///    so by the time this guard drops no DMA is in flight.
+struct HostRegister {
+    ptr: *mut std::ffi::c_void,
+}
+
+impl HostRegister {
+    /// Pin `[ptr, len)` so the driver may DMA from it without a bounce buffer.
+    ///
+    /// # Safety
+    /// See the type-level contract: the span must be a live, mapped, immutable
+    /// host range for the lifetime of the returned guard.
+    unsafe fn register(ptr: *mut u8, len: usize) -> Result<Self, AccelError> {
+        let flags = cudarc::driver::sys::CU_MEMHOSTREGISTER_PORTABLE;
+        // SAFETY: `ptr`/`len` describe a live mapped range (caller's contract);
+        // `register` itself only pins pages and does not dereference them.
+        unsafe {
+            cudarc::driver::sys::cuMemHostRegister_v2(ptr as *mut std::ffi::c_void, len, flags)
+        }
+        .result()
+        .map_err(|e| launch_err(format!("cuMemHostRegister_v2: {e}")))?;
+        Ok(Self {
+            ptr: ptr as *mut std::ffi::c_void,
+        })
+    }
+}
+
+impl Drop for HostRegister {
+    fn drop(&mut self) {
+        // SAFETY: the span was registered by `register` and has not been
+        // unregistered; the upload path synchronizes before this guard drops.
+        let _ = unsafe { cudarc::driver::sys::cuMemHostUnregister(self.ptr) };
+    }
+}
+
+/// Register a mapped host span, DMA it to the device, and unregister — the
+/// zero-copy upload the P1b-1 staging path replaces with a `copy_from_slice`.
+///
+/// This is the **fast path** when the source is already an mmap view (a
+/// `Col::Mapped` from a GTVVEC segment): `cuMemHostRegister` only rewrites page
+/// tables, so the subsequent `clone_htod` reads the file's pages directly with
+/// no bounce buffer *and* no host memcpy. The caller keeps the mapping alive
+/// across the call (the `&[T]` borrow enforces that).
+///
+/// On any register failure the caller falls back to the P1b-1 staging path; the
+/// query must not error just because the driver refused to pin the pages.
+pub fn register_and_upload<T: cudarc::driver::DeviceRepr>(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    src: &[T],
+) -> Result<(), AccelError> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let ptr = src.as_ptr() as *mut u8;
+    let len = std::mem::size_of_val(src);
+    // SAFETY: `src` is a live `&[T]` for the duration of this call; the mapping
+    // (if any) is held by the caller and cannot be torn down while we borrow it.
+    let _reg = unsafe { HostRegister::register(ptr, len) }?;
+    // The pages are now pinned, so `clone_htod`'s internal `memcpy_htod_async`
+    // reads them directly (no driver bounce buffer). `_reg` keeps them pinned
+    // until after the synchronize flushes the DMA.
+    let dst = stream
+        .clone_htod(src)
+        .map_err(|e| launch_err(format!("register upload DMA: {e}")))?;
+    stream
+        .synchronize()
+        .map_err(|e| launch_err(format!("register upload sync: {e}")))?;
+    drop(dst);
+    Ok(())
+}

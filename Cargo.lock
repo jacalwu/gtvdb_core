@@ -1928,6 +1928,7 @@ dependencies = [
  "gtv-core",
  "gtv-index",
  "gtv-params",
+ "memmap2",
  "thiserror",
 ]
 

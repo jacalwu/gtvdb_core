@@ -1,8 +1,8 @@
 # 立项：向量语料上 GTVSeg（GTVVEC 格式）
 
 > 本文是 [`storage-tiering-ssd-ram-vram.md`](storage-tiering-ssd-ram-vram.md) §4.1 与 [`pinned-upload-p1b.md`](pinned-upload-p1b.md) 的**前置工程立项**：让向量语料（KNN/ANN corpus）以 GTVSeg 同款「定宽、不可变、可 mmap」格式落盘。
-> 状态：**V-0 / V-1 / V-2 已实现**；V-3（`cudaHostRegister`，解锁 P1b-2）待做。
-> 前置事实：P1b-1 已交付并提交（`264d75a`，staging 达 pinned 上限，稳态 +14~43%）；P1b-2（`cudaHostRegister` 零拷贝）的唯一阻塞项就是「语料不在 mmap 上」。
+> 状态：**V-0 / V-1 / V-2 / V-3 已实现**；V-4（IVF 落盘复用 + 端到端基准）待做。
+> 前置事实：P1b-1 已交付并提交（`264d75a`，staging 达 pinned 上限，稳态 +14~43%）；P1b-2（`cudaHostRegister` 零拷贝）的唯一阻塞项就是「语料不在 mmap 上」——V-2 已解除该阻塞。
 
 ## 实现进度
 
@@ -11,7 +11,7 @@
 | V-0 | ✅ 已交付 | `gtv-core/src/column.rs`：`Pod` seal 开 `f32`，新增 mapped `f32` 列单测（NaN/±0 位模式） |
 | V-1 | ✅ 已交付 | `gtv-index/src/vector_segment.rs`（格式：`encode_vector_segment`/`open_vector_segment`/`VectorSegment`，6 单测）；`gtv-index-store/src/vector_segment_io.rs`（落盘 `write_atomic` + mmap 读回 `memmap2`，3 单测） |
 | V-2 | ✅ 已交付 | `FlatIndex` `Col<f32>`/`Col<u64>` 化（`flat.rs`，构造器签名不变，新增 `from_segment`）+ `IndexStore::save` 对 Flat 写 GTVVEC payload + `load` 按 payload magic 分派（GTVVEC 走 mmap 冷开 / GFLATv1 走解码）+ `verify` 对 GTVVEC 补 `verify_data`。容器 manifest pad 到 8 B（尾随空格，向后兼容） |
-| V-3 | ⏳ 待做 | `cudaHostRegister` 封装（解锁 P1b-2） |
+| V-3 | ✅ 已交付 | `cudaHostRegister` RAII 封装（`gtv-accelerator/src/cuda.rs`：`HostRegister` + `register_and_upload`，unsafe 集中一处，register 失败自动回落 P1b-1 staging）+ `Col::stable_bytes()` 暴露稳定字节区间 + `bench_pcie_transfer` 新增 register 列。**平台发现**：Windows WDDM 下 `cuMemHostRegister` 拒绝文件映射页（`CUDA_ERROR_OUT_OF_MEMORY`），register 零拷贝只在 Linux/TCC 可达 |
 | V-4 | ⏳ 待做 | IVF 落盘复用 + 端到端基准 |
 
 > **V-1 范围收敛说明**：立项原文把「容器 payload 从 `GFLATv1` 升级」列在 V-1，但实现时确认——容器 payload 升级必须伴随 `FlatIndex` 的 `Col` 化（否则 mmap 出的 GTVVEC 无法被仍用 `Vec` 字段的 `FlatIndex` 消费，是半成品）。因此 V-1 收敛为「格式模块 + 独立落盘/读回（`VectorSegment` 类型，不破坏现有 `.gtvidx` 路径）」，容器升级并入 V-2。

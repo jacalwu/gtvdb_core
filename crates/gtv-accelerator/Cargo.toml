@@ -36,3 +36,8 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
 [[example]]
 name = "bench_pcie_transfer"
 required-features = ["cuda"]
+
+[dev-dependencies]
+# `bench_pcie_transfer` maps a scratch file to emulate the `Col::Mapped` mmap
+# source that P1b-2 / V-3 registers with `cudaHostRegister`.
+memmap2 = "0.9"

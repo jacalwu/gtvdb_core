@@ -2,7 +2,7 @@
 
 > 本文是 [`storage-tiering-ssd-ram-vram.md`](storage-tiering-ssd-ram-vram.md) §4.1 / §5 的展开。目标：把「消灭第三份拷贝」从一句口号变成一份**可落地、可验收、可分阶段**的技术方案。
 > 前置事实依据：[`bench_pcie_transfer`](../crates/gtv-accelerator/examples/bench_pcie_transfer.rs)（P1a 已交付）实测：稳态 pinned 上传比未锁页快 **33–45%**，小载荷（1 MiB）快 **4.37×**。结论：pinned 有可量化价值，值得做。
-> 状态：**P1b-1 已实现**（`cuda.rs` 的 `StagingBuffer` + `build_corpus`/`device_series` 改造）；P1b-2 设计提案（阻塞于语料上 mmap）。
+> 状态：**P1b-1 已实现**（`cuda.rs` 的 `StagingBuffer` + `build_corpus`/`device_series` 改造）；**P1b-2 已实现**（`cudaHostRegister` 封装 `register_and_upload`，V-3 交付，含平台 fallback）。
 
 ---
 
@@ -122,9 +122,9 @@ let d = stream.clone_htod(&staging.buf)?;   // DMA 走 pinned 快路径（无 bo
 
 ---
 
-## 3. P1b-2：`cudaHostRegister` 零拷贝（语料上 mmap 后）
+## 3. P1b-2：`cudaHostRegister` 零拷贝（语料上 mmap 后，✅ 已实现 V-3）
 
-> 本节只写**设计**，标记为「阻塞于前置工程」，不排期实现。
+> V-3 已交付封装；但实测发现 **Windows WDDM 不支持 register 文件映射页**（见 §3.4 平台发现），register 零拷贝只在 Linux/TCC 下可达，封装已带回退。
 
 ### 3.1 前置工程：向量语料上 mmap
 
@@ -155,10 +155,27 @@ Col<f32> (GTVSeg mmap) ── cudaHostRegister ──▶ pinned 页（零拷贝�
 - pinned 页不参与 OS 换页，必须受 `VramBudget` host-pinned 子账配额，避免锁死系统内存。
 - 字节布局必须与 GTVSeg 定宽 POD 一致（承 §2.1 红线 1），不做任何 `cast` 或对齐破坏。
 
-### 3.4 验收
+### 3.4 验收（V-3 已交付）
 
-- 语料 mmap 后，`bench_pcie_transfer` 增加「register 已有 mmap」一列，带宽应接近 `cudaHostAlloc` 的 pinned 行。
-- `upload_from_mapped` 与 `upload(Vec)` 在 host/no-GPU 上语义等价（no-op / 退化为 `clone_htod`）。
+- ✅ `cudaHostRegister` RAII 封装：`gtv-accelerator/src/cuda.rs` 的 `HostRegister`（`cuMemHostRegister_v2`/`cuMemHostUnregister` 成对，Drop 保证 unregister）+ `register_and_upload`（register → `clone_htod` 零拷贝 DMA → synchronize → unregister），unsafe 集中一处并写 `SAFETY` 契约。
+- ✅ `Col::stable_bytes()`（`gtv-core/src/column.rs`）：暴露 `(NonNull<u8>, len)` 稳定字节区间，`Mapped`/`Owned` 两变体都可用，是 `cudaHostRegister` 的唯一取址入口。
+- ✅ `bench_pcie_transfer` 新增 register 列：register-mmap 直接 DMA，与 staging/pinned 对比。
+- ✅ fallback 路径验证：`register_and_upload` 在 register 失败时返回 `Err`，由调用方回落 P1b-1 staging，查询不报错。
+
+**平台发现（重要，改写 P1b-2 收益预期）**：
+
+在 **Windows WDDM 驱动**（开发机 RTX 4060 Laptop）下，`cuMemHostRegister_v2` 对**文件映射页**（`memmap2::Mmap`）**必然失败**，返回误导性的 `CUDA_ERROR_OUT_OF_MEMORY`；但对**普通堆内存**（`Vec`）成功。实测探针：
+
+| 内存形态 | `cuMemHostRegister_v2` 结果 |
+|:--|:--|
+| `Vec` 堆内存（1 MiB） | `CUDA_SUCCESS` |
+| `mmap` 文件映射（1 MiB） | `CUDA_ERROR_OUT_OF_MEMORY` |
+
+这意味着：**register 零拷贝（「mmap 页直接 DMA、免 host memcpy」）在 Windows WDDM 下不可达**，只在 Linux/TCC（`CU_MEMHOSTREGISTER_PORTABLE` 可 pin 文件页）下才是 P1b-2 描述的终点。在 Windows 上，语料上 mmap 带来的冷开收益（V-2 的 O(1) open + 零物化）依然成立，但上传仍走 P1b-1 staging——register 封装保留了这条 fallback 红线，代码在 Linux 上可无缝启用零拷贝路径。
+
+### 3.5 遗留：`build_corpus` 接线到 register（P1b-2 端到端）
+
+`register_and_upload` 已封装并验证，但 `build_corpus` 尚未接线（仍需 `KnnRequest` 携带 `BytesSource` 表达「mapped 来源」）。鉴于 Windows 上 register 必失败、收益只在 Linux 显现，此接线不排入 V-3，留待 Linux/TCC 部署环境评估时再做（与 `bytesSource` 扩展一并）。
 
 ---
 
@@ -168,11 +185,11 @@ Col<f32> (GTVSeg mmap) ── cudaHostRegister ──▶ pinned 页（零拷贝�
 |:--|:--|
 | GPUDirect（SSD→GPU P2P DMA） | P2，Linux-only，依赖 `nvidia-fs` + NVMe 拓扑 |
 | 异步预取流水线（`prefetch_hint` + stream 重叠） | P1c / P2，独立阶段 |
-| 向量语料上 GTVSeg（P1b-2 的前置） | 独立工程，与「三级分层」解耦，另行立项 |
+| `build_corpus` 接线 `register_and_upload`（P1b-2 端到端） | 需 `BytesSource` 扩展；且 Windows WDDM 下 register mmap 必失败（见 §3.4），收益只在 Linux 显现，留待 Linux/TCC 环境评估 |
 | host-pinned 配额强制执行 | 先观测（P1b-1 上报大小），执行留 P1b-2 |
 
 ---
 
 ## 5. 一句话总结
 
-P1b 的「pinned」分两个台阶：**P1b-1**（本次）不改数据来源，只用 `cudaHostAlloc` 的 write-combined staging 把 DMA 从「未锁页 bounce buffer」切到「pinned 快路径」，立即可做、P1a 已证明 33–45% 收益；**P1b-2**（语料上 mmap 后）用 `cudaHostRegister` 注册已有 mmap 视图，真正消灭第三份拷贝，但被「向量语料当前未落 GTVSeg」这一前置卡住，单独立项。
+P1b 的「pinned」分两个台阶：**P1b-1** 不改数据来源，只用 `cudaHostAlloc` 的 write-combined staging 把 DMA 从「未锁页 bounce buffer」切到「pinned 快路径」，已证明 33–45% 收益；**P1b-2** 用 `cudaHostRegister` 注册已有 mmap 视图、真正消灭第三份拷贝——V-3 已交付封装与带回退语义，但实测 **Windows WDDM 拒绝 register 文件映射页**，零拷贝终点只在 Linux/TCC 可达，Windows 上仍由 staging 兜底。

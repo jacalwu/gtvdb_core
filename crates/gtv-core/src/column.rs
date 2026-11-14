@@ -206,6 +206,30 @@ impl<T: Pod> Col<T> {
         matches!(self, Col::Mapped(_))
     }
 
+    /// The stable host-memory byte range backing this column, when one is safe
+    /// to hand to `cudaHostRegister`.
+    ///
+    /// Both variants share a `NonNull` pointer that stays put for the column's
+    /// lifetime — `Mapped` because the [`MappedRegion`] contract pins it, and
+    /// `Owned` because the `Vec` is not reallocated while this borrow lives.
+    /// This is the single place the accelerator can learn «these bytes are
+    /// stable, register them» without peeking at the enum's fields.
+    ///
+    /// Returns `None` for an empty column (a dangling sentinel has no bytes to
+    /// pin). The length is the element count times `size_of::<T>()`, i.e. the
+    /// exact span `cudaHostRegister` must pin.
+    pub fn stable_bytes(&self) -> Option<(std::ptr::NonNull<u8>, usize)> {
+        let (ptr, len) = match self {
+            Col::Owned(v) => (v.as_ptr() as *const u8, v.len() * std::mem::size_of::<T>()),
+            Col::Mapped(m) => (m.ptr as *const u8, m.len * std::mem::size_of::<T>()),
+        };
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: `as_ptr` of a non-empty `Vec`/`MappedCol` is non-null.
+        Some((unsafe { std::ptr::NonNull::new_unchecked(ptr as *mut u8) }, len))
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.deref().len()
@@ -340,6 +364,32 @@ mod tests {
         let c = MappedCol::<u64>::new(region, 8, 0).unwrap();
         assert!(c.is_empty());
         assert_eq!(&c[..], &[] as &[u64]);
+    }
+
+    #[test]
+    fn stable_bytes_reports_the_backing_span() {
+        let owned: Col<u32> = vec![1u32, 2, 3].into();
+        let (ptr, len) = owned.stable_bytes().unwrap();
+        assert_eq!(len, 3 * 4);
+        // The pointer aliases the Vec's own buffer.
+        assert_eq!(ptr.as_ptr() as usize, (&owned[0] as *const u32) as usize);
+
+        let mut bytes = vec![0u8; 64];
+        bytes[0..8].copy_from_slice(&42u64.to_le_bytes());
+        let region: Arc<dyn MappedRegion> = Arc::new(FakeRegion(bytes));
+        let mapped = MappedCol::<u64>::new(region, 0, 1).unwrap();
+        let (mptr, mlen) = mapped.stable_bytes().unwrap();
+        assert_eq!(mlen, 8);
+        assert_eq!(mptr.as_ptr() as usize, (&mapped[0] as *const u64) as usize);
+    }
+
+    #[test]
+    fn empty_column_has_no_stable_bytes() {
+        let owned: Col<u32> = Vec::new().into();
+        assert!(owned.stable_bytes().is_none());
+        let region: Arc<dyn MappedRegion> = Arc::new(FakeRegion(vec![0u8; 8]));
+        let mapped = MappedCol::<u64>::new(region, 8, 0).unwrap();
+        assert!(mapped.stable_bytes().is_none());
     }
 
     #[test]
