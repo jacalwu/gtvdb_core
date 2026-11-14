@@ -29,3 +29,10 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
     "dynamic-loading",
     "cuda-13000",
 ] }
+
+# The CUDA example is skipped by `cargo check --examples` on the default
+# (GPU-less) build via `required-features`, instead of failing to find `main`
+# when the crate-level `#![cfg(feature = "cuda")]` empties it.
+[[example]]
+name = "bench_pcie_transfer"
+required-features = ["cuda"]

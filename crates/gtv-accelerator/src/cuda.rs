@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::BooleanArray;
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaSlice, LaunchConfig, PinnedHostSlice, PushKernelArg,
+};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use gtv_core::Metric;
 
@@ -65,6 +67,72 @@ struct DeviceSeries {
     len: i32,
 }
 
+/// A reusable write-combined pinned host buffer used as the DMA staging area.
+///
+/// P1b-1 (`docs/pinned-upload-p1b.md`): uploading a pageable `Vec` through the
+/// driver forces a hidden copy into an internal bounce buffer before the DMA,
+/// which P1a measured at a 33–45% bandwidth loss. Copying into a `cudaHostAlloc`
+/// (write-combined) buffer once, then DMA-ing from the locked pages, avoids the
+/// bounce and lets the transfer run at the pinned ceiling.
+///
+/// The buffer is exact-sized and reallocated only when the element count
+/// changes: a pinned allocation is *not* swappable by the OS, so re-using one
+/// buffer per size is cheaper than re-allocating, and `clone_htod(&buf)`
+/// transfers exactly `cap` elements (no uninitialised tail is ever DMA'd).
+struct StagingBuffer<T: cudarc::driver::DeviceRepr> {
+    /// `None` until the first upload allocates it.
+    buf: Option<PinnedHostSlice<T>>,
+    /// Element count (in `T`) the buffer currently holds.
+    cap: usize,
+}
+
+impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy> StagingBuffer<T> {
+    /// Reserve a buffer holding exactly `n` `T`s, reallocating only when the
+    /// size changes.
+    fn ensure(&mut self, n: usize, ctx: &Arc<CudaContext>) -> Result<&mut [T], AccelError> {
+        if self.buf.is_none() || self.cap != n {
+            // SAFETY: `alloc_pinned` is unsafe only because the memory is
+            // uninitialised; we overwrite it via `copy_from_slice` before any
+            // read, and `PinnedHostSlice` owns the lifetime / free on drop.
+            let buf = unsafe { ctx.alloc_pinned::<T>(n) }
+                .map_err(|e| launch_err(format!("pinned staging alloc: {e}")))?;
+            self.buf = Some(buf);
+            self.cap = n;
+        }
+        let buf = self
+            .buf
+            .as_mut()
+            .expect("staging buffer allocated by ensure");
+        // `as_mut_slice` synchronises the pinned buffer's event first, so we
+        // never observe a half-written staging area from a prior async op.
+        let slice = buf
+            .as_mut_slice()
+            .map_err(|e| launch_err(format!("pinned staging slice: {e}")))?;
+        Ok(slice)
+    }
+
+    /// The current capacity in `T` elements (for telemetry / budget reporting).
+    fn cap(&self) -> usize {
+        self.cap
+    }
+}
+
+impl<T: cudarc::driver::DeviceRepr> Default for StagingBuffer<T> {
+    fn default() -> Self {
+        Self { buf: None, cap: 0 }
+    }
+}
+
+impl<T: cudarc::driver::DeviceRepr> std::fmt::Debug for StagingBuffer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagingBuffer")
+            .field("allocated", &self.buf.is_some())
+            .field("cap", &self.cap)
+            .field("bytes", &(self.cap * std::mem::size_of::<T>()))
+            .finish()
+    }
+}
+
 /// The query half of a fused top-K launch. The corpus half is the resident
 /// [`DeviceCorpus`]; keeping everything else in one value stops the kernel
 /// entry point from growing a positional argument list that is easy to
@@ -98,6 +166,10 @@ pub struct CudaBackend {
     /// every returned position's meaning) differs.
     ivf_corpora: Mutex<HashMap<(String, u64), Arc<DeviceCorpus>>>,
     series: Mutex<HashMap<(String, u64), Arc<DeviceSeries>>>,
+    /// Pinned DMA staging buffer for the `f32` corpus upload (P1b-1).
+    staging_f32: Mutex<StagingBuffer<f32>>,
+    /// Pinned DMA staging buffer for the `i64` as-of series upload (P1b-1).
+    staging_i64: Mutex<StagingBuffer<i64>>,
 }
 
 impl std::fmt::Debug for CudaBackend {
@@ -173,6 +245,9 @@ impl CudaBackend {
             corpora: Mutex::new(HashMap::new()),
             ivf_corpora: Mutex::new(HashMap::new()),
             series: Mutex::new(HashMap::new()),
+            // Allocated lazily on the first upload of each element type.
+            staging_f32: Mutex::new(StagingBuffer::default()),
+            staging_i64: Mutex::new(StagingBuffer::default()),
         })
     }
 
@@ -212,6 +287,17 @@ impl CudaBackend {
         let ivf = self.ivf_corpora.lock().map(|m| m.len()).unwrap_or(0);
         let series = self.series.lock().map(|m| m.len()).unwrap_or(0);
         corpora + ivf + series
+    }
+
+    /// Total host-pinned staging bytes currently held (P1b-1 telemetry).
+    ///
+    /// This is the write-combined `cudaHostAlloc` footprint: it is *not* device
+    /// memory, but it is non-swappable, so it matters for the host budget even
+    /// though it never shows up in `mem_info`.
+    pub fn staging_bytes(&self) -> usize {
+        let f32 = self.staging_f32.lock().map(|s| s.cap()).unwrap_or(0);
+        let i64 = self.staging_i64.lock().map(|s| s.cap()).unwrap_or(0);
+        f32 * std::mem::size_of::<f32>() + i64 * std::mem::size_of::<i64>()
     }
 
     /// Wait for all queued work on this context. Used after a device copy is
@@ -256,12 +342,26 @@ impl CudaBackend {
         let stream = self.ctx.default_stream();
 
         // One bulk upload of the row-major corpus, then a device-side transpose.
-        // The row-major buffer is dropped as soon as the transpose is enqueued
-        // and the stream has consumed it (cudarc keeps the allocation alive
-        // until the stream is synchronized by the next D2H copy).
-        let d_rowmajor = stream
-            .clone_htod(data)
-            .map_err(|e| launch_err(format!("upload corpus: {e}")))?;
+        // P1b-1: stage the pageable source through a write-combined pinned
+        // buffer first. DMA-ing from locked pages skips the driver's hidden
+        // bounce-buffer copy (measured at 33–45% in `bench_pcie_transfer`).
+        // The row-major device buffer is dropped as soon as the transpose is
+        // enqueued and the stream has consumed it (cudarc keeps the allocation
+        // alive until the stream is synchronized by the next D2H copy).
+        let d_rowmajor = {
+            let mut s = self
+                .staging_f32
+                .lock()
+                .map_err(|_| launch_err("pinned staging lock poisoned"))?;
+            {
+                let slice = s.ensure(data.len(), &self.ctx)?;
+                slice.copy_from_slice(data);
+            } // drop the `&mut` borrow before re-borrowing immutably
+            let buf = s.buf.as_ref().expect("staging allocated by ensure");
+            stream
+                .clone_htod(buf)
+                .map_err(|e| launch_err(format!("upload corpus: {e}")))?
+        };
         let mut data_t = stream
             .alloc_zeros::<f32>(n * dim)
             .map_err(|e| launch_err(format!("alloc column-major corpus: {e}")))?;
@@ -312,9 +412,20 @@ impl CudaBackend {
             }
         }
         let stream = self.ctx.default_stream();
-        let ts = stream
-            .clone_htod(req.right_times)
-            .map_err(|e| launch_err(format!("upload series: {e}")))?;
+        let ts = {
+            let mut s = self
+                .staging_i64
+                .lock()
+                .map_err(|_| launch_err("pinned staging lock poisoned"))?;
+            {
+                let slice = s.ensure(req.right_times.len(), &self.ctx)?;
+                slice.copy_from_slice(req.right_times);
+            }
+            let buf = s.buf.as_ref().expect("staging allocated by ensure");
+            stream
+                .clone_htod(buf)
+                .map_err(|e| launch_err(format!("upload series: {e}")))?
+        };
         let series = Arc::new(DeviceSeries {
             ts,
             len: req.right_times.len() as i32,

@@ -93,6 +93,7 @@
 | **P1-2** | 段内节点区间窄化 / `(time_bucket, src_range)` 分片 | 🧊 冻结（M6-b） | 持续段数进入 **100–500** 且 **B/edge > 256** 才启动。实测 1/10/100/500 段 → 0.8/8/80/**400** B/edge（跨平台几何常量）；目标 1,439 → ~145 B/edge。验收须复用 `crates/gtv-storage/tests/l2_time_box.rs` 断言，不破坏 `Skip/FullHit/Scan` |
 | **P1-3** | 热循环 measured-first 调优 | 🧊 冻结（M6-b） | 先做 Linux `perf stat`（`cache-misses` / `dTLB-load-misses` / `branch-misses`），再**只做被证明是瓶颈的一项**（16B 窄化 / SIMD 时间谓词 / Eytzinger / 大页 / 并行 frontier）；每项 A/B，输了回滚 |
 | **P1-4** | `gtv-pattern` motif / 环路 SQL 出口（业主追加） | ✅ **GO**，已交付 | 逐点 UDTF 与批量表逐条一致；`bench_motif_gate` Q1 在 N=32/128 为 11.82× / 49.79×（owned）、30.49× / 111.55×（shared）。详 §3.3 |
+| **P1-5** | SSD→RAM→VRAM 三级数据分层（业主追加） | 🔵 进行中 | 把 KDB mmap（已交付，见 M6-P0）作为 RAM warm 层，向上与 `ResidentRegistry` 的 VRAM hot 层打通：pinned 上传 / 异步预取 / （可选）GPUDirect。详 [`docs/storage-tiering-ssd-ram-vram.md`](docs/storage-tiering-ssd-ram-vram.md) 与 §3.5 |
 
 **红线**：`csr.rs` 的 `neighbors()` 热循环、GTVSeg v1 的 `disk == memory == cache line` 定宽列区恒等式、L2 交集/并集两组标量语义不得因优化而合并。U0–U3 用四个里程碑换来的「读路径零回归」是当前最值钱的资产。
 
@@ -143,6 +144,35 @@ P0 的以下补完属于测量欠账，**不新增任何算子**：
 Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；硬断言 `pointwise == batch == gtv_pattern::find_from`。与 M6-a 同结论：**瓶颈是 N 次 SQL 规划，不是图内核**；N=1 时 owned 仍慢（整图 clone），shared 路径已 >1。门禁用保守的 owned 路径，N≥32 必须 >1，否则 CI 失败。
 
 **边界**：`find_bounded`（显式 `TraversalBudget` / `CancelToken`）仍未接出 SQL，当前上界由 `limit` 提供；`sequence` 只在 Rust `MotifSpec` 可用，未做 SQL 数组字面量；`neighbors()` 热循环与 GTVSeg v1 列区零改动（`csr.rs` 在 M1 中只加了 `Neighbor::edge_idx` 与预算返回语义，见 §3.4）。
+
+### 3.5 已登记（P1-5）：SSD→RAM→VRAM 三级数据分层
+
+**背景**：`gtv-accelerator` 的 `ResidentRegistry`（VRAM hot 层）与 `gtv-storage` 的 GTVSeg mmap（SSD→RAM 层）已分别交付，但二者之间缺一根「传送带」——当前查询上传是**同步 H2D 拷贝**，等价于传统 offload 的低效形态。参考三个系统的思想并统一到 gtvdb：
+
+- **KDB+/q 的 mmap 极致 IO**：内存映射即存储（无解码）、分区+枚举字典、OS page cache 即缓存层。gtvdb 已落地前两者（M6-P0 + `hdb.rs`），缺的是「页级调度向上延伸到 VRAM」。
+- **PG-Strom 的 GPUDirect / GPU Cache**：SSD→GPU P2P DMA 绕过 CPU、热表驻留。驻留缓存已吸收（`resident.rs`），GPUDirect 未做。
+- **Strata 的热度分层 + 异步预取流水线**：VRAM hot + pinned host RAM warm + 按需冷读；算第 N 块时第 N+1 块已在 PCIe 上流。热度淘汰已吸收（decayed-heat），pinned/预取未做。
+
+设计文档：[`docs/storage-tiering-ssd-ram-vram.md`](docs/storage-tiering-ssd-ram-vram.md)。三条红线：三级共用同一份定宽 POD 字节布局；数据单向流动 SSD→RAM→VRAM（反向只失效不回写，GTVSeg 不可变 COW）；每一跳独立可观测 fallback。
+
+| 步骤 | 内容 | 状态 | 产出 |
+|:--|:--|:--|:--|
+| **P1a** | 量化 PCIe DMA 墙：同步 H2D 带宽 vs pinned 上传 vs 理想设备带宽 | ✅ 已交付 | `bench_pcie_transfer` 现状表（见下）：稳态 pinned 拿回 33–45% 带宽，小载荷 4.37× |
+| **P1b** | pinned 上传：P1b-1 `cudaHostAlloc` write-combined staging（✅ 已交付）；P1b-2 `cudaHostRegister` 注册 mmap 视图（阻塞于语料上 mmap） | ✅ P1b-1 已交付 | [`docs/pinned-upload-p1b.md`](docs/pinned-upload-p1b.md)，P1b-1 实测 staging 达 pinned 上限（稳态 +14~43%） |
+| **P1c** | 异步预取流水线：算第 N 块时预取第 N+1 块 | ⏳ 待做 | 隐藏 PCIe 搬运延迟 |
+| **P2** | heat 预取 + async 上传整合；GPUDirect（`#[cfg(linux)]` 可选，依赖 `nvidia-fs`） | ⏳ 待做 | 大表扫描省 CPU+PCIe 往返 |
+
+**P1a 现状表（Windows 本机 RTX 4060 Laptop，`bench_pcie_transfer`，`--features cuda --release`，warm-up 后）**：
+
+| payload | unpinned H2D | pinned H2D | pinned 加速 | 增益 |
+|--:|--:|--:|--:|--:|
+| 1 MiB | 0.69 GB/s | 3.03 GB/s | 4.37× | +337% |
+| 8 MiB | 9.32 GB/s | 10.60 GB/s | 1.14× | +14% |
+| 64 MiB | 8.72 GB/s | 11.60 GB/s | 1.33× | +33% |
+| 256 MiB | 8.24 GB/s | 11.95 GB/s | 1.45× | +45% |
+| 1024 MiB | 8.78 GB/s | 12.02 GB/s | 1.37× | +37% |
+
+**结论**：这台设备的 PCIe 带宽墙约 **12 GB/s**（pinned 上限）。稳态（≥8 MiB）下当前未锁页路径只能到 8.2–9.3 GB/s，**pinned 稳定拿回 33–45% 上传带宽**；小载荷（1 MiB，IVF probe 小块上传的典型形态）被 staging 拷贝惩罚，pinned 收益放大到 4.37×。这证明 P1b（把已有 mmap 页 `cudaHostRegister` 为 pinned，消灭 staging 拷贝）有可量化的价值。数值仅作同机 A/B 判定，不作对外性能声明。
 
 ### 3.4 已交付（M1）：候选集 / 边身份 / 预算语义
 
