@@ -9,12 +9,15 @@ use arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::Result;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use gtv_accelerator::AcceleratorRegistry;
 use gtv_catalog::{ExecutionRecord, IndexRef, ModelRef, TableRef};
 use gtv_core::TemporalCSR;
 use gtv_index::AnyIndex;
+use gtv_params::{CudaMode, GtvParams, QueryMode, ResolvedParams};
 
 use crate::ext::{ExtensionInfo, ExtensionRegistry};
 use crate::registry::{AsofResource, ResourceRegistry};
@@ -54,16 +57,19 @@ fn env_usize(name: &str) -> Option<usize> {
     v.parse::<usize>().ok().filter(|&n| n > 0)
 }
 
-/// Apply `GTV_TARGET_PARTITIONS` / `GTV_BATCH_SIZE` (and fall back to an
-/// explicit CPU-count `target_partitions` when the ENV is unset) so query
+/// Apply `GTV_TARGET_PARTITIONS` / `GTV_BATCH_SIZE` (and fall back to the
+/// parameter file's `WORKER_THREADS`, then to the CPU count) so query
 /// parallelism is tunable and observable. Cap partitions against available
 /// parallelism to reduce oversubscription with rayon-backed ANN / pattern
 /// work on the same process.
-fn apply_execution_env(config: SessionConfig) -> SessionConfig {
+fn apply_execution_env(config: SessionConfig, threads: Option<usize>) -> SessionConfig {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let partitions = env_usize("GTV_TARGET_PARTITIONS").unwrap_or(cpus).max(1);
+    let partitions = env_usize("GTV_TARGET_PARTITIONS")
+        .or(threads)
+        .unwrap_or(cpus)
+        .max(1);
     let mut config = config.with_target_partitions(partitions);
     if let Some(batch) = env_usize("GTV_BATCH_SIZE") {
         config = config.with_batch_size(batch);
@@ -162,19 +168,39 @@ pub struct GtvContext {
     /// `gtv_active_edge_count()` / `gtv_range_agg()`. Explicitly refreshed by
     /// `register_segment_store()` — never an implicit cache.
     aggregate: crate::aggregate::AggregateSlot,
+    /// The parameter file that configured this process (resolved defaults when no
+    /// file was found). Exposed so operators can inspect the effective config.
+    params: GtvParams,
+    /// Resolved, deployment-ready values (concrete byte budgets, chosen modes).
+    resolved: ResolvedParams,
+    /// Backend registry built from the parameter file. Not yet on the query path
+    /// (C1/C2/C3 add operators without routing SQL to them), but CUDA_MODE /
+    /// CUDA_VRAM already gate device init and its residency budget here. Behind an
+    /// `Arc` so `GtvContext` can stay `Clone` (the registry itself is not `Clone`).
+    accelerators: Arc<AcceleratorRegistry>,
 }
 
 impl GtvContext {
     /// Core-only context: temporal graph, vector search, lineage, DQ, quantum
     /// state metadata. No domain extension is loaded.
+    ///
+    /// Loads the parameter file (or the documented defaults) and builds the
+    /// engine around it.
     pub fn new() -> Self {
-        Self::empty()
+        let (params, _warnings) = GtvParams::load();
+        Self::build(&params)
+    }
+
+    /// Build a context from an explicit parameter set (tests, embedded usage).
+    pub fn with_params(params: GtvParams) -> Self {
+        Self::build(&params)
     }
 
     /// Build a context with `extensions` installed (banking, HFT, quantum
     /// compute, …). See [`crate::ext`] for the contract an extension implements.
     pub fn with_extensions(extensions: ExtensionRegistry) -> Result<Self> {
-        let mut this = Self::empty();
+        let (params, _warnings) = GtvParams::load();
+        let mut this = Self::build(&params);
         this.install_registry(extensions)?;
         Ok(this)
     }
@@ -205,24 +231,51 @@ impl GtvContext {
         self.extensions.get::<T>()
     }
 
-    fn empty() -> Self {
+    /// Build the engine around a parameter set: resolve it, then configure the
+    /// DataFusion runtime (memory pool, partitions, spill) and the backend
+    /// registry from the resolved values.
+    fn build(params: &GtvParams) -> Self {
+        // Resolve symbolic defaults (half of system RAM, 80% of device VRAM) into
+        // concrete numbers. A resolution failure (e.g. CUDA_MODE=ON with no GPU)
+        // must not abort startup: degrade to CUDA off and keep the rest.
+        let device_total = crate::accelerator::cuda_device_total();
+        let resolved = match params.resolve(device_total) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("gtv: parameter resolution warning: {e}; continuing with CUDA disabled");
+                let mut safe = params.clone();
+                safe.cuda_mode = CudaMode::Off;
+                safe.resolve(None).expect("gtv: default resolution cannot fail")
+            }
+        };
+
         // B3-5: EXPLAIN should surface the estimated statistics that the
         // `StatsTable` provider exposes (num_rows / min / max / null_count).
         let mut config = SessionConfig::new();
         config.options_mut().explain.show_statistics = true;
         // Explicit target_partitions / batch_size (GTV_TARGET_PARTITIONS,
-        // GTV_BATCH_SIZE). DataFusion already defaults partitions to CPUs; we
-        // set them so operators can tune without rebuilding.
-        let config = apply_execution_env(config);
+        // GTV_BATCH_SIZE) override the parameter file's WORKER_THREADS, which is
+        // itself a fallback for the logical CPU count.
+        let config = apply_execution_env(config, resolved.worker_threads);
 
         // B3-6 spill-to-disk: large sorts / joins land under the configured
-        // spill directory (default `<tmp>/gtv-spill`).
-        let spill = spill_dir();
+        // spill directory. `GTV_SPILL_DIR` still wins for container overrides.
+        let spill = std::env::var_os("GTV_SPILL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| resolved.spill_dir.clone());
         let _ = std::fs::create_dir_all(&spill);
         let disk = DiskManagerBuilder::default()
-            .with_mode(DiskManagerMode::Directories(vec![spill]));
-        let runtime = RuntimeEnvBuilder::new()
-            .with_disk_manager_builder(disk)
+            .with_mode(DiskManagerMode::Directories(vec![spill.clone()]));
+        let mut runtime_builder = RuntimeEnvBuilder::new().with_disk_manager_builder(disk);
+        // MEMORY_TARGET bounds DataFusion's memory pool. Only enforce it when the
+        // operator set it explicitly: the auto default (half of system RAM) stays
+        // unenforced so small CI boxes and ad-hoc runs behave as before.
+        if params.memory_target.is_explicit() {
+            runtime_builder = runtime_builder.with_memory_pool(Arc::new(GreedyMemoryPool::new(
+                resolved.memory_target_bytes as usize,
+            )));
+        }
+        let runtime = runtime_builder
             .build()
             .expect("gtv: build DataFusion runtime env");
         let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime));
@@ -402,6 +455,12 @@ impl GtvContext {
             )),
         );
 
+        // -- backends, gated by the parameter file ---------------------------
+        // CUDA_MODE / CUDA_VRAM decide whether the device is opened and with what
+        // residency budget. The query path does not route here yet (C1-C3 add
+        // operators behind the trait), but this is where that wiring will attach.
+        let accelerators = Arc::new(crate::accelerator::registry_with(Some(&resolved)));
+
         Self {
             ctx,
             knn_collections,
@@ -419,6 +478,9 @@ impl GtvContext {
             invalidation_root,
             aggregate,
             table_sources: Arc::new(RwLock::new(HashMap::new())),
+            params: params.clone(),
+            resolved,
+            accelerators,
         }
     }
 
@@ -435,6 +497,27 @@ impl GtvContext {
 
     pub fn session(&self) -> &SessionContext {
         &self.ctx
+    }
+
+    /// The parameter file (or resolved defaults) this context was built from.
+    pub fn params(&self) -> &GtvParams {
+        &self.params
+    }
+
+    /// Concrete, deployment-ready values resolved from the parameter file.
+    pub fn resolved(&self) -> &ResolvedParams {
+        &self.resolved
+    }
+
+    /// The backend registry, built from `CUDA_MODE` / `CUDA_VRAM`. Not yet on the
+    /// query path, but available for tooling and the future routing integration.
+    pub fn accelerators(&self) -> &AcceleratorRegistry {
+        &self.accelerators
+    }
+
+    /// The configured default query dialect (`DEFAULT_MODE`).
+    pub fn default_mode(&self) -> QueryMode {
+        self.resolved.default_mode
     }
 
     /// Register an in-memory table from a schema and its record batches.

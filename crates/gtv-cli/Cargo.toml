@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 gtv-core = { path = "../gtv-core" }
 gtv-engine = { path = "../gtv-engine" }
+gtv-params = { path = "../gtv-params" }
 gtv-storage = { path = "../gtv-storage" }
 arrow.workspace = true
 anyhow.workspace = true

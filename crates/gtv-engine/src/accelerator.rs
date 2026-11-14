@@ -13,30 +13,69 @@
 //! the failure is a missing device, not a failed query.
 
 use gtv_accelerator::{AcceleratorRegistry, ExecutionPolicy};
+use gtv_params::ResolvedParams;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
 /// Build the process-wide backend list.
 ///
 /// `Ok` on every machine: a device that cannot open is reported through
-/// [`registry_state`] and simply not registered.
+/// [`registry_state`] and simply not registered. This form consults the parameter
+/// file via `resolved`; callers that predate it (or tests) pass `None` and get
+/// the historical behaviour — open the device if one is present.
 pub fn registry() -> AcceleratorRegistry {
-    #[allow(unused_mut)]
-    let mut reg = AcceleratorRegistry::new();
+    registry_with(None)
+}
+
+/// Build the backend list honouring a resolved parameter file.
+///
+/// When `resolved` says CUDA is disabled (`CUDA_MODE=FALSE`), the device is never
+/// opened. When enabled, the residency budget comes from `CUDA_VRAM` (typically
+/// 80% of device VRAM) rather than the crate's 60% fallback. A device that fails
+/// to open is simply not registered — the CPU reference remains.
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+pub fn registry_with(resolved: Option<&ResolvedParams>) -> AcceleratorRegistry {
+    let reg = AcceleratorRegistry::new();
     #[cfg(feature = "cuda")]
     {
-        match gtv_accelerator_cuda::CudaAccelerator::open() {
-            Ok(acc) => {
-                reg.register(Arc::new(acc));
-            }
-            Err(_) => {
-                // No device, no driver, or a driver that failed to initialise.
-                // The CPU reference is already registered; this is the answer
-                // `AcceleratorRegistry::route` will report as `NoDevice`.
+        let enabled = match resolved {
+            Some(r) => r.cuda_enabled,
+            // Legacy callers: open the device if one is present.
+            None => true,
+        };
+        if enabled {
+            let budget = resolved
+                .filter(|r| r.cuda_vram_bytes > 0)
+                .map(|r| r.cuda_vram_bytes);
+            let device = resolved.map(|r| r.cuda_device).unwrap_or(0);
+            let opts = gtv_accelerator_cuda::OpenOptions { device, budget };
+            match gtv_accelerator_cuda::CudaAccelerator::open_with(opts) {
+                Ok(acc) => {
+                    reg.register(Arc::new(acc));
+                }
+                Err(_) => {
+                    // No device, no driver, or a driver that failed to
+                    // initialise. The CPU reference is already registered.
+                }
             }
         }
     }
     reg
+}
+
+/// Detected device VRAM in bytes, or `None` when the `cuda` feature is off or no
+/// device is present. Used to resolve `CUDA_VRAM`'s fraction default.
+pub fn cuda_device_total() -> Option<u64> {
+    #[cfg(feature = "cuda")]
+    {
+        gtv_accelerator_cuda::CudaAccelerator::probe()
+            .ok()
+            .map(|d| d.total_mem_bytes)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
 }
 
 /// What the build can do, independent of what the machine can do.

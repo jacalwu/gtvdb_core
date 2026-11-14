@@ -9,6 +9,7 @@
 use anyhow::{anyhow, Result};
 use arrow::util::pretty::print_batches;
 use gtv_engine::GtvContext;
+use gtv_params::{GtvParams, QueryMode};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -29,6 +30,8 @@ Core commands
                             register every segment published by a P1 SegmentStore
   .csv       <name> <file>  register a CSV as table <name>
   .parquet   <name> <path>  register a Parquet file / directory as <name>
+  .params                 show the effective parameter file (MEMORY_TARGET, CUDA_*,
+                          DEFAULT_MODE, …)
 
 Everything else is executed as SQL, for example:
   SELECT * FROM gtv_segments();
@@ -51,6 +54,7 @@ enum Command {
     Store { prefix: String, path: String, node_count: usize },
     Csv { name: String, path: String },
     Parquet { name: String, path: String },
+    Params,
     Sql(String),
 }
 
@@ -75,6 +79,10 @@ fn parse(line: &str) -> Result<Command> {
     let Some(rest) = line.strip_prefix('.') else {
         return Ok(Command::Sql(line.to_string()));
     };
+    // `.params` takes no arguments; handle before splitting.
+    if rest.trim().eq_ignore_ascii_case("params") {
+        return Ok(Command::Params);
+    }
     let mut words = rest.split_whitespace();
     let head = words.next().unwrap_or_default().to_ascii_lowercase();
     let tail: Vec<&str> = words.collect();
@@ -158,6 +166,11 @@ async fn run(ctx: &GtvContext, cmd: Command) -> Result<bool> {
         Command::Extensions => {
             show(ctx, "SELECT name, version, objects FROM gtv_extensions()").await?
         }
+        Command::Params => {
+            for line in ctx.resolved().summary_lines() {
+                println!("  {line}");
+            }
+        }
         Command::Segment { name, path } => {
             ctx.register_segment(&path, &name)?;
             println!("mmap'd GTVSeg `{path}` as `{name}` — no decode, no copy");
@@ -183,8 +196,27 @@ async fn run(ctx: &GtvContext, cmd: Command) -> Result<bool> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load the parameter file up front so LOG_LEVEL can shape logging from the
+    // first line. `GTV_PARAMS_FILE` / defaults apply; a missing file is fine.
+    let (params, warnings) = GtvParams::load();
+    for w in &warnings {
+        eprintln!("gtv: {w}");
+    }
+    // Honour LOG_LEVEL unless the caller already set RUST_LOG (explicit wins).
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", params.log_level.as_rust_log());
+    }
+
     // No extension registry is installed: this is the core-only build.
-    let ctx = GtvContext::new();
+    let ctx = GtvContext::with_params(params.clone());
+
+    // DEFAULT_MODE selects the REPL dialect. The core build only links SQL; a `Q`
+    // request without the domain extension falls back to SQL and says so once.
+    let mode = ctx.default_mode();
+    if mode == QueryMode::Q {
+        println!("note: DEFAULT_MODE=Q but no domain extension is linked in this build; using SQL.");
+    }
+
     println!("{BANNER}");
 
     let mut rl = DefaultEditor::new()?;
@@ -231,6 +263,8 @@ mod tests {
         assert_eq!(parse("quit").unwrap(), Command::Quit);
         assert_eq!(parse(".tables").unwrap(), Command::Tables);
         assert_eq!(parse(".extensions").unwrap(), Command::Extensions);
+        assert_eq!(parse(".params").unwrap(), Command::Params);
+        assert_eq!(parse(".PARAMS").unwrap(), Command::Params);
         assert_eq!(
             parse(".segment g data/g.seg").unwrap(),
             Command::Segment { name: "g".into(), path: "data/g.seg".into() }

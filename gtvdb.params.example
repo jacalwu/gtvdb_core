@@ -1,0 +1,49 @@
+# ---------------------------------------------------------------------------
+# gtVdB parameter file (Oracle-style, all-uppercase keys)
+#
+# Copy this to `gtvdb.params` in the working directory (or set GTV_PARAMS_FILE
+# to point elsewhere). Every key has a default, so an absent file is not an
+# error: gtVdB starts with the documented defaults. Per-key overrides are also
+# available as environment variables of the form GTV_PARAM_<KEY> (highest
+# precedence), e.g. GTV_PARAM_CUDA_MODE=FALSE.
+#
+# Units are binary: K=2^10, M=2^20, G=2^30, T=2^40 (a trailing B is ignored).
+# Fractions: MEMORY_TARGET=SYSTEM:0.5, MEMORY_OBJ_AREA=TARGET:0.5,
+# CUDA_VRAM=SYSTEM:0.8.
+# ---------------------------------------------------------------------------
+
+# Total host memory gtVdB may allocate. Default: half of system RAM.
+MEMORY_TARGET=16000M
+
+# Region reserved for resident-in-memory objects. Default: half of MEMORY_TARGET.
+MEMORY_OBJ_AREA=8000M
+
+# GPU acceleration: OFF | ON | AUTO (default AUTO: on when a device is present).
+CUDA_MODE=TRUE
+
+# Device memory budget when CUDA is enabled. Default: 80% of device VRAM.
+CUDA_VRAM=6000M
+
+# Which CUDA device ordinal to use (0 = first GPU).
+CUDA_DEVICE=0
+
+# Default query dialect: SQL | Q. (Q requires the matching domain extension.)
+DEFAULT_MODE=SQL
+
+# Logging verbosity: ERROR | WARN | INFO | DEBUG | TRACE.
+LOG_LEVEL=INFO
+
+# Spill-to-disk directory for large sorts/joins. Default: <tmp>/gtv-spill.
+# SPILL_DIR=/var/gtvdb/spill
+
+# Query parallelism. 0/AUTO = logical CPU count.
+# WORKER_THREADS=AUTO
+
+# Root data directory. Default: ./.gtvdb
+# DATA_DIR=./.gtvdb
+
+# Catalog directory. Default: DATA_DIR/catalog
+# CATALOG_DIR=./.gtvdb/catalog
+
+# Telemetry emission: ON | OFF.
+TELEMETRY=OFF

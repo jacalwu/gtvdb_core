@@ -1,0 +1,12 @@
+[package]
+name = "gtv-params"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Oracle-style parameter file for gtVdB: MEMORY_TARGET, CUDA_VRAM, DEFAULT_MODE, and deployment knobs."
+
+[dependencies]
+thiserror.workspace = true
+# Cross-platform physical RAM query for the MEMORY_TARGET default (half of it).
+# Builds and tests fine on the GPU-less CI; it only runs once at startup.
+sysinfo = "0.33"
