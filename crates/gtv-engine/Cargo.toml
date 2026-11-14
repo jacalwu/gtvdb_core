@@ -34,18 +34,10 @@ default = []
 # Enables gtv-array's `crm-lp` feature (pure-Rust microlp backend via good_lp)
 # and the `method = 'lp'` dispatch in crm_alloc / crm_audit.
 crm-lp = ["gtv-array/crm-lp"]
-# Device backend. Off by default: the default build has no CUDA code, no driver
-# calls and no device dependency in its binary.
-cuda = ["dep:gtv-accelerator-cuda"]
+# Hardware acceleration for exact K-NN and as-of joins. Off by default: the
+# host path is what GPU-less CI exercises, and it is the same path a deployment
+# falls back to when no device is present.
+cuda = ["gtv-accelerator/cuda"]
 # NOTE: no feature here may reference a crate under `gtv_ext_lib/`. An
 # extension's opt-in feature belongs on the extension crate itself (e.g.
 # `gtv-ext-quantum/qoqo`); the core must build with every extension absent.
-
-# Optional device backend. Nothing in this crate calls it yet (C1 is residency
-# plumbing); the dependency exists so `--features cuda` produces a binary that
-# *can* hold a device copy, and so the default build provably cannot. Declared
-# in its own section at the end of the file: a `[dependencies.x]` table swallows
-# every following bare key, which silently moved nine dependencies under it.
-[dependencies.gtv-accelerator-cuda]
-path = "../gtv-accelerator-cuda"
-optional = true

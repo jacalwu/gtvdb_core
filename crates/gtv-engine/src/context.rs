@@ -231,23 +231,43 @@ impl GtvContext {
         self.extensions.get::<T>()
     }
 
+    /// Resolve params, downgrading `CUDA_MODE=ON` to `OFF` when no CUDA device
+    /// is present (we cannot probe VRAM without a device), so the engine still
+    /// boots on GPU-less machines. Other errors (e.g. `obj_area > target`) are
+    /// surfaced to the caller.
+    fn resolve_params(
+        params: &GtvParams,
+    ) -> std::result::Result<ResolvedParams, gtv_params::ParamError> {
+        // Probe the device only when CUDA is actually requested, so a GPU-less
+        // host never pays for driver initialisation. With the `cuda` feature the
+        // total VRAM turns `CUDA_VRAM=DEVICE:0.8` into a real byte count; without
+        // it the probe reports `None`, which resolves CUDA to off.
+        let device_total = if params.cuda_mode == CudaMode::Off {
+            None
+        } else {
+            gtv_accelerator::device_total_bytes(params.cuda_device)
+        };
+        match params.resolve(device_total) {
+            Ok(r) => Ok(r),
+            Err(gtv_params::ParamError::CudaNoDevice) => {
+                let mut p = params.clone();
+                p.cuda_mode = CudaMode::Off;
+                p.resolve(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Build the engine around a parameter set: resolve it, then configure the
     /// DataFusion runtime (memory pool, partitions, spill) and the backend
     /// registry from the resolved values.
     fn build(params: &GtvParams) -> Self {
-        // Resolve symbolic defaults (half of system RAM, 80% of device VRAM) into
-        // concrete numbers. A resolution failure (e.g. CUDA_MODE=ON with no GPU)
-        // must not abort startup: degrade to CUDA off and keep the rest.
-        let device_total = crate::accelerator::cuda_device_total();
-        let resolved = match params.resolve(device_total) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("gtv: parameter resolution warning: {e}; continuing with CUDA disabled");
-                let mut safe = params.clone();
-                safe.cuda_mode = CudaMode::Off;
-                safe.resolve(None).expect("gtv: default resolution cannot fail")
-            }
-        };
+        let resolved = Self::resolve_params(params).unwrap_or_else(|e| {
+            eprintln!("gtv: parameter resolution warning: {e}; continuing with CUDA disabled");
+            let mut safe = params.clone();
+            safe.cuda_mode = CudaMode::Off;
+            safe.resolve(None).expect("gtv: default resolution cannot fail")
+        });
 
         // B3-5: EXPLAIN should surface the estimated statistics that the
         // `StatsTable` provider exposes (num_rows / min / max / null_count).
@@ -270,7 +290,7 @@ impl GtvContext {
         // MEMORY_TARGET bounds DataFusion's memory pool. Only enforce it when the
         // operator set it explicitly: the auto default (half of system RAM) stays
         // unenforced so small CI boxes and ad-hoc runs behave as before.
-        if params.memory_target.is_explicit() {
+        if resolved.memory_target_explicit {
             runtime_builder = runtime_builder.with_memory_pool(Arc::new(GreedyMemoryPool::new(
                 resolved.memory_target_bytes as usize,
             )));
@@ -280,6 +300,12 @@ impl GtvContext {
             .expect("gtv: build DataFusion runtime env");
         let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime));
 
+        // Device acceleration: budget carved from CUDA_VRAM, cache policy from
+        // ACCEL_CACHE / ACCEL_SYNC_* / ACCEL_HEAT_HALF_LIFE. Falls back to the
+        // host silently (the reason is kept in telemetry) so boot never depends
+        // on a GPU.
+        let accelerators = Arc::new(AcceleratorRegistry::from_resolved(&resolved));
+
         // -- core: temporal / columnar primitives --------------------------
         for udwf in crate::udf::window_udfs() {
             ctx.register_udwf(udwf);
@@ -288,10 +314,19 @@ impl GtvContext {
 
         // -- core: graph + vector ------------------------------------------
         let knn_collections = Arc::new(RwLock::new(HashMap::new()));
-        ctx.register_udtf("knn", Arc::new(KnnTableFunction::new(knn_collections.clone())));
+        ctx.register_udtf(
+            "knn",
+            Arc::new(KnnTableFunction::new(
+                knn_collections.clone(),
+                accelerators.clone(),
+            )),
+        );
         ctx.register_udtf(
             "vector_search",
-            Arc::new(KnnTableFunction::new(knn_collections.clone())),
+            Arc::new(KnnTableFunction::new(
+                knn_collections.clone(),
+                accelerators.clone(),
+            )),
         );
         let any_indexes: crate::ann::IndexRegistry = Arc::new(RwLock::new(HashMap::new()));
         ctx.register_udtf("ann", Arc::new(crate::ann::AnnTableFunction::new(any_indexes.clone())));
@@ -455,12 +490,6 @@ impl GtvContext {
             )),
         );
 
-        // -- backends, gated by the parameter file ---------------------------
-        // CUDA_MODE / CUDA_VRAM decide whether the device is opened and with what
-        // residency budget. The query path does not route here yet (C1-C3 add
-        // operators behind the trait), but this is where that wiring will attach.
-        let accelerators = Arc::new(crate::accelerator::registry_with(Some(&resolved)));
-
         Self {
             ctx,
             knn_collections,
@@ -509,9 +538,8 @@ impl GtvContext {
         &self.resolved
     }
 
-    /// The backend registry, built from `CUDA_MODE` / `CUDA_VRAM`. Not yet on the
-    /// query path, but available for tooling and the future routing integration.
-    pub fn accelerators(&self) -> &AcceleratorRegistry {
+    /// The device acceleration registry (KNN / as-of offload + telemetry).
+    pub fn accelerators(&self) -> &Arc<AcceleratorRegistry> {
         &self.accelerators
     }
 
@@ -1023,6 +1051,7 @@ impl GtvContext {
             Arc::new(crate::asof::AsofJoinTableFunction::new(
                 right_times,
                 right_values,
+                self.accelerators.clone(),
             )),
         );
     }
@@ -1041,6 +1070,7 @@ impl GtvContext {
             right_price.clone(),
             right_spread.clone(),
             tolerance_ns,
+            self.accelerators.clone(),
         ));
         self.ctx.register_udtf("asof_join", tf.clone());
         self.ctx.register_udtf("aj", tf);
@@ -1075,8 +1105,46 @@ impl GtvContext {
         labels: Option<Vec<String>>,
         metric: gtv_core::Metric,
     ) -> Result<()> {
-        let collection = KnnCollection::with_metric(ids, vectors, labels, metric)
+        let mut collection = KnnCollection::with_metric(ids, vectors, labels, metric)
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        // Fresh content version: registering under an existing name replaces the
+        // collection, and the device copy must follow.
+        collection.assign_version(self.accelerators.next_version());
+        self.knn_collections
+            .write()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution(
+                    "knn collection registry poisoned".into(),
+                )
+            })?
+            .insert(name.to_string(), collection);
+        Ok(())
+    }
+
+    /// Register an **IVF-backed** `knn` collection.
+    ///
+    /// `nlist` cells are trained on the corpus; each query probes `nprobe` of
+    /// them. This is the SQL entry point for the device IVF operator: the
+    /// cell-ordered corpus is uploaded once, and only the probe's position list
+    /// crosses PCIe per query. Distances remain exact `f32`.
+    pub fn register_knn_ivf(
+        &self,
+        name: &str,
+        ids: Vec<u64>,
+        vectors: Vec<Vec<f32>>,
+        labels: Option<Vec<String>>,
+        options: crate::knn::IvfOptions,
+    ) -> Result<()> {
+        let mut collection = KnnCollection::with_ivf(
+            ids,
+            vectors,
+            labels,
+            options.metric,
+            options.nlist,
+            options.nprobe,
+        )
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        collection.assign_version(self.accelerators.next_version());
         self.knn_collections
             .write()
             .map_err(|_| {

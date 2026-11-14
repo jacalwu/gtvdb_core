@@ -23,7 +23,7 @@ use arrow::array::BooleanArray;
 use gtv_core::{GtvError, Metric, Result, VectorHit, VectorIndex};
 
 use crate::bytes::{metric_code, metric_from_code, Reader, Writer};
-use crate::flat::{metric_distance, par_topk_over, FlatIndex};
+use crate::flat::{exact_topk_positions, metric_distance, CorpusView, FlatIndex};
 
 const IVF_MAGIC: &[u8; 8] = b"GIVFv1\0\0";
 const IVF_MAGIC_V2: &[u8; 8] = b"GIVFv2\0\0";
@@ -46,6 +46,33 @@ impl SplitMix64 {
     }
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// The rows an IVF query will actually scan.
+///
+/// This is the *contract* between query planning and execution, and the seam
+/// the device backend consumes. The host scan and the CUDA kernel are both
+/// handed this exact list, so equivalence does not depend on two independent
+/// implementations picking the same cells. `positions` is ascending (each
+/// probed cell contributes one contiguous run) and has already had the
+/// caller's filter applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbePlan {
+    /// Probed cell ids, nearest centroid first.
+    pub cells: Vec<u32>,
+    /// Corpus row positions to scan. Indices into `data` / `ids`.
+    pub positions: Vec<u32>,
+}
+
+impl ProbePlan {
+    /// Candidate rows a scan of this plan must visit.
+    pub fn rows(&self) -> usize {
+        self.positions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
     }
 }
 
@@ -506,6 +533,32 @@ impl IvfIndex {
         &self.ids
     }
 
+    /// Zero-copy access to the cell-ordered row-major corpus.
+    ///
+    /// Row `p` occupies `data[p * dim .. (p + 1) * dim]`; cell `l` occupies the
+    /// contiguous run `list_offsets[l]..list_offsets[l + 1]`. The CUDA backend
+    /// uploads this buffer once and keeps a column-major copy resident.
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// Original input position of each cell-ordered row (the filter-mask
+    /// domain). Kept so a device-side plan can be built with the same mask
+    /// semantics as [`crate::FlatIndex`].
+    pub fn orig_pos(&self) -> &[u32] {
+        &self.orig_pos
+    }
+
+    /// Cell boundaries; `nlist + 1` ascending offsets into `data` / `ids`.
+    pub fn list_offsets(&self) -> &[u32] {
+        &self.list_offsets
+    }
+
+    /// Whether the stored rows are unit-normalized (true exactly for cosine).
+    pub fn is_normalized(&self) -> bool {
+        self.metric.requires_normalization()
+    }
+
     /// Ids in the *original input / filter-mask* order (undo the cell
     /// reordering). The `BooleanArray` filter domain is the order of the ids
     /// passed to the constructor, matching [`crate::FlatIndex`].
@@ -790,33 +843,41 @@ impl IvfIndex {
         self.search_scored_probe(query, k, mask, self.nprobe)
     }
 
-    /// Exact `f32` top-K over the `probe` nearest cells (B3-3 uses
-    /// `probe = nlist` for the exact-scan strategy).
-    fn search_scored_probe(
+    /// Choose the `probe` nearest cells and the corpus rows they cover.
+    ///
+    /// This is the **single** selection routine for the host scan, the
+    /// `filtered_search` widening loop and the CUDA probe. `mask` is in the
+    /// original input order, so a row at cell-ordered position `p` is allowed
+    /// iff `mask[orig_pos[p]]` — the same domain `FlatIndex` uses.
+    ///
+    /// Centroid ranking is O(nlist × dim) on the host (2 MiB at
+    /// nlist=1024, dim=512), which is noise next to a probe scan. Keeping it
+    /// here is what makes the device's cell choice bit-for-bit identical.
+    pub fn probe_positions(
         &self,
         query: &[f32],
-        k: usize,
-        mask: Option<&BooleanArray>,
         probe: usize,
-    ) -> Vec<(f32, u64)> {
+        mask: Option<&BooleanArray>,
+    ) -> ProbePlan {
         #[cfg(target_arch = "x86_64")]
         let use_simd =
             std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
         #[cfg(not(target_arch = "x86_64"))]
         let use_simd = false;
 
-        let query = self.prepare_query(query);
-        let metric = self.metric;
-
-        // 1. Distance to every centroid, then keep the `nprobe` nearest.
         let nprobe = probe.min(self.nlist);
+        if nprobe == 0 || self.nlist == 0 {
+            return ProbePlan {
+                cells: Vec::new(),
+                positions: Vec::new(),
+            };
+        }
+
+        let q = self.prepare_query(query);
         let mut cd: Vec<(f32, u32)> = (0..self.nlist)
             .map(|c| {
                 let row = &self.centroids[c * self.dim..(c + 1) * self.dim];
-                (
-                    metric_distance(&query, row, metric, use_simd),
-                    c as u32,
-                )
+                (metric_distance(&q, row, self.metric, use_simd), c as u32)
             })
             .collect();
         cd.sort_by(|a, b| {
@@ -826,10 +887,9 @@ impl IvfIndex {
         });
         cd.truncate(nprobe);
 
-        // 2. Gather candidate vector indices from the probed cells (contiguous
-        //    runs), dropping any position the caller's bitmask excludes.
+        let cells: Vec<u32> = cd.into_iter().map(|(_, c)| c).collect();
         let mut positions: Vec<u32> = Vec::new();
-        for &(_, c) in &cd {
+        for &c in &cells {
             let lo = self.list_offsets[c as usize];
             let hi = self.list_offsets[c as usize + 1];
             match mask {
@@ -839,31 +899,31 @@ impl IvfIndex {
                 None => positions.extend(lo..hi),
             }
         }
+        ProbePlan { cells, positions }
+    }
 
-        // 3. Exact bounded top-K scan over the candidates (parallel, sequential
-        //    reads within each contiguous cell).
-        let data = &self.data;
-        let ids = &self.ids;
-        let dim = self.dim;
-        let n = ids.len();
-        par_topk_over(&positions, k, |pos| {
-            let i = pos as usize;
-            // IVF probes are *indirect* row reads (positions within probed lists):
-            // prefetch the next row so the 2 KB DRAM fetch overlaps the current
-            // row's distance computation (hardware prefetch cannot follow the
-            // non-contiguous list positions).
-            #[cfg(target_arch = "x86_64")]
-            if i + 1 < n {
-                unsafe {
-                    std::arch::x86_64::_mm_prefetch(
-                        data.as_ptr().add((i + 1) * dim) as *const _,
-                        std::arch::x86_64::_MM_HINT_T0,
-                    );
-                }
-            }
-            let row = &data[i * dim..(i + 1) * dim];
-            (metric_distance(&query, row, metric, use_simd), ids[i])
-        })
+    /// Exact `f32` top-K over the `probe` nearest cells (B3-3 uses
+    /// `probe = nlist` for the exact-scan strategy).
+    fn search_scored_probe(
+        &self,
+        query: &[f32],
+        k: usize,
+        mask: Option<&BooleanArray>,
+        probe: usize,
+    ) -> Vec<(f32, u64)> {
+        let plan = self.probe_positions(query, probe, mask);
+        exact_topk_positions(
+            CorpusView {
+                ids: &self.ids,
+                data: &self.data,
+                dim: self.dim,
+                metric: self.metric,
+                normalized: self.is_normalized(),
+            },
+            &plan.positions,
+            query,
+            k,
+        )
     }
 }
 
@@ -1478,6 +1538,81 @@ impl VectorIndex for IvfIndex {
 mod tests {
     use super::*;
     use crate::flat::FlatIndex;
+
+    #[test]
+    fn probe_plan_is_the_scan_the_index_actually_runs() {
+        let data: Vec<f32> = (0..24).map(|v| (v % 7) as f32 * 0.5).collect();
+        let ids: Vec<u64> = (0..12).collect();
+        let ivf = IvfIndex::new(ids, data, 2, 4, 2).unwrap();
+        let q = [1.0f32, 2.0];
+        let plan = ivf.probe_positions(&q, ivf.nprobe(), None);
+
+        assert_eq!(plan.cells.len(), 2);
+        assert!(plan.positions.windows(2).all(|w| w[0] < w[1]), "runs must be ascending");
+        assert_eq!(plan.rows(), ivf.probed_rows(&q));
+
+        // The host scan over the plan is exactly what VectorIndex::search does.
+        let via_plan = exact_topk_positions(
+            CorpusView {
+                ids: ivf.ids(),
+                data: ivf.data(),
+                dim: ivf.dim(),
+                metric: ivf.metric(),
+                normalized: ivf.is_normalized(),
+            },
+            &plan.positions,
+            &q,
+            3,
+        );
+        let via_index: Vec<(f32, u64)> = ivf
+            .search_scored_probe(&q, 3, None, ivf.nprobe())
+            .into_iter()
+            .collect();
+        assert_eq!(via_plan, via_index);
+    }
+
+    #[test]
+    fn probe_plan_applies_the_mask_in_original_input_order() {
+        let data = vec![0.0f32, 0.0, 1.0, 1.0, 5.0, 5.0, 9.0, 9.0];
+        let ids: Vec<u64> = (0..4).collect();
+        let ivf = IvfIndex::new(ids, data, 2, 4, 4).unwrap();
+        let q = [0.0f32, 0.0];
+        // Allow ids 1 and 3 only; the plan must look them up through orig_pos.
+        let mask = BooleanArray::from(vec![false, true, false, true]);
+        let plan = ivf.probe_positions(&q, 4, Some(&mask));
+        assert_eq!(plan.rows(), 2);
+        let got: Vec<u64> = plan
+            .positions
+            .iter()
+            .map(|&p| ivf.ids()[p as usize])
+            .collect();
+        assert_eq!(got, vec![1, 3]);
+    }
+
+    #[test]
+    fn full_probe_covers_every_row_and_out_of_range_is_ignored() {
+        let data = vec![0.0f32, 0.0, 1.0, 1.0, 2.0, 2.0];
+        let ids: Vec<u64> = (0..3).collect();
+        let ivf = IvfIndex::new(ids.clone(), data.clone(), 2, 3, 1).unwrap();
+        let plan = ivf.probe_positions(&[0.0, 0.0], ivf.nlist(), None);
+        assert_eq!(plan.cells.len(), 3);
+        assert_eq!(plan.positions, vec![0, 1, 2]);
+
+        let hits = exact_topk_positions(
+            CorpusView {
+                ids: &ids,
+                data: &data,
+                dim: 2,
+                metric: Metric::L2,
+                normalized: false,
+            },
+            &[1, 99],
+            &[0.0, 0.0],
+            5,
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, 1);
+    }
 
     #[test]
     fn ivf_recovers_nearest_on_small_corpus() {

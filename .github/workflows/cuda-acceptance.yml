@@ -1,0 +1,244 @@
+# CUDA acceptance gates (§6 of docs/acceleration.md).
+#
+# This is a *separate* workflow from ci.yml on purpose: ci.yml runs entirely on
+# ubuntu-latest and must stay green on GPU-less runners. Only this workflow
+# requires a device. Its test binary is `#![cfg(feature = "cuda")]`, so a plain
+# `cargo test --workspace` never even compiles the gates.
+#
+# SECURITY: a self-hosted runner executes repository code with local privileges
+# and direct access to the GPU/driver. Untrusted fork PRs are deliberately NOT
+# a trigger here (there is no `pull_request` event). Same-repo PRs can be
+# validated by dispatching this workflow manually against that ref.
+#
+# SETUP (one time, repository admin):
+#   Settings -> Secrets and variables -> Actions -> Variables -> New repository
+#   variable, name GPU_RUNNER_LABEL, value = JSON array of the GPU runner's
+#   labels, e.g.  ["self-hosted","linux","gpu"]
+#             or  ["self-hosted","Windows","X64","gpu"]
+#   The runner needs: NVIDIA driver + nvidia-smi, CUDA 13.x toolkit with
+#   NVRTC (libnvrtc.so / nvrtc64_130_0.dll), >= 5 GiB free VRAM and >= 6 GiB
+#   available host RAM for gate 2 (2 GiB host corpus + 4 GiB transient device).
+
+name: CUDA acceptance gates
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: >-
+          JSON array of runner labels; overrides the GPU_RUNNER_LABEL repo
+          variable, e.g. ["self-hosted","linux","gpu"].
+        required: false
+        type: string
+      min_speedup:
+        description: 'Gate 2 host-relative floor (CI default 1.0 = device must not be slower; §6 target 2.0)'
+        required: false
+        default: '1.0'
+        type: string
+      min_bandwidth:
+        description: 'Gate 2 minimum device effective bandwidth in GB/s (default 100)'
+        required: false
+        default: '100'
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - 'crates/gtv-accelerator/**'
+      - 'crates/gtv-index/src/flat.rs'
+      - 'crates/gtv-index/src/ivf.rs'
+      - 'crates/gtv-index/src/lib.rs'
+      - 'crates/gtv-index/Cargo.toml'
+      - 'crates/gtv-engine/src/knn.rs'
+      - 'crates/gtv-engine/src/temporal.rs'
+      - 'crates/gtv-engine/src/asof.rs'
+      - 'crates/gtv-engine/src/context.rs'
+      - 'crates/gtv-core/src/temporal.rs'
+      - 'crates/gtv-engine/Cargo.toml'
+      - 'crates/gtv-cli/Cargo.toml'
+      - 'crates/gtv-params/src/lib.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/cuda-acceptance.yml'
+  schedule:
+    # Nightly full run even when no CUDA file changed: catches driver / toolkit
+    # drift that a path-filtered push would miss.
+    - cron: '0 2 * * *'
+
+# A GPU runner is a scarce, single resource. Never run two gate suites at once.
+concurrency:
+  group: cuda-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # A wrong `runs-on` label does not fail — the job simply queues until the
+  # workflow times out, which is a miserable way to discover a typo. Validate
+  # the configuration on a cheap hosted runner first, in seconds.
+  precheck:
+    name: Runner label is configured
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require GPU_RUNNER_LABEL (or a dispatch override)
+        env:
+          RESOLVED_LABELS: ${{ vars.GPU_RUNNER_LABEL }}
+          DISPATCH_LABELS: ${{ inputs.runner_labels }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RESOLVED_LABELS" ] && [ -z "$DISPATCH_LABELS" ]; then
+            echo "::error::Set repository variable GPU_RUNNER_LABEL (Settings -> Secrets and variables -> Actions -> Variables) to a JSON array of your GPU runner's labels, e.g. [\"self-hosted\",\"linux\",\"gpu\"], or pass runner_labels when dispatching this workflow."
+            exit 1
+          fi
+          echo "OK: runner labels = ${DISPATCH_LABELS:-$RESOLVED_LABELS}"
+
+  acceptance:
+    needs: precheck
+    name: §6 gates on the GPU runner
+    # `vars` / `inputs` / `fromJSON` are all valid in runs-on. The dispatch
+    # input wins, then the repository variable, then a documented default.
+    runs-on: ${{ fromJSON(inputs.runner_labels || vars.GPU_RUNNER_LABEL || '["self-hosted","linux","gpu"]') }}
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      # Keep the same invocation as the local discipline; an empty RUSTFLAGS /
+      # RUSTC_WRAPPER neutralises any machine-level wrapper injection.
+      RUSTFLAGS: ''
+      RUSTC_WRAPPER: ''
+      CARGO_INCREMENTAL: '0'
+      # Hard-fail instead of SKIP if the device disappears. Without this, a
+      # dedicated GPU job would go green with the card unplugged.
+      GTV_CUDA_REQUIRE_DEVICE: '1'
+      # §6's 2x is a *reference-machine* acceptance target, not a portable CI
+      # gate: host memory bandwidth varies wildly across runners (this machine
+      # ~70 GB/s CPU vs ~138 GB/s GPU = ~2x; a fast-CPU runner could be <1x
+      # with a perfectly healthy kernel). CI therefore only requires the device
+      # path not to be *slower* than the host, and relies on the stable
+      # hardware-level bandwidth floor plus the warm/cold amortization ratio.
+      # Run locally (or dispatch with min_speedup=2.0) for the full §6 target.
+      GTV_GATE2_MIN_SPEEDUP: ${{ inputs.min_speedup || '1.0' }}
+      # 2 GB / 100 GB/s = 20 ms. The runtime-k register-spill defect measured
+      # 25.4 ms (~80 GB/s), so this floor catches the real regression that the
+      # relative ratio can mask. Override for a slower device.
+      GTV_GATE2_MIN_BANDWIDTH_GBS: ${{ inputs.min_bandwidth || '100' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Separate cache key: this job builds --release --features cuda, which is
+      # a different artifact set from the debug GPU-less jobs in ci.yml.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cuda-acceptance-release
+          cache-all-crates: true
+
+      - name: Runner configuration
+        shell: bash
+        env:
+          RESOLVED_LABELS: ${{ vars.GPU_RUNNER_LABEL }}
+          DISPATCH_LABELS: ${{ inputs.runner_labels }}
+        run: |
+          echo "event=${{ github.event_name }} os=$RUNNER_OS runner=${RUNNER_NAME:-unknown}"
+          echo "resolved labels: ${DISPATCH_LABELS:-$RESOLVED_LABELS}"
+
+      - name: Preflight - GPU, VRAM, CUDA runtime (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          nvidia-smi
+          gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)"
+          drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1)"
+          free="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -n1 | tr -d '[:space:]')"
+          echo "GPU=$gpu driver=$drv free=${free}MiB"
+          if [ -z "$free" ] || [ "$free" -lt 5120 ]; then
+            echo "::error::gate 2 needs >= 5120 MiB free VRAM (found '${free:-unknown}' MiB); stop other GPU workloads"
+            exit 1
+          fi
+
+          avail_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
+          echo "Host MemAvailable=$((avail_kb / 1024)) MiB"
+          if [ "$((avail_kb / 1024))" -lt 6144 ]; then
+            echo "::error::gate 2 builds a 2 GiB host corpus; need >= 6 GiB available RAM"
+            exit 1
+          fi
+
+          cuda_home="${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}"
+          echo "CUDA_HOME=$cuda_home"
+          ls -l "$cuda_home"/lib64/libnvrtc.so* 2>/dev/null || \
+            ls -l "$cuda_home"/lib/libnvrtc.so* 2>/dev/null || true
+          if ! ldconfig -p 2>/dev/null | grep -q 'libnvrtc'; then
+            echo "::warning::libnvrtc is not in the linker cache; adding the toolkit lib dir to LD_LIBRARY_PATH"
+          fi
+          if ! ldconfig -p 2>/dev/null | grep -q 'libcuda'; then
+            echo "::warning::libcuda is not in the linker cache; cudarc will try explicit library candidates"
+          fi
+          echo "CUDA_HOME=$cuda_home" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:$cuda_home/lib64:$cuda_home/lib" >> "$GITHUB_ENV"
+
+      - name: Preflight - GPU, VRAM, CUDA runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          nvidia-smi
+          $free = [int]((nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | Select-Object -First 1).Trim())
+          if ($free -lt 5120) { throw "gate 2 needs >= 5120 MiB free VRAM (found $free MiB)" }
+          $cuda = $env:CUDA_PATH
+          if (-not $cuda) { $cuda = $env:CUDA_HOME }
+          if (-not $cuda) { throw "CUDA_PATH / CUDA_HOME is not set on this runner" }
+          $bin = Join-Path $cuda 'bin\x64'
+          if (-not (Test-Path $bin)) { $bin = Join-Path $cuda 'bin' }
+          $nvrtc = @(Get-ChildItem -Path $bin -Filter 'nvrtc64_*.dll' -ErrorAction SilentlyContinue)
+          if ($nvrtc.Count -eq 0) { throw "NVRTC DLL not found under $bin" }
+          Write-Host "NVRTC: $($nvrtc.Name -join ', ')"
+          # cudarc uses dynamic-loading, so the CUDA bin dir must be on PATH.
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+
+      - name: Compile the gate suite (release, --features cuda)
+        shell: bash
+        run: |
+          cargo test -p gtv-accelerator --features cuda --release \
+            --test cuda_acceptance --test cuda_smoke --no-run
+
+      - name: Run §6 gates
+        id: gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p gtv-accelerator --features cuda --release \
+            --test cuda_acceptance --test cuda_smoke \
+            -- --nocapture --test-threads=1 2>&1 | tee cuda-acceptance.log
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          summary="$GITHUB_STEP_SUMMARY"
+          # Git Bash on Windows sees a Windows-style path; convert it.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            summary="$(cygpath -u "$GITHUB_STEP_SUMMARY")"
+          fi
+          {
+            echo "## CUDA acceptance gates (§6)"
+            echo ""
+            echo "| Gate | Result |"
+            echo "|---|---|"
+            if [ -f cuda-acceptance.log ]; then
+              # --nocapture prefixes the first output line of each test with
+              # `test <name> ... `, so anchoring on ^GATE would silently drop
+              # gates 1/3/4. Extract from the GATE token wherever it appears.
+              grep -oE 'GATE [0-9]+: PASS.*' cuda-acceptance.log \
+                | sed -E 's/^GATE ([0-9]+): (PASS.*)$/| \1 | \2 |/' || true
+            fi
+            echo ""
+            echo "Runner: \`$RUNNER_OS\` · event: \`${{ github.event_name }}\` · ref: \`$GITHUB_REF\`"
+          } >> "$summary"
+
+      - name: Upload gate log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cuda-acceptance.log
+          if-no-files-found: warn
+          retention-days: 14

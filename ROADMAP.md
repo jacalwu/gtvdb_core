@@ -42,6 +42,7 @@
 历史上有两套 `M` 编号，直接并列会误读，本路线图固定如下写法：
 
 - `M1–M6 / M11 / M13 / M14`：**平台早期里程碑**，§2.1 保留原名不改号。
+- 主仓 `jacalwu/gtvdb` 遗留的 `M13 / M14 / M15`（部署參數檔 / 裝置加速層 / IVF 卸載）与本仓 `M13 / M14`（两次拆仓）**编号冲突**，本路线图把它们记作 **M16 / M17 / M18**，正文引用原主仓文档（`docs/acceleration.md`、`docs/params-file.md`）时保留其原始编号并加此映射说明。
 - `M0 / M1 / M2 / M3`（见 `docs/minimal-temporal-update-impl.md`）：**过去更新系列**，下文记作 **U0–U3**。
 - `M6-a / M6-b`：**perf-first 系列**（沿用「做 M6」的叫法）；`-a` 已交付，`-b` 为冻结项。
 - `P0 / P1 / P2`：评审 §4 的**优先级**，不是里程碑编号；**P1-4** 是业主在 §3.3 盘点后批准追加的第四项（motif SQL 出口），不属于评审 §4 原本的三项。
@@ -62,6 +63,10 @@
 - [x] **M11 扩展机制**：`gtv_engine::ext::GtvExtension` + `ExtensionRegistry` + `gtv_extensions()`；领域工作负载移出核心仓
 - [x] **M13 核心仓拆分**：拆出独立的 `gtvdb_core`（干净历史、零扩展依赖、可独立 `cargo test --workspace`），并以 CI 守卫固定边界
 - [x] **M14 扩展仓拆分**：拆出独立的 `gtvdb_ext`（13 个扩展 crate + full-pack CLI/server），以固定 commit 的 git dependency 单向依赖本仓；两仓各有 CI
+- [x] **M16 部署參數檔**（原主仓 M13，`94bad94`）：Oracle `init.ora` 风格扁平档（`gtv-params` crate），控制 `MEMORY_TARGET`（默认系统一半）、`MEMORY_OBJ_AREA`（默认 target 一半）、`CUDA_MODE`/`CUDA_VRAM`/`CUDA_DEVICE`、`DEFAULT_MODE`、`LOG_LEVEL`、spill/worker/data/catalog/telemetry；`GTV_PARAM_<KEY>` 环境覆写与 `GTV_PARAMS_FILE` 发现；`GtvContext::with_params` 挂载内存池与 spill，CLI `.params` 指令。详 `docs/params-file.md`、样例 `gtvdb.params.example`
+- [x] **M17 装置加速层**（原主仓 M14）：`gtv-accelerator` crate（`VramBudget` 显存账本 + `ResidentRegistry` 常驻缓存 + `AccelBackend` 契约 + 主机回退）。两个算子落地：精确 KNN（连续语料 + 有界 `select_nth_unstable`）与 as-of join（`O(L+R)` 单调归并）。常驻缓存吸收 PG-Strom GPU Cache 设计但改写容量管理与查询期一致性；`ACCEL_CACHE=SHADOW` 可在无 GPU 机器上标定命中率。基准：KNN 5.85×、asof 5.28×（纯 CPU）。CUDA 后端（NVRTC 运行时编译）已在 RTX 4060 Laptop / CUDA 13.1 / compute_89 通过 §6 五条验收并接入 `cuda-acceptance.yml`。详 `docs/acceleration.md`
+- [x] **M18 IVF 卸载 + 显存压力治理**（原主仓 M15）：`gtv-index` 抽出 `ProbePlan` 与 `exact_topk_positions`，宿主/装置共用同一份 cell 选择；CUDA 融合 top-K kernel 增加可选位置间接层；引擎新增 `register_knn_ivf`。准入改为衰减热度 + 滞回 + 影子账本（`ACCEL_HEAT_HALF_LIFE`），显存预算改为弹性（只缩不胀）。新增第 6/7 条硬件验收，**7 条门槛全绿**。详 `docs/acceleration.md` §9
+  - ⚠️ **C1–C3（PTX 预编译路线）退役**：本仓原 `gtv-accelerator`（Sel 契约/C1 驻留）与 `gtv-accelerator-cuda`（C2 flat batch KNN、C3 rolling window、`xtask cuda-ptx`）已被 M17/M18 的 NVRTC 单 crate 路线**整体取代并删除**（代码存于拆分前历史 `1a0dbaa`）。C3 rolling window 门禁本就未过（端到端 1.03×，默认关闭）；M17 路线覆盖 C1/C2 全部交付且另有 7 条硬体验收。原 CUDA 规范文档（`docs/cuda-acceleration-plan.md`、`docs/gtvdb-cpu-cuda-cursor-development-spec.md`）保留作历史记录。
 
 ### 2.2 元数据与过去更新系列（上一版完全漏记）
 
@@ -188,6 +193,8 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 crates/                    # 平台（本仓全部内容）
 ├── gtv-core / gtv-array / gtv-index / gtv-index-store / gtv-storage / gtv-delta
 ├── gtv-pattern / gtv-catalog / gtv-ingest / gtv-udf / gtv-engine / gtv-proto
+├── gtv-params             # Oracle 风格部署参数档解析（纯 crate，无 GPU 依赖）(M16)
+├── gtv-accelerator        # 装置加速层：弹性显存账本 + 热度准入常驻缓存 + flat/IVF/as-of + 主机回退（CUDA 选用）(M17/M18)
 └── gtv-cli                # 精简 REPL，零扩展依赖（bin: gtv）
 ```
 

@@ -1,28 +1,26 @@
-//! Error and warning types for parameter parsing.
-
 use std::path::PathBuf;
 
-/// A fatal problem in a parameter file that prevents gtVdB from starting with a
-/// coherent configuration.
+/// Errors that abort parameter loading.
 ///
-/// Parse failures are fatal on purpose: a parameter file is the single source of
-/// truth for deployment behaviour, so a typo must stop the process rather than
-/// silently fall back to defaults that look right but are not what was written.
+/// Unknown keys and missing *optional* files are *warnings*, not errors (see
+/// [`crate::Warnings`]); these variants are the hard failures that should stop
+/// boot.
 #[derive(Debug, thiserror::Error)]
 pub enum ParamError {
-    #[error("parameter file not found: {0}")]
+    /// The parameters file named by `GTV_PARAMS_FILE` / a discovered path does
+    /// not exist.
+    #[error("parameters file not found: {0}")]
     FileNotFound(PathBuf),
 
-    #[error("could not read {path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    /// I/O error while reading a located parameters file.
+    #[error("io error reading {path}: {source}")]
+    Io { path: PathBuf, source: std::io::Error },
 
-    #[error("line {line}: {message}")]
+    /// A line could not be interpreted as `KEY=VALUE` / `KEY VALUE`.
+    #[error("parse error on line {line}: {message}")]
     Parse { line: usize, message: String },
 
+    /// A recognized key had a value that could not be parsed / validated.
     #[error("invalid value for {key}: `{value}` ({reason})")]
     InvalidValue {
         key: String,
@@ -30,34 +28,45 @@ pub enum ParamError {
         reason: String,
     },
 
-    #[error("CUDA_MODE=ON but no CUDA device is available; set CUDA_MODE=FALSE or run on a machine with a GPU")]
+    /// `CUDA_MODE=ON` was requested but no CUDA device is available.
+    #[error("CUDA_MODE=ON but no CUDA device is available (set CUDA_MODE=AUTO or OFF)")]
     CudaNoDevice,
 
-    #[error(
-        "CUDA_VRAM is a fraction but the device VRAM is unknown (no device); set CUDA_VRAM to an explicit size"
-    )]
+    /// `CUDA_VRAM` could not be resolved because no device total was supplied.
+    #[error("CUDA_VRAM could not be resolved (no device total available)")]
     CudaVramUnknown,
 
-    #[error("MEMORY_OBJ_AREA ({area} B) exceeds MEMORY_TARGET ({target} B)")]
+    /// `MEMORY_OBJ_AREA` is larger than `MEMORY_TARGET`.
+    #[error(
+        "MEMORY_OBJ_AREA ({area} MiB) exceeds MEMORY_TARGET ({target} MiB)"
+    )]
     ObjAreaExceedsTarget { area: u64, target: u64 },
 }
 
-/// A non-fatal observation while loading parameters.
+/// A non-fatal issue encountered while loading parameters.
 ///
-/// Unknown keys and unreadable-but-optional files produce warnings, not errors,
-/// so an operator can extend the file over time without breaking older builds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Unknown keys and a missing-but-optional file produce warnings so that a
+/// slightly-off config still boots instead of crashing.
+#[derive(Debug, Clone)]
 pub struct Warning {
-    pub line: usize,
-    pub key: String,
+    /// Source line number, when the warning came from a file.
+    pub line: Option<usize>,
+    /// The parameter key involved, when known.
+    pub key: Option<String>,
+    /// Human-readable explanation.
     pub message: String,
 }
 
 impl std::fmt::Display for Warning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "params: line {}: [{}] {}", self.line, self.key, self.message)
+        match (self.line, &self.key) {
+            (Some(l), Some(k)) => write!(f, "line {}: key `{}`: {}", l, k, self.message),
+            (Some(l), None) => write!(f, "line {}: {}", l, self.message),
+            (None, Some(k)) => write!(f, "key `{}`: {}", k, self.message),
+            (None, None) => write!(f, "{}", self.message),
+        }
     }
 }
 
-/// Convenience alias used by [`crate::GtvParams::load`].
+/// Collection of non-fatal warnings produced during a load.
 pub type Warnings = Vec<Warning>;

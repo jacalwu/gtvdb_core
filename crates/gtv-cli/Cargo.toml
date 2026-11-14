@@ -8,6 +8,12 @@ license.workspace = true
 name = "gtv"
 path = "src/main.rs"
 
+[features]
+default = []
+# Device acceleration for the engine's KNN / as-of operators. Off by default;
+# the host path is what GPU-less CI exercises.
+cuda = ["gtv-engine/cuda"]
+
 [dependencies]
 gtv-core = { path = "../gtv-core" }
 gtv-engine = { path = "../gtv-engine" }

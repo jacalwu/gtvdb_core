@@ -912,6 +912,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7359bf1de037ddada72729c3acec9b040f3468400c6e9e740b01ba0cd2e89562"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "dashmap"
 version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1915,20 +1924,11 @@ name = "gtv-accelerator"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "gtv-array",
+ "cudarc",
  "gtv-core",
  "gtv-index",
+ "gtv-params",
  "thiserror",
-]
-
-[[package]]
-name = "gtv-accelerator-cuda"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "gtv-accelerator",
- "gtv-core",
- "libc",
 ]
 
 [[package]]
@@ -1997,7 +1997,6 @@ dependencies = [
  "chrono",
  "datafusion",
  "gtv-accelerator",
- "gtv-accelerator-cuda",
  "gtv-array",
  "gtv-catalog",
  "gtv-core",
@@ -2570,6 +2569,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "liblzma"
@@ -4750,13 +4759,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "xtask"
-version = "0.1.0"
-dependencies = [
- "blake3",
-]
 
 [[package]]
 name = "yoke"

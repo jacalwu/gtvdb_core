@@ -1,49 +1,95 @@
-# ---------------------------------------------------------------------------
-# gtVdB parameter file (Oracle-style, all-uppercase keys)
+# =============================================================================
+# gtVdB parameters file  (Oracle-style: flat KEY=VALUE, all-uppercase keys)
+# -----------------------------------------------------------------------------
+# Copy this to one of the locations below and edit as needed:
+#   * $GTV_PARAMS_FILE            (explicit path, highest precedence)
+#   * ./gtvdb.params              (current working directory)
+#   * <exe-dir>/gtvdb.params      (next to the gtv binary)
+#   * /etc/gtvdb/gtvdb.params     (Unix) | C:\ProgramData\gtvdb\gtvdb.params (Win)
 #
-# Copy this to `gtvdb.params` in the working directory (or set GTV_PARAMS_FILE
-# to point elsewhere). Every key has a default, so an absent file is not an
-# error: gtVdB starts with the documented defaults. Per-key overrides are also
-# available as environment variables of the form GTV_PARAM_<KEY> (highest
-# precedence), e.g. GTV_PARAM_CUDA_MODE=FALSE.
+# Syntax
+#   * # and -- start a comment; blank lines are ignored.
+#   * KEY=VALUE or KEY VALUE (whitespace also accepted).
+#   * Keys are case-insensitive; values are not.
+#   * Sizes accept binary suffixes K/M/G/T (optional trailing B): 16000M = 16000 MiB.
+#   * Fractions: SYSTEM:0.5 = half of system RAM; TARGET:0.5 = half of
+#     MEMORY_TARGET; DEVICE:0.8 = 80% of the CUDA device VRAM.
+#   * Keywords AUTO / SYSTEM / ON / OFF / TRUE / FALSE accepted where sensible.
 #
-# Units are binary: K=2^10, M=2^20, G=2^30, T=2^40 (a trailing B is ignored).
-# Fractions: MEMORY_TARGET=SYSTEM:0.5, MEMORY_OBJ_AREA=TARGET:0.5,
-# CUDA_VRAM=SYSTEM:0.8.
-# ---------------------------------------------------------------------------
+# Environment overrides (highest priority) use GTV_PARAM_<KEY>, e.g.
+#   export GTV_PARAM_MEMORY_TARGET=32000M
+# Other long-standing env knobs are still honoured: GTV_SPILL_DIR,
+# GTV_TARGET_PARTITIONS, GTV_BATCH_SIZE.
+# =============================================================================
 
-# Total host memory gtVdB may allocate. Default: half of system RAM.
-MEMORY_TARGET=16000M
+# --- Memory -----------------------------------------------------------------
+# Total memory gtVdB may allocate. Default: half of system physical RAM.
+# Set explicitly to cap the DataFusion memory pool (only mounted when explicit).
+MEMORY_TARGET=SYSTEM:0.5
 
-# Region reserved for resident-in-memory objects. Default: half of MEMORY_TARGET.
-MEMORY_OBJ_AREA=8000M
+# Resident-in-memory object area (objects kept hot). Default: half of
+# MEMORY_TARGET. Must not exceed MEMORY_TARGET.
+MEMORY_OBJ_AREA=TARGET:0.5
 
-# GPU acceleration: OFF | ON | AUTO (default AUTO: on when a device is present).
-CUDA_MODE=TRUE
+# --- CUDA / GPU -------------------------------------------------------------
+# OFF  = never use the GPU.
+# AUTO = use the GPU only when a device is detectable (default).
+# ON   = require a device; gtVdB fails to start if none is present.
+CUDA_MODE=AUTO
 
-# Device memory budget when CUDA is enabled. Default: 80% of device VRAM.
-CUDA_VRAM=6000M
+# VRAM budget gtVdB may use. Default: 80% of device VRAM (DEVICE:0.8).
+# Use a concrete size (e.g. 6000M) to pin it.
+CUDA_VRAM=DEVICE:0.8
 
-# Which CUDA device ordinal to use (0 = first GPU).
+# Device ordinal when multiple GPUs are present.
 CUDA_DEVICE=0
 
-# Default query dialect: SQL | Q. (Q requires the matching domain extension.)
+# --- Device cache (the GPU-resident working set) ----------------------------
+# What happens to a corpus / right-side series once it is uploaded:
+#   OFF    = never keep a device copy; every operation runs on the host.
+#   SHADOW = run on the host, but keep the residency ledger and hit/miss
+#            accounting as if the cache were live. Use this to size VRAM before
+#            buying a GPU: `.accel` reports the hit ratio and the upload bytes a
+#            device would have saved.
+#   ON     = keep the device copy and run there when it fits (default).
+# Accommodating an oversized dataset is never fatal: it is declined and that one
+# operation runs on the host, while everything else keeps its device copy.
+ACCEL_CACHE=ON
+
+# Pending host->device delta that triggers one batched upload. Default: 25% of
+# CUDA_VRAM. Until then, queries read the resident prefix from the device and the
+# un-synced tail from the host, so an append never stalls or invalidates a query.
+# Accepts AUTO (the 25% default) or a concrete size:
+# ACCEL_SYNC_THRESHOLD=512M
+
+# Seconds after the last upload at which pending delta is applied even if the
+# byte threshold was not reached. 0 = apply on every batch boundary.
+ACCEL_SYNC_INTERVAL=5
+
+# Half-life (seconds) of a resident block's access heat. Heat = decayed
+# frequency, used for admission and eviction: a proven-hot corpus is not
+# displaced by a one-shot scan, and a declined corpus can still earn its way
+# back in after a few queries. 0 disables heat and restores pure LRU.
+ACCEL_HEAT_HALF_LIFE=30
+
+# --- Query dialect ----------------------------------------------------------
+# SQL = standard DataFusion SQL (default). Q = native q dialect (needs the
+# quantum/q extension; falls back to SQL with a warning if unavailable).
 DEFAULT_MODE=SQL
 
-# Logging verbosity: ERROR | WARN | INFO | DEBUG | TRACE.
+# --- Runtime / deployment tuning -------------------------------------------
+# Log verbosity: ERROR | WARN | INFO | DEBUG | TRACE. Surfaces via RUST_LOG.
 LOG_LEVEL=INFO
 
-# Spill-to-disk directory for large sorts/joins. Default: <tmp>/gtv-spill.
-# SPILL_DIR=/var/gtvdb/spill
+# Spill directory for large sorts/joins. GTV_SPILL_DIR env wins if set.
+# SPILL_DIR=/var/lib/gtv/spill
 
-# Query parallelism. 0/AUTO = logical CPU count.
+# Worker thread count (parallelism). AUTO => GTV_TARGET_PARTITIONS or CPU count.
 # WORKER_THREADS=AUTO
 
-# Root data directory. Default: ./.gtvdb
-# DATA_DIR=./.gtvdb
+# Directories used by deployment layouts (read by tooling; see docs).
+# DATA_DIR=./data
+# CATALOG_DIR=./catalog
 
-# Catalog directory. Default: DATA_DIR/catalog
-# CATALOG_DIR=./.gtvdb/catalog
-
-# Telemetry emission: ON | OFF.
-TELEMETRY=OFF
+# Optional telemetry toggle.
+TELEMETRY=FALSE

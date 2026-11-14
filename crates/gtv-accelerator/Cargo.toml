@@ -4,9 +4,28 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Hardware backend. Off by default so GPU-less CI links and tests the exact same
+# code path production uses (the host backend), and an operator opts in per
+# deployment — mirroring `CUDA_MODE=ON` rather than `AUTO`.
+cuda = ["dep:cudarc"]
+
 [dependencies]
 arrow.workspace = true
 thiserror.workspace = true
 gtv-core = { path = "../gtv-core" }
-gtv-array = { path = "../gtv-array" }
 gtv-index = { path = "../gtv-index" }
+gtv-params = { path = "../gtv-params" }
+
+# Optional, only with `--features cuda`. `dynamic-loading` keeps the build
+# linkable on machines without libcuda and turns a missing driver into a
+# runtime `probe()` failure instead of a link error — the same reason
+# gtv-cli's example uses it.
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-13000",
+] }

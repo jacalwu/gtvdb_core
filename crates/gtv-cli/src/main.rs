@@ -32,6 +32,8 @@ Core commands
   .parquet   <name> <path>  register a Parquet file / directory as <name>
   .params                 show the effective parameter file (MEMORY_TARGET, CUDA_*,
                           DEFAULT_MODE, …)
+  .accel                  show device acceleration: VRAM budget, resident cache,
+                          hit ratio, fallbacks
 
 Everything else is executed as SQL, for example:
   SELECT * FROM gtv_segments();
@@ -55,6 +57,7 @@ enum Command {
     Csv { name: String, path: String },
     Parquet { name: String, path: String },
     Params,
+    Accel,
     Sql(String),
 }
 
@@ -79,9 +82,12 @@ fn parse(line: &str) -> Result<Command> {
     let Some(rest) = line.strip_prefix('.') else {
         return Ok(Command::Sql(line.to_string()));
     };
-    // `.params` takes no arguments; handle before splitting.
+    // `.params` / `.accel` take no arguments; handle before splitting.
     if rest.trim().eq_ignore_ascii_case("params") {
         return Ok(Command::Params);
+    }
+    if rest.trim().eq_ignore_ascii_case("accel") {
+        return Ok(Command::Accel);
     }
     let mut words = rest.split_whitespace();
     let head = words.next().unwrap_or_default().to_ascii_lowercase();
@@ -147,6 +153,101 @@ async fn show(ctx: &GtvContext, query: &str) -> Result<()> {
     Ok(())
 }
 
+/// Print the accelerator ledger: device, budget, resident blocks, fallbacks.
+///
+/// `ACCEL_CACHE=SHADOW` is the useful case here — the same counters are
+/// maintained without a device, so the hit ratio and the upload bytes a GPU
+/// would have avoided are visible before any hardware is bought.
+fn print_accel(ctx: &GtvContext) {
+    let t = ctx.accelerators().telemetry();
+    let mib = |b: u64| format!("{} MiB", b / (1024 * 1024));
+    let used_pct = if t.resident.capacity_bytes == 0 {
+        0.0
+    } else {
+        t.resident.resident_bytes as f64 / t.resident.capacity_bytes as f64 * 100.0
+    };
+    println!("  ACCEL_CACHE      = {}", t.mode.as_str());
+    println!(
+        "  DEVICE           = {} ({})",
+        t.device.name,
+        t.device.kind.as_str()
+    );
+    println!("  VRAM_TOTAL       = {}", mib(t.device.total_bytes));
+    println!(
+        "  BUDGET           = {} / {} ({used_pct:.1}% used)",
+        mib(t.resident.resident_bytes),
+        mib(t.resident.capacity_bytes)
+    );
+    println!(
+        "  REQUESTS         = {} ({} device, {} host, {} fallback, {} cache-declined)",
+        t.requests,
+        t.executed_on_device,
+        t.executed_on_host,
+        t.fallbacks,
+        t.cache_declined
+    );
+    println!(
+        "  RESIDENT         = {} blocks, hit ratio {:.1}% ({} hits / {} misses)",
+        t.resident.blocks,
+        t.resident.hit_ratio() * 100.0,
+        t.resident.hits,
+        t.resident.misses
+    );
+    println!(
+        "  UPLOADS          = {} ({} transferred)",
+        t.resident.uploads,
+        mib(t.resident.upload_bytes)
+    );
+    println!(
+        "  EVICTIONS        = {} ({})",
+        t.resident.evictions,
+        mib(t.resident.evicted_bytes)
+    );
+    println!(
+        "  DEVICE_FREE      = {} (live probe; clamped {} times)",
+        if t.resident.device_free_bytes == 0 {
+            "n/a".to_string()
+        } else {
+            mib(t.resident.device_free_bytes)
+        },
+        t.resident.elastic_clamps
+    );
+    println!(
+        "  HEAT             = hottest {:.2} | {} heat-deferred | {} promoted | {} cold-tier candidates",
+        t.resident.hottest_milli as f64 / 1000.0,
+        t.resident.heat_deferred,
+        t.resident.promotions,
+        t.resident.shadow_blocks
+    );
+    println!(
+        "  PENDING          = {} rows / {}",
+        t.resident.pending_rows,
+        mib(t.resident.pending_bytes)
+    );
+    if let Some(err) = &t.last_error {
+        println!("  LAST_ERROR       = {err}");
+    }
+    let blocks = ctx.accelerators().blocks();
+    if blocks.is_empty() {
+        println!("  blocks           : (none resident)");
+    } else {
+        println!("  blocks:");
+        for b in blocks {
+            println!(
+                "    {:<7} {:<18} {:>10}  rows {}/{}  hits {}  misses {}  heat {:.2}",
+                b.kind.as_str(),
+                b.name,
+                mib(b.bytes),
+                b.resident_rows,
+                b.rows,
+                b.hits,
+                b.misses,
+                b.heat_milli as f64 / 1000.0
+            );
+        }
+    }
+}
+
 /// Run one command. Returns `false` when the shell should exit.
 async fn run(ctx: &GtvContext, cmd: Command) -> Result<bool> {
     match cmd {
@@ -171,6 +272,7 @@ async fn run(ctx: &GtvContext, cmd: Command) -> Result<bool> {
                 println!("  {line}");
             }
         }
+        Command::Accel => print_accel(ctx),
         Command::Segment { name, path } => {
             ctx.register_segment(&path, &name)?;
             println!("mmap'd GTVSeg `{path}` as `{name}` — no decode, no copy");

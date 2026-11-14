@@ -185,16 +185,6 @@ impl FlatIndex {
         Self::from_flat_metric(ids, data, dim, metric)
     }
 
-    /// Normalize the query when the metric requires it.
-    fn prepare_query<'a>(&self, query: &'a [f32]) -> Cow<'a, [f32]> {
-        if self.normalized {
-            let mut q = query.to_vec();
-            self.metric.normalize_in_place(&mut q);
-            Cow::Owned(q)
-        } else {
-            Cow::Borrowed(query)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +483,163 @@ pub(crate) fn par_topk_over(
     topk
 }
 
+// ---------------------------------------------------------------------------
+// Public zero-copy scan entry point
+// ---------------------------------------------------------------------------
+
+/// A borrowed, contiguous row-major corpus to scan.
+///
+/// The point of the type is that it carries no ownership: the accelerator host
+/// backend and the CUDA upload path both operate on the caller's buffer, so a
+/// query never copies the corpus to scan it.
+#[derive(Debug, Clone, Copy)]
+pub struct CorpusView<'a> {
+    pub ids: &'a [u64],
+    /// Row-major: row `i` occupies `data[i * dim .. (i + 1) * dim]`.
+    pub data: &'a [f32],
+    pub dim: usize,
+    pub metric: Metric,
+    /// Whether rows are already unit-length. When true the query is normalized
+    /// too, so cosine reduces to `1 - dot`. This is the invariant
+    /// [`FlatIndex`] establishes at build time; claiming it for a corpus that
+    /// was not normalized will mis-rank cosine queries.
+    pub normalized: bool,
+}
+
+impl CorpusView<'_> {
+    /// `true` when the buffer shapes agree (`data.len() == ids.len() * dim`).
+    pub fn is_consistent(&self) -> bool {
+        self.dim > 0 && self.data.len() == self.ids.len() * self.dim
+    }
+
+    /// Rows in the corpus.
+    pub fn rows(&self) -> usize {
+        self.ids.len()
+    }
+}
+
+/// Bounded exact top-K scan over a borrowed contiguous corpus.
+///
+/// Ranking is a per-thread bounded candidate buffer flushed with
+/// `select_nth_unstable_by`, so the `N × (f32, u64)` score vector never reaches
+/// DRAM — only `threads × k` candidates are merged at the end.
+///
+/// Returns `(distance, id)` nearest-first, ties broken by ascending id. An
+/// inconsistent corpus (empty, `dim == 0`, query/corpus mismatch) yields an empty
+/// result rather than panicking, so a caller can treat "no candidates" uniformly.
+pub fn exact_topk(
+    corpus: CorpusView<'_>,
+    query: &[f32],
+    k: usize,
+    filter_mask: Option<&BooleanArray>,
+) -> Vec<(f32, u64)> {
+    let n = corpus.rows();
+    if k == 0 || n == 0 || !corpus.is_consistent() || query.len() != corpus.dim {
+        return Vec::new();
+    }
+    if let Some(mask) = filter_mask {
+        if mask.len() != n {
+            return Vec::new();
+        }
+    }
+
+    let CorpusView {
+        ids,
+        data,
+        dim,
+        metric,
+        normalized,
+    } = corpus;
+    let query = prepared_query(query, metric, normalized);
+    let use_simd = simd_available();
+
+    par_topk(n, k, filter_mask, |i| {
+        // Manual prefetch of the row `PREFETCH_DIST` ahead: the exact KNN scan
+        // streams a large (possibly >L3) contiguous corpus, so software
+        // prefetch lets the load pipeline overlap the DRAM round-trip instead
+        // of waiting on the hardware prefetcher's tail latency.
+        #[cfg(target_arch = "x86_64")]
+        const PREFETCH_DIST: usize = 8;
+        #[cfg(target_arch = "x86_64")]
+        if i + PREFETCH_DIST < n {
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    data.as_ptr().add((i + PREFETCH_DIST) * dim) as *const _,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+        }
+        let row = &data[i * dim..(i + 1) * dim];
+        (metric_distance(&query, row, metric, use_simd), ids[i])
+    })
+}
+
+/// Bounded exact top-K over an explicit *subset* of rows in `corpus`.
+///
+/// `positions` are row indices into `corpus`, ascending and unique, with any
+/// filtering already applied by the caller. This is the scan an IVF probe runs
+/// once it has chosen its cells, and it is deliberately the same code as
+/// [`exact_topk`]: the accelerator's host and device IVF paths both consume a
+/// position list produced by `IvfIndex::probe_positions`, so "the device agrees
+/// with the host" is a property of one selection routine rather than two that
+/// happen to match.
+///
+/// Out-of-range positions are ignored rather than trusted: a plan that
+/// disagrees with the corpus shape yields a smaller result, never a panic.
+pub fn exact_topk_positions(
+    corpus: CorpusView<'_>,
+    positions: &[u32],
+    query: &[f32],
+    k: usize,
+) -> Vec<(f32, u64)> {
+    let n = corpus.rows();
+    if k == 0 || positions.is_empty() || !corpus.is_consistent() || query.len() != corpus.dim {
+        return Vec::new();
+    }
+
+    let CorpusView {
+        ids,
+        data,
+        dim,
+        metric,
+        normalized,
+    } = corpus;
+    let query = prepared_query(query, metric, normalized);
+    let use_simd = simd_available();
+
+    let mut kept: Vec<u32> = Vec::with_capacity(positions.len());
+    kept.extend(positions.iter().copied().filter(|&p| (p as usize) < n));
+
+    par_topk_over(&kept, k, |pos| {
+        let i = pos as usize;
+        // Probed cells are contiguous runs, so the *next* position is usually
+        // `i + 1` and the prefetch follows the stream; only a cell boundary
+        // jumps. Hardware prefetch cannot cross that jump, hence the manual hint.
+        #[cfg(target_arch = "x86_64")]
+        if i + 1 < n {
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    data.as_ptr().add((i + 1) * dim) as *const _,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+        }
+        let row = &data[i * dim..(i + 1) * dim];
+        (metric_distance(&query, row, metric, use_simd), ids[i])
+    })
+}
+
+/// Normalize the query when the metric requires it.
+fn prepared_query<'a>(query: &'a [f32], metric: Metric, normalized: bool) -> Cow<'a, [f32]> {
+    if normalized {
+        let mut q = query.to_vec();
+        metric.normalize_in_place(&mut q);
+        Cow::Owned(q)
+    } else {
+        Cow::Borrowed(query)
+    }
+}
+
 impl VectorIndex for FlatIndex {
     fn metric(&self) -> Metric {
         self.metric
@@ -525,33 +672,18 @@ impl VectorIndex for FlatIndex {
             return Ok(Vec::new());
         }
 
-        let query = self.prepare_query(query);
-        let n = self.ids.len();
-        let dim = self.dim;
-        let data = &self.data;
-        let ids = &self.ids;
-        let metric = self.metric;
-        let use_simd = simd_available();
-
-        let scored = par_topk(n, k, filter_mask, |i| {
-            // Manual prefetch of the row `PREFETCH_DIST` ahead: the exact KNN scan
-            // streams a large (possibly >L3) contiguous corpus, so software
-            // prefetch lets the load pipeline overlap the DRAM round-trip instead
-            // of waiting on the hardware prefetcher's tail latency.
-            #[cfg(target_arch = "x86_64")]
-            const PREFETCH_DIST: usize = 8;
-            #[cfg(target_arch = "x86_64")]
-            if i + PREFETCH_DIST < n {
-                unsafe {
-                    std::arch::x86_64::_mm_prefetch(
-                        data.as_ptr().add((i + PREFETCH_DIST) * dim) as *const _,
-                        std::arch::x86_64::_MM_HINT_T0,
-                    );
-                }
-            }
-            let row = &data[i * dim..(i + 1) * dim];
-            (metric_distance(&query, row, metric, use_simd), ids[i])
-        });
+        let scored = exact_topk(
+            CorpusView {
+                ids: &self.ids,
+                data: &self.data,
+                dim: self.dim,
+                metric: self.metric,
+                normalized: self.normalized,
+            },
+            query,
+            k,
+            filter_mask,
+        );
 
         Ok(scored
             .into_iter()

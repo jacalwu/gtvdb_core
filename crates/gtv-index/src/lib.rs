@@ -17,10 +17,10 @@ pub use ann::{
     allowed_count, estimate_recall, execute_ann, plan_ann, recall_curve, AnnConfig, AnnPlan,
     AnnStrategy, AnnTelemetry, LatencyBreakdown, RerankResult, RerankedHit,
 };
-pub use flat::FlatIndex;
+pub use flat::{exact_topk, exact_topk_positions, CorpusView, FlatIndex};
 pub use hnsw::HnswIndex;
 pub use index::{AnyIndex, BuildOptions, IndexType, PersistableIndex};
 pub use ivf::{
     kmeans_train, select_tuned, tune_ivf, tune_ivf_curve, CellStats, IvfIndex, IvfTrainingMeta,
-    KMeansConfig, RetrainTrigger, TuneConfig, TuneResult,
+    KMeansConfig, ProbePlan, RetrainTrigger, TuneConfig, TuneResult,
 };

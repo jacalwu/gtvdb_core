@@ -50,8 +50,7 @@ crates/
 ├── gtv-array       向量化列运算（asof / mavg / msum）
 ├── gtv-index       ANN：Flat / IVF / HNSW，统一 Metric 契约
 ├── gtv-index-store .gtvidx 索引持久化
-├── gtv-accelerator 后端契约：Sel 候选集、CPU reference、驻留缓存 + 失效、回落策略（默认构建零 CUDA 依赖）
-├── gtv-accelerator-cuda CUDA 后端：运行期加载驱动、真实设备驻留（C1 无 kernel；仅 `--features cuda` 编译）
+├── gtv-accelerator 装置加速层：弹性显存账本 + 热度准入常驻缓存 + 精确 KNN / as-of / IVF 卸载 + 主机回退（NVRTC 运行时编译 CUDA，`--features cuda` 选用）
 ├── gtv-storage     GTVSeg v1 段格式、WAL、MemSegment、SegmentStore、Parquet、SnapshotStore
 ├── gtv-delta       LSM delta + compaction
 ├── gtv-pattern     时序图 pattern matching

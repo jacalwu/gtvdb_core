@@ -60,7 +60,7 @@ jobs:
           fail=0
           for pkg in gtv-core gtv-array gtv-index gtv-index-store gtv-storage \
                      gtv-catalog gtv-pattern gtv-ingest gtv-udf gtv-proto gtv-delta \
-                     gtv-engine gtv-cli; do
+                     gtv-params gtv-accelerator gtv-engine gtv-cli; do
             deps=$(cargo tree -p "$pkg" --edges normal --prefix none | awk '{print $1}' | sort -u)
             if echo "$deps" | grep -Eq "$bad_re"; then
               echo "::error::$pkg depends on an extension crate"
@@ -93,6 +93,10 @@ jobs:
         run: cargo test -p gtv-core
       - name: Vector index
         run: cargo test -p gtv-index
+      - name: Parameter file (M16)
+        run: cargo test -p gtv-params
+      - name: Device acceleration host paths (M17/M18)
+        run: cargo test -p gtv-accelerator
       - name: Temporal pattern matching
         run: cargo test -p gtv-pattern
       - name: Temporal + state-graph SQL surface
