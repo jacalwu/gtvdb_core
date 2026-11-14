@@ -15,13 +15,13 @@ pub mod manifest;
 pub mod store;
 pub mod vector_segment_io;
 
-pub use container::{decode, encode, CONTAINER_MAGIC, CONTAINER_VERSION};
+pub use container::{decode, encode, split_container_header, CONTAINER_MAGIC, CONTAINER_VERSION};
 pub use embedding::{build_and_save, build_index_from_embeddings, EmbeddingIndexError, EmbeddingIndexSpec};
 pub use manifest::IndexManifest;
 pub use store::{IndexMeta, IndexStore, IndexVersion, LoadedIndex};
 pub use vector_segment_io::{
-    corpus_file_name, corpus_path, open_vector_segment_at, verify_vector_segment,
-    write_vector_segment,
+    container_payload_is_gtvvec, corpus_file_name, corpus_path, open_vector_segment_at,
+    open_vector_segment_from_container, verify_vector_segment, write_vector_segment,
 };
 
 /// Errors from the index store.

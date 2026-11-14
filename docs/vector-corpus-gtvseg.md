@@ -1,7 +1,7 @@
 # 立项：向量语料上 GTVSeg（GTVVEC 格式）
 
 > 本文是 [`storage-tiering-ssd-ram-vram.md`](storage-tiering-ssd-ram-vram.md) §4.1 与 [`pinned-upload-p1b.md`](pinned-upload-p1b.md) 的**前置工程立项**：让向量语料（KNN/ANN corpus）以 GTVSeg 同款「定宽、不可变、可 mmap」格式落盘。
-> 状态：**V-0 / V-1 已实现**；V-2（`FlatIndex` Col 化 + 容器升级）待做。
+> 状态：**V-0 / V-1 / V-2 已实现**；V-3（`cudaHostRegister`，解锁 P1b-2）待做。
 > 前置事实：P1b-1 已交付并提交（`264d75a`，staging 达 pinned 上限，稳态 +14~43%）；P1b-2（`cudaHostRegister` 零拷贝）的唯一阻塞项就是「语料不在 mmap 上」。
 
 ## 实现进度
@@ -10,7 +10,7 @@
 |:--|:--|:--|
 | V-0 | ✅ 已交付 | `gtv-core/src/column.rs`：`Pod` seal 开 `f32`，新增 mapped `f32` 列单测（NaN/±0 位模式） |
 | V-1 | ✅ 已交付 | `gtv-index/src/vector_segment.rs`（格式：`encode_vector_segment`/`open_vector_segment`/`VectorSegment`，6 单测）；`gtv-index-store/src/vector_segment_io.rs`（落盘 `write_atomic` + mmap 读回 `memmap2`，3 单测） |
-| V-2 | ⏳ 待做 | `FlatIndex` `Col<f32>` 化 + `gtv-index-store::load` 走 mmap + 引擎 save/load 接线 |
+| V-2 | ✅ 已交付 | `FlatIndex` `Col<f32>`/`Col<u64>` 化（`flat.rs`，构造器签名不变，新增 `from_segment`）+ `IndexStore::save` 对 Flat 写 GTVVEC payload + `load` 按 payload magic 分派（GTVVEC 走 mmap 冷开 / GFLATv1 走解码）+ `verify` 对 GTVVEC 补 `verify_data`。容器 manifest pad 到 8 B（尾随空格，向后兼容） |
 | V-3 | ⏳ 待做 | `cudaHostRegister` 封装（解锁 P1b-2） |
 | V-4 | ⏳ 待做 | IVF 落盘复用 + 端到端基准 |
 

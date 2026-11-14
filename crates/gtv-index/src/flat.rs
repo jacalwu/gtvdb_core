@@ -16,9 +16,11 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use arrow::array::BooleanArray;
+use gtv_core::column::Col;
 use gtv_core::{GtvError, Metric, Result, VectorHit, VectorIndex};
 
 use crate::bytes::{metric_code, metric_from_code, Reader, Writer};
+use crate::vector_segment::VectorSegment;
 
 const FLAT_MAGIC: &[u8; 8] = b"GFLATv1\0";
 
@@ -27,11 +29,15 @@ const FLAT_MAGIC: &[u8; 8] = b"GFLATv1\0";
 ///
 /// The bitmask is indexed by the *position* of the vector in the index
 /// (0..n); it is the caller's job to build a mask aligned with that layout.
+///
+/// The columns are [`Col`]-backed: built in memory they are `Col::Owned`, and
+/// loaded from an immutable GTVVEC segment they are `Col::Mapped` (zero-copy,
+/// mmap-backed) — see [`FlatIndex::from_segment`].
 #[derive(Debug, Clone)]
 pub struct FlatIndex {
-    ids: Vec<u64>,
+    ids: Col<u64>,
     /// Row-major: vector `i` occupies `data[i * dim .. (i + 1) * dim]`.
-    data: Vec<f32>,
+    data: Col<f32>,
     dim: usize,
     metric: Metric,
     /// True when rows were unit-normalized at construction (Cosine).
@@ -73,6 +79,27 @@ impl FlatIndex {
         Self::from_flat_metric(ids, data, dim, metric)
     }
 
+    /// Build a zero-copy view over an immutable, mmap-backed GTVVEC segment.
+    ///
+    /// This is the cold-open path: the columns are `Col::Mapped` and deref to
+    /// the mapped pages directly, so no `rows × dim` buffer is materialized.
+    /// `dim` / `metric` / `normalized` come from the segment header; the
+    /// `FLAG_NORMALIZED` bit is trusted (the rows were normalized at write
+    /// time, which is the only place the immutable segment allows it).
+    pub fn from_segment(segment: VectorSegment) -> Self {
+        let dim = segment.dim();
+        let metric = segment.metric();
+        let normalized = segment.is_normalized();
+        let (ids, data) = segment.into_columns();
+        Self {
+            ids,
+            data,
+            dim,
+            metric,
+            normalized,
+        }
+    }
+
     /// Build from an already-contiguous row-major buffer with [`Metric::L2`].
     pub fn from_flat(ids: Vec<u64>, data: Vec<f32>, dim: usize) -> Result<Self> {
         Self::from_flat_metric(ids, data, dim, Metric::L2)
@@ -102,8 +129,8 @@ impl FlatIndex {
             }
         }
         Ok(Self {
-            ids,
-            data,
+            ids: ids.into(),
+            data: data.into(),
             dim,
             metric,
             normalized: metric.requires_normalization(),
@@ -145,7 +172,7 @@ impl FlatIndex {
 
     /// The stored vector for `id`, if present (used by exact rerank).
     pub fn vector_for_id(&self, id: u64) -> Option<&[f32]> {
-        let pos = self.ids.iter().position(|&x| x == id)?;
+        let pos = self.ids[..].iter().position(|&x| x == id)?;
         Some(&self.data[pos * self.dim..(pos + 1) * self.dim])
     }
 
@@ -156,10 +183,10 @@ impl FlatIndex {
             .u32(self.dim as u32)
             .u8(metric_code(self.metric))
             .u64(self.ids.len() as u64);
-        for id in &self.ids {
+        for id in &self.ids[..] {
             w.u64(*id);
         }
-        for v in &self.data {
+        for v in &self.data[..] {
             w.f32(*v);
         }
         w.into_vec()
@@ -674,8 +701,8 @@ impl VectorIndex for FlatIndex {
 
         let scored = exact_topk(
             CorpusView {
-                ids: &self.ids,
-                data: &self.data,
+                ids: &self.ids[..],
+                data: &self.data[..],
                 dim: self.dim,
                 metric: self.metric,
                 normalized: self.normalized,

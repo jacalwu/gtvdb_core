@@ -211,6 +211,18 @@ impl VectorSegment {
         }
         Ok(())
     }
+
+    /// Consume the segment, handing back the two mapped columns.
+    ///
+    /// Each [`Col`] carries its own `Arc<dyn MappedRegion>` (cloned at
+    /// construction), so the mapping stays alive after `self` — and the
+    /// now-dropped `region` field — are gone. This is the seam
+    /// [`FlatIndex::from_segment`](crate::FlatIndex::from_segment) uses to turn
+    /// a cold-opened GTVVEC into a queryable flat index without copying a
+    /// single vector.
+    pub fn into_columns(self) -> (Col<u64>, Col<f32>) {
+        (self.ids, self.data)
+    }
 }
 
 /// Map `region` (a whole GTVVEC file already mmap'd by the caller) read-only.

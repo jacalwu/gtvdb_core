@@ -178,11 +178,43 @@ fn corruption_is_detected() {
         .join("index.gtvidx");
     let mut bytes = std::fs::read(&path).unwrap();
     let n = bytes.len();
+    // Flip a byte in the trailing payload/checksum region. For a GTVVEC payload
+    // this lands in the data column (past the header), which `load` does *not*
+    // hash on the O(1) cold-open path — but `verify` must catch it.
     bytes[n - 40] ^= 0xff;
     std::fs::write(&path, &bytes).unwrap();
 
-    assert!(store.load(tag, None).is_err());
+    // Cold open stays O(1) and does not detect the data-column corruption...
+    assert!(store.load(tag, None).is_ok());
+    // ...but the explicit integrity check does.
     assert!(store.verify(tag, 1).is_err());
+}
+
+#[test]
+fn gtvvec_header_corruption_fails_load() {
+    let tag = "hcorrupt";
+    let store = IndexStore::open(root(tag)).unwrap();
+    let (ids, vs) = vectors(32, 4, 9);
+    let index = AnyIndex::build(ids, vs, Metric::L2, &BuildOptions::Flat).unwrap();
+    store.save(tag, &index, &BuildOptions::Flat, &meta()).unwrap();
+
+    let id = store.resolve(tag).unwrap();
+    let path = store
+        .root()
+        .join(id.to_string())
+        .join("v1")
+        .join("index.gtvidx");
+    let bytes = std::fs::read(&path).unwrap();
+    let mut corrupted = bytes.clone();
+    // The GTVVEC payload begins at `16 + manifest_len`; flip a byte inside its
+    // 4096-byte header (row_count field lives at payload offset 12).
+    let manifest_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let payload_offset = 16 + manifest_len;
+    corrupted[payload_offset + 12] ^= 0xff;
+    std::fs::write(&path, &corrupted).unwrap();
+
+    // Header corruption is caught on open (header_checksum is always verified).
+    assert!(store.load(tag, None).is_err());
 }
 
 #[test]
