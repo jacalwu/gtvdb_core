@@ -46,14 +46,21 @@ mod sealed {
     impl Sealed for u32 {}
     impl Sealed for u64 {}
     impl Sealed for i64 {}
+    impl Sealed for f32 {}
 }
 
 /// Plain-old-data element types allowed to back a [`Col`].
 ///
-/// Sealed on purpose: only the four fixed-width integer types used by the CSR
-/// columns qualify. `bool`, `char`, references, enums with niches and structs
-/// with padding all have invalid bit patterns and would make byte
+/// Sealed on purpose: only the fixed-width types used by the CSR columns and
+/// the vector corpus qualify. `bool`, `char`, references, enums with niches and
+/// structs with padding all have invalid bit patterns and would make byte
 /// reinterpretation undefined behaviour.
+///
+/// The admission criterion is «every bit pattern is a valid value and there is
+/// no padding»: `f32` qualifies because NaN / infinities / ±0 are all valid
+/// `f32` bit patterns (this is the same judgment `bytemuck` makes), and
+/// `size_of::<f32>() == align_of::<f32>() == 4`. Any future addition (`f64`,
+/// `i32`, …) must be reviewed against the same criterion.
 pub trait Pod: sealed::Sealed + Copy + Send + Sync + 'static {}
 
 impl<T> Pod for T where T: sealed::Sealed + Copy + Send + Sync + 'static {}
@@ -287,6 +294,28 @@ mod tests {
         assert!(c.is_mapped());
         assert_eq!(&c[..], &[0, 1, 2, 3]);
         assert_eq!(c[2], 2);
+    }
+
+    #[test]
+    fn mapped_f32_column_reinterprets_le_bytes() {
+        // f32 rows at a 64-byte aligned offset, including a NaN and ±0 to prove
+        // every bit pattern survives the round trip (Pod admission criterion).
+        let values = [1.5f32, -2.25f32, f32::NAN, 0.0f32, -0.0f32];
+        let mut bytes = vec![0u8; 128];
+        for (i, v) in values.iter().enumerate() {
+            bytes[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let region: Arc<dyn MappedRegion> = Arc::new(FakeRegion(bytes));
+        let c = MappedCol::<f32>::new(region, 64, values.len()).unwrap();
+        assert!(c.is_mapped());
+        assert_eq!(c.len(), values.len());
+        assert_eq!(c[0], 1.5);
+        assert_eq!(c[1], -2.25);
+        assert!(c[2].is_nan());
+        // ±0 both map to 0.0 but keep their sign bit in the raw representation.
+        assert_eq!(c[3], 0.0);
+        assert_eq!(c[3].to_bits(), 0.0f32.to_bits());
+        assert_eq!(c[4].to_bits(), (-0.0f32).to_bits());
     }
 
     #[test]

@@ -9,4 +9,5 @@ arrow.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
 serde.workspace = true
+blake3.workspace = true
 gtv-core = { path = "../gtv-core" }

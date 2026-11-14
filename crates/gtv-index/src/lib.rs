@@ -12,6 +12,9 @@ pub mod flat;
 pub mod hnsw;
 pub mod index;
 pub mod ivf;
+pub mod vector_segment;
+
+pub use vector_segment::{encode_vector_segment, open_vector_segment, VectorHeader, VectorSegment};
 
 pub use ann::{
     allowed_count, estimate_recall, execute_ann, plan_ann, recall_curve, AnnConfig, AnnPlan,

@@ -161,8 +161,8 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 | **P1b** | pinned 上传：P1b-1 `cudaHostAlloc` write-combined staging（✅ 已交付）；P1b-2 `cudaHostRegister` 注册 mmap 视图（前置「向量语料上 GTVSeg」已立项，见 V 系列） | ✅ P1b-1 已交付 | [`docs/pinned-upload-p1b.md`](docs/pinned-upload-p1b.md)，P1b-1 实测 staging 达 pinned 上限（稳态 +14~43%） |
 | **P1c** | 异步预取流水线：算第 N 块时预取第 N+1 块 | ⏳ 待做 | 隐藏 PCIe 搬运延迟 |
 | **P2** | heat 预取 + async 上传整合；GPUDirect（`#[cfg(linux)]` 可选，依赖 `nvidia-fs`） | ⏳ 待做 | 大表扫描省 CPU+PCIe 往返 |
-| **V-0** | 向量语料上 GTVSeg 立项 + `Pod` 扩展 `f32` | 🔵 立项已交付 | [`docs/vector-corpus-gtvseg.md`](docs/vector-corpus-gtvseg.md)：GTVVEC v1 格式定稿，`column.rs` seal 开 `f32` |
-| **V-1** | GTVVEC v1 格式模块：writer（`write_atomic`）+ cold-open reader + 容器 payload 从 `GFLATv1` 升级（manifest pad 64 B 对齐） | ⏳ 待做 | 格式单测：round-trip / 校验 / 对齐 / 旧 payload 兼容分派 |
+| **V-0** | 向量语料上 GTVSeg 立项 + `Pod` 扩展 `f32` | ✅ 已交付 | [`docs/vector-corpus-gtvseg.md`](docs/vector-corpus-gtvseg.md)：GTVVEC v1 格式定稿；`column.rs` seal 开 `f32`（NaN/±0 位模式单测） |
+| **V-1** | GTVVEC v1 格式模块：`encode`/`open`（header 校验 + 列目录 + blake3）+ index-store 落盘（`write_atomic`）/ mmap 读回（`memmap2`） | ✅ 已交付 | `gtv-index/src/vector_segment.rs`（6 单测）+ `gtv-index-store/src/vector_segment_io.rs`（3 单测）；旧 `GFLATv1`/`.gtvidx` 路径未动 |
 | **V-2** | `FlatIndex` `Col<f32>` 化（镜像 TemporalCSR）+ `gtv-index-store` load mmap 化 + 引擎 save/load 接线 | ⏳ 待做 | 冷打开 O(1)、3 份拷贝→1 份 mmap 视图；旧 `.gtvidx` 兼容 |
 | **V-3** | `cudaHostRegister` 封装（mmap 页直接 DMA）+ 基准 + fallback | ⏳ 待做 | **解锁 P1b-2**；register 失败回落 P1b-1 staging |
 | **V-4** | IVF 语料落盘复用 + 冷打开 / 常驻 pinned 占用端到端基准 | ⏳ 待做 | 对比表 |
