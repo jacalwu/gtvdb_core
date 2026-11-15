@@ -177,6 +177,36 @@ impl AsofRequest<'_> {
     }
 }
 
+/// A proactive upload request: make the device copy of a corpus exist *now*, so
+/// the next query that needs it does not pay the transfer on its critical path.
+///
+/// This is the write half of the P2 heat pump: the shadow ledger says which
+/// non-resident blocks are hottest, the registry admits the key through the same
+/// budget/heat policy a query would use, and the backend then performs the very
+/// same upload a cold query would have performed — only earlier.
+#[derive(Debug, Clone)]
+pub struct PrefetchRequest<'a> {
+    /// Which cache the device copy belongs to (`Corpus` / `IvfCorpus`).
+    pub kind: crate::resident::ResidentKind,
+    pub name: &'a str,
+    pub version: u64,
+    pub ids: &'a [u64],
+    /// Row-major corpus, `ids.len() * dim` floats (the flat layout for both
+    /// kinds; the backend transposes on upload).
+    pub data: &'a [f32],
+    pub dim: usize,
+}
+
+impl PrefetchRequest<'_> {
+    pub fn resident_bytes(&self) -> u64 {
+        (self.ids.len() * 8 + self.data.len() * 4) as u64
+    }
+
+    pub fn rows(&self) -> u64 {
+        self.ids.len() as u64
+    }
+}
+
 /// Why a backend could not execute. Every variant is recoverable: the registry
 /// records it and runs the operation on the host.
 #[derive(Debug, thiserror::Error)]
@@ -233,5 +263,26 @@ pub trait AccelBackend: Send + Sync + std::fmt::Debug {
     /// backend holds nothing, hence the default no-op.
     fn release(&self, kind: crate::resident::ResidentKind, name: &str) {
         let _ = (kind, name);
+    }
+
+    /// Proactively upload `req` so a later query finds it resident.
+    ///
+    /// Returns `Ok(true)` when a device copy is now held, `Ok(false)` when this
+    /// backend keeps no device copy for that kind (the registry records a
+    /// skipped pump, not a query failure). The default is "not supported":
+    /// prefetch is an optimisation, and a backend that cannot do it must simply
+    /// say so rather than make a query pay for the attempt.
+    fn prefetch_corpus(&self, req: &PrefetchRequest<'_>) -> Result<bool, AccelError> {
+        let _ = req;
+        Ok(false)
+    }
+
+    /// `(direct, staged)` corpus-upload counts, when the backend tracks them.
+    ///
+    /// The two sum to the number of uploads the backend performed, so a build
+    /// that gains GPUDirect can be checked against the staged-only baseline
+    /// without adding a second counter elsewhere.
+    fn direct_upload_stats(&self) -> Option<(u64, u64)> {
+        None
     }
 }

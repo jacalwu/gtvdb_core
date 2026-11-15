@@ -33,6 +33,18 @@ use gtv_params::{CudaMode, GtvParams};
 const ORDINAL: usize = 0;
 const MIB: u64 = 1024 * 1024;
 
+/// All gates share one GPU, and `mem_get_info` / latency are process-global: two
+/// gates running on cargo's default thread pool see each other's allocations and
+/// upload load. Without this, gate 5 reported a 32 MiB "leak" that was only a
+/// sibling test holding VRAM. Gates are cheap (a few seconds each), so serialise.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    // A panicking gate poisons the lock; the next gate still deserves to run and
+    // report its own verdict.
+    GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Open device 0. A genuinely absent device is a SKIP on a mixed CI fleet, but
 /// a dedicated GPU job sets `GTV_CUDA_REQUIRE_DEVICE=1` and must fail instead.
 fn device() -> Option<CudaBackend> {
@@ -133,6 +145,7 @@ fn assert_hits_equal(host: &[RawHit], dev: &[RawHit], label: &str) {
 
 #[test]
 fn gate1_equivalence_across_metrics_masks_and_tolerances() {
+    let _gpu = exclusive();
     let Some(dev) = device() else { return };
     let host = gtv_accelerator::HostBackend::new();
     let mut knn_cases = 0usize;
@@ -230,6 +243,7 @@ fn gate1_equivalence_across_metrics_masks_and_tolerances() {
 
 #[test]
 fn gate2_second_query_amortizes_the_resident_upload() {
+    let _gpu = exclusive();
     let Some(dev) = device() else { return };
 
     const N: usize = 1_000_000;
@@ -355,6 +369,7 @@ fn gate2_second_query_amortizes_the_resident_upload() {
 
 #[test]
 fn gate3_forced_fallback_is_deterministic() {
+    let _gpu = exclusive();
     let Some(_dev) = device() else { return };
     let total = gtv_accelerator::device_total_bytes(ORDINAL).unwrap_or(0);
     assert!(total > 0, "a present device must report its VRAM");
@@ -415,6 +430,7 @@ fn gate3_forced_fallback_is_deterministic() {
 
 #[test]
 fn gate4_telemetry_accounting_holds() {
+    let _gpu = exclusive();
     let Some(dev) = device() else { return };
     let reg = registry(dev, 64 * MIB);
     let (ids, data, query, normalized) = separated_corpus(1024, 32, Metric::L2);
@@ -490,6 +506,7 @@ fn gate4_telemetry_accounting_holds() {
 
 #[test]
 fn gate5_eviction_releases_device_memory() {
+    let _gpu = exclusive();
     let Some(dev) = device() else { return };
     let free_at_start = mem_get_info(ORDINAL).map(|(f, _)| f);
     let free_after_init = mem_get_info(ORDINAL).map(|(f, _)| f);
@@ -647,6 +664,7 @@ fn synthetic_ivf(
 /// same ids and distances.
 #[test]
 fn gate6_heat_admission_bounds_uploads_without_losing_exactness() {
+    let _gpu = exclusive();
     let Some(heat_dev) = device() else { return };
     let Some(lru_dev) = device() else { return };
 
@@ -748,6 +766,7 @@ fn gate6_heat_admission_bounds_uploads_without_losing_exactness() {
 
 #[test]
 fn gate7_ivf_probe_equivalence_and_amortization() {
+    let _gpu = exclusive();
     let Some(dev) = device() else { return };
     let host = gtv_accelerator::HostBackend::new();
 

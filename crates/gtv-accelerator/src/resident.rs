@@ -65,6 +65,13 @@ pub const PROTECT_FLOOR: f64 = 4.0;
 pub const ADMIT_MARGIN: f64 = 1.25;
 /// Bounded shadow ledger: the decline window is evidence, not a second cache.
 const MAX_SHADOW: usize = 256;
+/// Minimum shadow heat before a non-resident block is worth pulling in
+/// proactively. One reference earns 1.0 and decays below it, so a one-shot scan
+/// never qualifies; two references (the point at which a workload has
+/// demonstrably asked twice) do. Deliberately low: the shadow ledger is bounded
+/// and the pump is rate-limited by `ACCEL_PREFETCH_BLOCKS`, so the expensive
+/// mistake is *not* prefetching, not prefetching one block too many.
+pub const PREFETCH_HEAT_FLOOR: f64 = 1.5;
 
 /// Heat at `now` after exponential decay. A zero half-life disables decay (and,
 /// by convention in this module, the whole heat policy).
@@ -138,6 +145,9 @@ pub enum DeclineReason {
     HeatProtected,
     /// The live device probe tightened the budget below this request.
     ElasticBudget,
+    /// A heat-pump upload wanted to fill VRAM that is currently in use. The
+    /// pump never evicts, so this is the expected answer on a saturated cache.
+    NoSlack,
 }
 
 impl DeclineReason {
@@ -148,6 +158,7 @@ impl DeclineReason {
             DeclineReason::NoRoom => "no-room",
             DeclineReason::HeatProtected => "heat-protected",
             DeclineReason::ElasticBudget => "elastic-budget",
+            DeclineReason::NoSlack => "no-slack",
         }
     }
 }
@@ -450,6 +461,46 @@ impl ResidentRegistry {
         rows: u64,
         version: u64,
     ) -> Admission {
+        self.admit_with(key, bytes, rows, version, ADMIT_MARGIN, true)
+    }
+
+    /// Ask for a device copy on behalf of the idle heat pump.
+    ///
+    /// Two things differ from [`Self::admit`]:
+    ///
+    /// * **It never evicts.** The pump may only fill VRAM that is *free right
+    ///   now*; if the cache is saturated it declines with
+    ///   [`DeclineReason::NoSlack`]. Measured reason: a pump allowed to evict
+    ///   re-uploads the block a query just replaced, which on a 3×2 rotation
+    ///   raised transferred bytes by 71% and p99 by 41% for no gain. Filling
+    ///   slack cannot regress anything — it uses VRAM that would otherwise idle.
+    /// * **It consumes heat instead of adding to it.** An unsolicited upload is
+    ///   not a reference from the workload; counting it would make pumped blocks
+    ///   outrank the ones queries actually asked for.
+    ///
+    /// The natural trigger is VRAM released by a re-registered (smaller or
+    /// dropped) collection: the freed region is exactly where the previous
+    /// working set wants to live, and the shadow ledger holds the blocks that
+    /// had to leave.
+    pub fn admit_prefetch(
+        &mut self,
+        key: &ResidentKey,
+        bytes: u64,
+        rows: u64,
+        version: u64,
+    ) -> Admission {
+        self.admit_with(key, bytes, rows, version, 1.0, false)
+    }
+
+    fn admit_with(
+        &mut self,
+        key: &ResidentKey,
+        bytes: u64,
+        rows: u64,
+        version: u64,
+        margin: f64,
+        count_reference: bool,
+    ) -> Admission {
         if !self.mode.tracks_residency() {
             return Admission::Declined {
                 needed: bytes,
@@ -497,8 +548,11 @@ impl ResidentRegistry {
                 if let Some(block) = self.blocks.get_mut(key) {
                     block.hits = block.hits.saturating_add(1);
                     block.epoch = epoch;
-                    if !half_life.is_zero() {
+                    if count_reference && !half_life.is_zero() {
                         block.heat = decayed(block.heat, block.touched, now, half_life) + 1.0;
+                    } else if !half_life.is_zero() {
+                        // A pump hit is not a reference: decay, never add.
+                        block.heat = decayed(block.heat, block.touched, now, half_life);
                     }
                     block.touched = now;
                 }
@@ -525,7 +579,7 @@ impl ResidentRegistry {
                 } else {
                     0.0
                 };
-                if let Err(reason) = self.make_room(grow, Some(key), standing, now) {
+                if let Err(reason) = self.make_room(grow, Some(key), standing, now, margin, count_reference) {
                     return declined(reason, self);
                 }
             }
@@ -551,11 +605,22 @@ impl ResidentRegistry {
             return Admission::Resident;
         }
 
-        let (candidate_heat, deferred_before) = self.note_reference(key, now);
+        let (candidate_heat, deferred_before) = if count_reference {
+            self.note_reference(key, now)
+        } else {
+            // Pump admission: spend the heat the workload already earned, but do
+            // not add to it (see `admit_prefetch`).
+            let heat = self
+                .shadow
+                .get(key)
+                .map(|s| decayed(s.heat, s.touched, now, self.heat_half_life))
+                .unwrap_or(0.0);
+            (heat, 0)
+        };
         if bytes > self.budget.capacity() {
             return too_large(self);
         }
-        if let Err(reason) = self.make_room(bytes, None, candidate_heat, now) {
+        if let Err(reason) = self.make_room(bytes, None, candidate_heat, now, margin, count_reference) {
             return declined(reason, self);
         }
         self.budget.try_reserve(bytes);
@@ -643,6 +708,11 @@ impl ResidentRegistry {
             .map(|b| (b.resident_rows, b.rows))
     }
 
+    /// Whether `key` currently has a device block (any split state).
+    pub fn is_resident(&self, key: &ResidentKey) -> bool {
+        self.blocks.contains_key(key)
+    }
+
     /// Drop a block and return its bytes to the budget.
     pub fn remove(&mut self, key: &ResidentKey) -> bool {
         let Some(block) = self.blocks.remove(key) else {
@@ -651,6 +721,23 @@ impl ResidentRegistry {
         self.budget.release(block.bytes);
         self.pending.remove(key);
         true
+    }
+
+    /// Drop a block, return its bytes to the budget, and report how many.
+    ///
+    /// Unlike an eviction this also drops the *shadow* entry: a block released
+    /// this way belongs to a dataset that no longer exists, so its heat has no
+    /// future use either. That distinction is the whole point — the caller is
+    /// the P2 heat pump's reclaim step, which converts dead VRAM (a dropped
+    /// collection's device copy) into the free slack a pump pass can fill.
+    pub fn release(&mut self, key: &ResidentKey) -> u64 {
+        let Some(block) = self.blocks.remove(key) else {
+            return 0;
+        };
+        self.budget.release(block.bytes);
+        self.pending.remove(key);
+        self.shadow.remove(key);
+        block.bytes
     }
 
     /// Evict the coldest blocks until `need` bytes are free.
@@ -664,15 +751,28 @@ impl ResidentRegistry {
     ///
     /// `protect` is never evicted (the block currently being admitted), which
     /// prevents an admit from evicting itself and then failing anyway.
+    ///
+    /// `margin` is the hysteresis between the candidate and the victim: queries
+    /// pass [`ADMIT_MARGIN`], the idle heat pump passes `1.0` (see
+    /// [`Self::admit_prefetch`]).
+    ///
+    /// `allow_evict == false` restricts the request to VRAM that is free right
+    /// now: no victim is chosen at all. The heat pump runs in that mode so an
+    /// unsolicited upload can never displace a block a query is using.
     fn make_room(
         &mut self,
         need: u64,
         protect: Option<&ResidentKey>,
         candidate_heat: f64,
         now: Instant,
+        margin: f64,
+        allow_evict: bool,
     ) -> Result<(), DeclineReason> {
         if need == 0 || self.budget.free() >= need {
             return Ok(());
+        }
+        if !allow_evict {
+            return Err(DeclineReason::NoSlack);
         }
         while self.budget.free() < need {
             let victim = self
@@ -692,7 +792,7 @@ impl ResidentRegistry {
             };
             if self.heat_enabled()
                 && victim_heat >= PROTECT_FLOOR
-                && candidate_heat < victim_heat * ADMIT_MARGIN
+                && candidate_heat < victim_heat * margin
             {
                 return Err(DeclineReason::HeatProtected);
             }
@@ -722,6 +822,47 @@ impl ResidentRegistry {
     /// Take the keys evicted since the previous call.
     pub fn take_evictions(&mut self) -> Vec<ResidentKey> {
         std::mem::take(&mut self.recent_evictions)
+    }
+
+    /// Non-resident keys ranked by decayed heat, hottest first.
+    ///
+    /// This is the read side of the shadow ledger. A block that keeps losing
+    /// admission still records how often it was asked for ([`Self::admit`] →
+    /// [`Self::note_reference`]); the P2 heat pump uses that evidence to upload
+    /// it *before* the next query needs it, instead of paying the transfer on
+    /// the query's critical path.
+    ///
+    /// Only keys at or above `min_heat` are returned — a one-shot scan earns
+    /// ~1.0 and must never get a slot — and keys that are currently resident are
+    /// skipped because they need no pump. Ties break on name so the candidate
+    /// order is stable between passes.
+    pub fn hottest_shadows(&self, min_heat: f64, limit: usize) -> Vec<(ResidentKey, f64)> {
+        if limit == 0 || self.shadow.is_empty() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let half_life = self.heat_half_life;
+        let mut ranked: Vec<(ResidentKey, f64)> = self
+            .shadow
+            .iter()
+            .filter(|(k, _)| !self.blocks.contains_key(*k))
+            .map(|(k, s)| (k.clone(), decayed(s.heat, s.touched, now, half_life)))
+            .filter(|(_, heat)| *heat >= min_heat)
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
+        ranked.truncate(limit);
+        ranked
+    }
+
+    /// Drop the shadow evidence for `key` (the dataset is gone, or the caller
+    /// decided it will never be prefetched). Returns whether anything was
+    /// removed.
+    pub fn forget_shadow(&mut self, key: &ResidentKey) -> bool {
+        self.shadow.remove(key).is_some()
     }
 
     /// One row per resident block, sorted by name for stable output.
@@ -1001,6 +1142,87 @@ mod tests {
         let t = r.telemetry();
         assert!(t.elastic_clamps >= 1);
         assert!(t.capacity_bytes < t.configured_capacity_bytes);
+    }
+
+    #[test]
+    fn hottest_shadows_rank_by_heat_and_exclude_residents() {
+        // Room for one block: every newcomer is refused by the protected hot one,
+        // which is exactly the situation the heat pump exists for.
+        let mut r = reg(AccelCache::On, 500, 0);
+        assert_eq!(r.admit(&key("hot"), 400, 10, 1), Admission::Resident);
+        for _ in 0..5 {
+            r.admit(&key("hot"), 400, 10, 1);
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                r.admit(&key("warm"), 400, 10, 1).decline_reason(),
+                Some(DeclineReason::HeatProtected)
+            );
+        }
+        assert!(matches!(
+            r.admit(&key("cold"), 400, 10, 1),
+            Admission::Declined { .. }
+        ));
+
+        let ranked = r.hottest_shadows(0.5, 8);
+        let names: Vec<&str> = ranked.iter().map(|(k, _)| k.name.as_str()).collect();
+        assert_eq!(names, vec!["warm", "cold"], "hottest first, residents excluded");
+        assert!(ranked[0].1 > ranked[1].1, "two refusals outrank one");
+
+        // The prefetch floor separates "asked twice" from "scanned once": only
+        // the twice-refused key is worth an unsolicited upload.
+        let pumpable = r.hottest_shadows(PREFETCH_HEAT_FLOOR, 8);
+        assert_eq!(pumpable.len(), 1);
+        assert_eq!(pumpable[0].0.name, "warm");
+
+        // A floor above what any of them earned yields nothing, and so does a
+        // zero limit — the pump must be able to say "nothing worth pulling in".
+        assert!(r.hottest_shadows(PREFETCH_HEAT_FLOOR * 10.0, 8).is_empty());
+        assert!(r.hottest_shadows(0.0, 0).is_empty());
+        assert_eq!(r.hottest_shadows(0.0, 1).len(), 1, "limit truncates");
+
+        // Forgetting a key drops its evidence exactly once.
+        assert!(r.forget_shadow(&key("cold")));
+        assert!(!r.forget_shadow(&key("cold")));
+        assert_eq!(r.hottest_shadows(0.0, 8).len(), 1);
+    }
+
+    #[test]
+    fn the_pump_fills_slack_only_and_never_evicts() {
+        let mut r = reg(AccelCache::On, 500, 0);
+        assert_eq!(r.admit(&key("hot"), 400, 10, 1), Admission::Resident);
+        for _ in 0..5 {
+            r.admit(&key("hot"), 400, 10, 1);
+        }
+        // One refusal leaves evidence, so the key is a pump candidate.
+        for _ in 0..2 {
+            r.admit(&key("warm"), 400, 10, 1);
+        }
+
+        // 100 B free, 400 B wanted: a query would evict a victim here, the pump
+        // declines instead — an unsolicited upload must never displace a block a
+        // query is using (measured cost of allowing it: +71% bytes, p99 × 1.41).
+        assert_eq!(
+            r.admit_prefetch(&key("warm"), 400, 10, 1).decline_reason(),
+            Some(DeclineReason::NoSlack)
+        );
+        assert!(r.is_resident(&key("hot")), "the victim is still there");
+        assert_eq!(r.telemetry().evictions, 0);
+
+        // Releasing the dropped collection's block is where slack comes from;
+        // afterwards the very same pump request succeeds.
+        assert_eq!(r.release(&key("hot")), 400);
+        assert!(!r.is_resident(&key("hot")));
+        assert_eq!(r.release(&key("hot")), 0, "releasing twice frees nothing");
+        assert_eq!(r.admit_prefetch(&key("warm"), 400, 10, 1), Admission::Resident);
+        assert!(r.is_resident(&key("warm")));
+
+        // A pump hit consumes heat without earning any: the block's stored heat
+        // is what the workload earned, so pumping cannot inflate a ranking.
+        let before = r.telemetry().hottest_milli;
+        assert_eq!(r.admit_prefetch(&key("warm"), 400, 10, 1), Admission::Resident);
+        assert_eq!(r.admit_prefetch(&key("warm"), 400, 10, 1), Admission::Resident);
+        assert_eq!(r.telemetry().hottest_milli, before, "pumps never add heat");
     }
 
     #[test]

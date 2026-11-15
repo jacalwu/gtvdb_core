@@ -72,6 +72,33 @@ ACCEL_SYNC_INTERVAL=5
 # back in after a few queries. 0 disables heat and restores pure LRU.
 ACCEL_HEAT_HALF_LIFE=30
 
+# --- Heat-driven prefetch ----------------------------------------------------
+# OFF = (default) corpora are uploaded on demand only; a query that misses the
+# device cache pays the upload before its first use.
+# ON  = the shadow ledger (heat of recently declined/evicted blocks) drives a
+# proactive pump: while the device is idle, the hottest non-resident blocks are
+# pulled in ahead of the next query that needs them. Never fails a query --
+# the host fallback path is always available.
+ACCEL_PREFETCH=OFF
+
+# How many shadow-ledger blocks one prefetch pass may pull in. Keep small
+# (1-2) so the pump never competes with a query for PCIe/H2D bandwidth.
+ACCEL_PREFETCH_BLOCKS=1
+
+# --- GPUDirect (optional; Linux + nvidia-fs) --------------------------------
+# OFF = (default) all host->device uploads go through the staged pinned-buffer
+# path (works everywhere).
+# ON  = uploads of at least ACCEL_GPUDIRECT_THRESHOLD bytes may use GPUDirect
+# Storage (cufile / nvidia-fs) to skip the RAM staging round-trip. Requires
+# Linux with the nvidia-fs kernel module and a supported NVMe topology; any
+# other platform automatically falls back to the staged path. Not yet
+# validated on real GPUDirect hardware.
+ACCEL_GPUDIRECT=OFF
+
+# Minimum upload size for which the GPUDirect path is attempted. Below this
+# the staged path is used (its fixed cost is lower). Default: 1G.
+ACCEL_GPUDIRECT_THRESHOLD=1G
+
 # --- Query dialect ----------------------------------------------------------
 # SQL = standard DataFusion SQL (default). Q = native q dialect (needs the
 # quantum/q extension; falls back to SQL with a warning if unavailable).

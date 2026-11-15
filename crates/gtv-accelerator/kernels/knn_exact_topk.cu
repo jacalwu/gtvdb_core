@@ -91,6 +91,43 @@ extern "C" __global__ void transpose_rowmajor_to_colmajor(
     }
 }
 
+// Windowed variant for the P1c block pipeline: transposes one row-block of a
+// corpus into its final position of the *full* column-major matrix, so blocks
+// can be uploaded and transposed one at a time (copy of block N+1 overlapping
+// this kernel on block N) without a second full-size pass.
+//
+// `in` holds `n_in * dim` row-major floats (the block); `out` is the full
+// `dim * n_total` column-major corpus and only rows `[row0, row0 + n_in)` are
+// written: `in[v * dim + d]` becomes `out[d * n_total + row0 + v]`.
+// `tiles_x` counts dimension tiles over `dim`; tiles over rows use `n_in`.
+extern "C" __global__ void transpose_rowmajor_to_colmajor_window(
+    const float* __restrict__ in,   // n_in * dim, row-major
+    float* __restrict__ out,        // dim * n_total, column-major
+    int n_total,
+    int dim,
+    int tiles_x,
+    int row0,
+    int n_in)
+{
+    __shared__ float tile[TILE][TILE + 1];
+
+    const int tile_x = blockIdx.x % tiles_x;
+    const int tile_y = blockIdx.x / tiles_x;
+
+    const int v = tile_y * TILE + threadIdx.y;
+    const int d = tile_x * TILE + threadIdx.x;
+    if (v < n_in && d < dim) {
+        tile[threadIdx.y][threadIdx.x] = in[v * dim + d];
+    }
+    __syncthreads();
+
+    const int d2 = tile_x * TILE + threadIdx.y;
+    const int v2 = tile_y * TILE + threadIdx.x;
+    if (d2 < dim && v2 < n_in) {
+        out[d2 * n_total + row0 + v2] = tile[threadIdx.x][threadIdx.y];
+    }
+}
+
 // One kernel serves BOTH the flat scan and the IVF probe. `pos` is an optional
 // gather list of corpus row indices: NULL means "identity over [0, npos)",
 // which is the flat scan; non-NULL is an IVF probe plan (ascending contiguous

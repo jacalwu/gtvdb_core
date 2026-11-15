@@ -223,6 +223,18 @@ pub struct GtvParams {
     /// the admission/eviction score; `0` disables the policy and restores pure
     /// LRU. Default: 30.
     pub accel_heat_half_life_secs: u64,
+    /// Whether the heat-driven prefetch pump may proactively upload hot
+    /// non-resident blocks (shadow-ledger entries) while idle. Default: false.
+    pub accel_prefetch: bool,
+    /// Maximum number of shadow-ledger blocks one prefetch pass pulls into the
+    /// device cache. Default: 1.
+    pub accel_prefetch_blocks: usize,
+    /// Whether GPUDirect Storage (nvidia-fs) may be used for large corpus
+    /// uploads when the platform supports it. Default: false.
+    pub accel_gpudirect: bool,
+    /// Minimum corpus size for which a GPUDirect upload is attempted; smaller
+    /// uploads use the staged (host-pinned) path. Default: 1 GiB.
+    pub accel_gpudirect_threshold: u64,
     /// Default query dialect. Default: `Sql`.
     pub default_mode: QueryMode,
     /// Log level. Default: `Info`.
@@ -253,6 +265,10 @@ impl Default for GtvParams {
             accel_sync_threshold: None,
             accel_sync_interval_secs: 5,
             accel_heat_half_life_secs: 30,
+            accel_prefetch: false,
+            accel_prefetch_blocks: 1,
+            accel_gpudirect: false,
+            accel_gpudirect_threshold: 1024 * 1024 * 1024,
             default_mode: QueryMode::default(),
             log_level: Level::default(),
             spill_dir: None,
@@ -425,6 +441,12 @@ impl GtvParams {
             accel_sync_threshold_bytes,
             accel_sync_interval: Duration::from_secs(self.accel_sync_interval_secs),
             accel_heat_half_life: Duration::from_secs(self.accel_heat_half_life_secs),
+            accel_prefetch: self.accel_prefetch,
+            accel_prefetch_blocks: self.accel_prefetch_blocks,
+            // GPUDirect only makes sense with an engaged device; mirror the
+            // accel_cache clamp so a no-device resolve never claims otherwise.
+            accel_gpudirect: self.accel_gpudirect && cuda_enabled,
+            accel_gpudirect_threshold_bytes: self.accel_gpudirect_threshold,
             default_mode: self.default_mode,
             log_level: self.log_level,
             spill_dir,
@@ -483,6 +505,25 @@ impl GtvParams {
                 self.accel_heat_half_life_secs = value.trim().parse().map_err(|_| {
                     invalid("ACCEL_HEAT_HALF_LIFE", value, "not a non-negative number of seconds")
                 })?;
+                true
+            }
+            "ACCEL_PREFETCH" => {
+                self.accel_prefetch = parse_bool(value).map_err(|m| invalid("ACCEL_PREFETCH", value, &m))?;
+                true
+            }
+            "ACCEL_PREFETCH_BLOCKS" => {
+                self.accel_prefetch_blocks = value.trim().parse().map_err(|_| {
+                    invalid("ACCEL_PREFETCH_BLOCKS", value, "not a non-negative integer")
+                })?;
+                true
+            }
+            "ACCEL_GPUDIRECT" => {
+                self.accel_gpudirect = parse_bool(value).map_err(|m| invalid("ACCEL_GPUDIRECT", value, &m))?;
+                true
+            }
+            "ACCEL_GPUDIRECT_THRESHOLD" => {
+                self.accel_gpudirect_threshold =
+                    parse_size(value).map_err(|m| invalid("ACCEL_GPUDIRECT_THRESHOLD", value, &m))?;
                 true
             }
             "DEFAULT_MODE" => {
@@ -565,6 +606,16 @@ pub struct ResolvedParams {
     /// Half-life of resident-block heat. `Duration::ZERO` disables heat and
     /// restores pure LRU eviction.
     pub accel_heat_half_life: Duration,
+    /// Whether the heat-driven prefetch pump may proactively upload hot
+    /// non-resident blocks while idle.
+    pub accel_prefetch: bool,
+    /// Maximum shadow-ledger blocks one prefetch pass pulls in.
+    pub accel_prefetch_blocks: usize,
+    /// Whether GPUDirect Storage uploads are enabled (Linux + nvidia-fs only;
+    /// the accelerator falls back to staged uploads everywhere else).
+    pub accel_gpudirect: bool,
+    /// Corpus size above which a GPUDirect upload is attempted.
+    pub accel_gpudirect_threshold_bytes: u64,
     /// Selected default query dialect.
     pub default_mode: QueryMode,
     /// Selected log level.
@@ -624,6 +675,21 @@ impl ResolvedParams {
             format!("{}s half-life", self.accel_heat_half_life.as_secs())
         };
         v.push(format!("ACCEL_HEAT      = {heat}"));
+        let prefetch = if self.accel_prefetch {
+            format!("ON ({} block(s)/pass)", self.accel_prefetch_blocks)
+        } else {
+            "OFF".to_string()
+        };
+        v.push(format!("ACCEL_PREFETCH   = {prefetch}"));
+        let gpudirect = if self.accel_gpudirect {
+            format!(
+                "ON (threshold >= {} MiB)",
+                self.accel_gpudirect_threshold_bytes / mib
+            )
+        } else {
+            "OFF".to_string()
+        };
+        v.push(format!("ACCEL_GPUDIRECT  = {gpudirect}"));
         v.push(format!(
             "DEFAULT_MODE     = {}",
             match self.default_mode {
@@ -922,5 +988,61 @@ mod tests {
     fn explicit_obj_area_over_target_is_rejected() {
         let (p, _) = GtvParams::from_reader("MEMORY_TARGET=100M\nMEMORY_OBJ_AREA=200M\n".as_bytes()).unwrap();
         assert!(p.resolve(None).is_err());
+    }
+
+    #[test]
+    fn prefetch_and_gpudirect_defaults() {
+        let (p, _w) = GtvParams::from_reader("".as_bytes()).unwrap();
+        let r = p.resolve(None).unwrap();
+        assert!(!r.accel_prefetch);
+        assert_eq!(r.accel_prefetch_blocks, 1);
+        assert!(!r.accel_gpudirect);
+        assert_eq!(r.accel_gpudirect_threshold_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn prefetch_and_gpudirect_parse_and_resolve() {
+        let (p, _w) = GtvParams::from_reader(
+            "ACCEL_PREFETCH=ON\nACCEL_PREFETCH_BLOCKS=3\nACCEL_GPUDIRECT=TRUE\nACCEL_GPUDIRECT_THRESHOLD=512M\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(p.accel_prefetch);
+        assert_eq!(p.accel_prefetch_blocks, 3);
+        assert!(p.accel_gpudirect);
+        assert_eq!(p.accel_gpudirect_threshold, 512 * 1024 * 1024);
+        // No device injected in AUTO => cuda off => GPUDirect is clamped off.
+        let r = p.resolve(None).unwrap();
+        assert!(r.accel_prefetch);
+        assert_eq!(r.accel_prefetch_blocks, 3);
+        assert!(!r.accel_gpudirect);
+        assert_eq!(r.accel_gpudirect_threshold_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn gpudirect_needs_a_device() {
+        let (p, _w) = GtvParams::from_reader(
+            "CUDA_MODE=ON\nACCEL_GPUDIRECT=ON\nACCEL_GPUDIRECT_THRESHOLD=1G\n".as_bytes(),
+        )
+        .unwrap();
+        // CUDA_MODE=ON with no device is a hard error ...
+        assert!(p.resolve(None).is_err());
+        // ... and with a device GPUDirect survives the resolve.
+        let r = p.resolve(Some(8 * 1024 * 1024 * 1024)).unwrap();
+        assert!(r.cuda_enabled);
+        assert!(r.accel_gpudirect);
+        assert_eq!(r.accel_gpudirect_threshold_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn summary_lines_cover_prefetch_and_gpudirect() {
+        let (p, _w) = GtvParams::from_reader(
+            "ACCEL_PREFETCH=ON\nACCEL_PREFETCH_BLOCKS=2\n".as_bytes(),
+        )
+        .unwrap();
+        let r = p.resolve(None).unwrap();
+        let lines = r.summary_lines();
+        assert!(lines.iter().any(|l| l.starts_with("ACCEL_PREFETCH") && l.contains("2 block(s)/pass")));
+        assert!(lines.iter().any(|l| l.starts_with("ACCEL_GPUDIRECT") && l.contains("OFF")));
     }
 }

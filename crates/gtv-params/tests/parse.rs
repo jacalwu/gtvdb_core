@@ -234,6 +234,31 @@ fn heat_half_life_defaults_to_30_seconds() {
 }
 
 #[test]
+fn prefetch_and_gpudirect_keys_are_parsed_and_explicit() {
+    let (p, _) = GtvParams::from_reader(
+        "CUDA_MODE=OFF\nACCEL_PREFETCH=ON\nACCEL_PREFETCH_BLOCKS=2\nACCEL_GPUDIRECT=TRUE\nACCEL_GPUDIRECT_THRESHOLD=256M\n"
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(p.accel_prefetch);
+    assert_eq!(p.accel_prefetch_blocks, 2);
+    assert!(p.accel_gpudirect);
+    assert_eq!(p.accel_gpudirect_threshold, 256 * 1024 * 1024);
+    assert!(p.is_explicit("ACCEL_PREFETCH"));
+    assert!(p.is_explicit("ACCEL_GPUDIRECT_THRESHOLD"));
+
+    // CUDA_MODE=OFF: GPUDirect is clamped off, prefetch survives (the pump also
+    // works against the host-side shadow ledger).
+    let r = p.resolve(None).unwrap();
+    assert!(!r.accel_gpudirect);
+    assert!(r.accel_prefetch);
+    assert_eq!(r.accel_prefetch_blocks, 2);
+    let lines = r.summary_lines();
+    assert!(lines.iter().any(|l| l.starts_with("ACCEL_PREFETCH")));
+    assert!(lines.iter().any(|l| l.starts_with("ACCEL_GPUDIRECT")));
+}
+
+#[test]
 fn accel_cache_is_off_when_cuda_is_off_unless_shadow_is_asked_for() {
     let (p, _) = GtvParams::from_reader("CUDA_MODE=OFF\n".as_bytes()).unwrap();
     let r = p.resolve(None).unwrap();

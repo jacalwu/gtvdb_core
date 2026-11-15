@@ -22,14 +22,14 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::BooleanArray;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, LaunchConfig, PinnedHostSlice, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use gtv_core::Metric;
 
 use crate::backend::{
     AccelBackend, AccelError, AccelOp, AsofRequest, DeviceInfo, DeviceKind, IvfRequest, KnnRequest,
-    RawHit,
+    PrefetchRequest, RawHit,
 };
 use crate::resident::ResidentKind;
 use crate::sweep::non_decreasing;
@@ -49,6 +49,15 @@ const TILE: u32 = 32;
 const MAX_BLOCKS: u32 = 1024;
 /// Target thread count for the as-of kernel; sets the per-thread chunk size.
 const ASOF_TARGET_THREADS: usize = 256 * 512;
+/// P1c: default row-block size of the corpus upload pipeline, in bytes of
+/// row-major `f32` payload. One block is a single H2D copy and one windowed
+/// transpose; with two blocks in flight the copy of N+1 overlaps the transpose
+/// and scan of N. **8 MiB is the measured knee** (`bench_cold_upload_pipeline_vs_bulk`,
+/// 195 MiB corpus on the P1a host): bulk 94.6 ms → 64 MiB 72.2 → 16 MiB 49.9 →
+/// **8 MiB 46.9** → 4 MiB 47.0 → 1 MiB 57.7 (launch overhead). 8 MiB keeps the
+/// transient double-buffer scratch at `2 × 8` MiB of device memory and the
+/// pinned staging at the same.
+pub const DEFAULT_PREFETCH_BLOCK_BYTES: usize = 8 * 1024 * 1024;
 
 const KNN_SRC: &str = include_str!("../kernels/knn_exact_topk.cu");
 const ASOF_SRC: &str = include_str!("../kernels/asof_merge_chunked.cu");
@@ -149,6 +158,40 @@ struct TopkQuery<'a> {
     positions: Option<&'a [u32]>,
 }
 
+/// The query half of the P1c fused cold scan ([`CudaBackend::build_and_scan`]).
+///
+/// Everything [`TopkQuery`] carries except the row window: the pipeline
+/// derives per-block positions itself (pre-applying the flat mask on the
+/// host), so the kernel runs with `has_mask = 0` on every block.
+#[derive(Debug, Clone, Copy)]
+struct BlockScan<'a> {
+    ids: &'a [u64],
+    query: &'a [f32],
+    metric: Metric,
+    normalized: bool,
+    k: usize,
+    /// Label mask for the flat scan (row domain).
+    flat_mask: Option<&'a BooleanArray>,
+    /// IVF probe plan (`None` for the flat scan).
+    positions: Option<&'a [u32]>,
+}
+
+impl BlockScan<'_> {
+    /// The same scan expressed as a whole-corpus [`TopkQuery`] (cache-hit and
+    /// race-fallback paths).
+    fn as_topk_query(&self) -> TopkQuery<'_> {
+        TopkQuery {
+            ids: self.ids,
+            query: self.query,
+            metric: self.metric,
+            normalized: self.normalized,
+            k: self.k,
+            mask: self.flat_mask,
+            positions: self.positions,
+        }
+    }
+}
+
 /// A CUDA device with both kernels compiled through NVRTC.
 pub struct CudaBackend {
     device: DeviceInfo,
@@ -156,6 +199,15 @@ pub struct CudaBackend {
     /// NVRTC architecture option computed from the device we opened.
     arch: String,
     transpose_fn: CudaFunction,
+    /// P1c windowed transpose: one row-block into its rows of the full
+    /// column-major corpus (see `transpose_rowmajor_to_colmajor_window`).
+    transpose_window_fn: CudaFunction,
+    /// P1c: dedicated H2D stream. Block N+1's copy runs here while the default
+    /// stream transposes block N.
+    copy_stream: Arc<CudaStream>,
+    /// P1c pipeline block size in bytes of row-major `f32` payload; `0` builds
+    /// the corpus as one bulk copy (pre-P1c behavior).
+    prefetch_block_bytes: usize,
     /// One compiled kernel specialization per distinct `k`, so `KERNEL_K` is a
     /// compile-time constant and the candidate arrays stay in registers.
     knn_functions: Mutex<HashMap<usize, Arc<CudaFunction>>>,
@@ -166,10 +218,24 @@ pub struct CudaBackend {
     /// every returned position's meaning) differs.
     ivf_corpora: Mutex<HashMap<(String, u64), Arc<DeviceCorpus>>>,
     series: Mutex<HashMap<(String, u64), Arc<DeviceSeries>>>,
-    /// Pinned DMA staging buffer for the `f32` corpus upload (P1b-1).
-    staging_f32: Mutex<StagingBuffer<f32>>,
+    /// Two pinned DMA staging buffers (P1b-1) for the corpus upload pipeline:
+    /// the host fills slot `b % 2` for block `b` while the DMA of block `b-1`
+    /// is still in flight from the other slot.
+    staging_f32: Mutex<[StagingBuffer<f32>; 2]>,
     /// Pinned DMA staging buffer for the `i64` as-of series upload (P1b-1).
     staging_i64: Mutex<StagingBuffer<i64>>,
+    /// `ACCEL_GPUDIRECT`: whether a large upload *may* skip the staging copy.
+    gpudirect_enabled: bool,
+    /// `ACCEL_GPUDIRECT_THRESHOLD`: the size below which staging always wins.
+    gpudirect_threshold: u64,
+    /// What [`crate::gpudirect::probe`] reported for this host, cached so no
+    /// upload pays for the probe.
+    gpudirect_status: crate::gpudirect::DirectStatus,
+    /// Uploads that actually took the direct path (0 until a `cufile` binding
+    /// exists — see the module docs).
+    gpudirect_direct: std::sync::atomic::AtomicU64,
+    /// Uploads that took the staged path, the GPUDirect-enabled ones included.
+    gpudirect_staged: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for CudaBackend {
@@ -221,6 +287,9 @@ impl CudaBackend {
         let transpose_fn = knn_module
             .load_function("transpose_rowmajor_to_colmajor")
             .map_err(|e| launch_err(format!("load transpose kernel: {e}")))?;
+        let transpose_window_fn = knn_module
+            .load_function("transpose_rowmajor_to_colmajor_window")
+            .map_err(|e| launch_err(format!("load windowed transpose kernel: {e}")))?;
 
         let asof_ptx = compile_ptx_with_opts(ASOF_SRC, opts())
             .map_err(|e| launch_err(format!("nvrtc asof: {e}")))?;
@@ -231,6 +300,14 @@ impl CudaBackend {
             .load_function("asof_merge_chunked_kernel")
             .map_err(|e| launch_err(format!("load asof kernel: {e}")))?;
 
+        // P1c: a second stream for H2D corpus copies. Creating it flips the
+        // context into cudarc's multi-stream mode, which activates per-slice
+        // event tracking — that is what makes the copy/transpose overlap safe
+        // (each kernel launch waits on its input's copy event automatically).
+        let copy_stream = ctx
+            .new_stream()
+            .map_err(|e| launch_err(format!("create copy stream: {e}")))?;
+
         Ok(Self {
             device: DeviceInfo {
                 name,
@@ -240,15 +317,103 @@ impl CudaBackend {
             ctx,
             arch,
             transpose_fn,
+            transpose_window_fn,
+            copy_stream,
+            prefetch_block_bytes: DEFAULT_PREFETCH_BLOCK_BYTES,
             knn_functions: Mutex::new(HashMap::new()),
             asof_fn,
             corpora: Mutex::new(HashMap::new()),
             ivf_corpora: Mutex::new(HashMap::new()),
             series: Mutex::new(HashMap::new()),
             // Allocated lazily on the first upload of each element type.
-            staging_f32: Mutex::new(StagingBuffer::default()),
+            staging_f32: Mutex::new([StagingBuffer::default(), StagingBuffer::default()]),
             staging_i64: Mutex::new(StagingBuffer::default()),
+            // Off until `from_resolved` says otherwise; probing here would be a
+            // filesystem hit on a path that may never be used.
+            gpudirect_enabled: false,
+            gpudirect_threshold: 1 << 30,
+            gpudirect_status: crate::gpudirect::DirectStatus::Unavailable("not configured"),
+            gpudirect_direct: std::sync::atomic::AtomicU64::new(0),
+            gpudirect_staged: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Set the P1c upload-pipeline block size in bytes of row-major `f32`
+    /// payload. `0` restores the pre-P1c single bulk copy. Default
+    /// [`DEFAULT_PREFETCH_BLOCK_BYTES`].
+    pub fn with_prefetch_block_bytes(mut self, bytes: usize) -> Self {
+        self.prefetch_block_bytes = bytes;
+        self
+    }
+
+    /// The configured P1c block size (bytes of row-major payload per block).
+    pub fn prefetch_block_bytes(&self) -> usize {
+        self.prefetch_block_bytes
+    }
+
+    /// Enable/disable the GPUDirect Decision (`ACCEL_GPUDIRECT`) and give the
+    /// size threshold above which a direct transfer would be attempted.
+    ///
+    /// Probing happens once here rather than per upload. The probe is allowed to
+    /// refuse on any host — including every host today, because no `cufile`
+    /// binding is compiled in — and the upload simply stays staged.
+    pub fn with_gpudirect(mut self, enabled: bool, threshold: u64) -> Self {
+        self.gpudirect_enabled = enabled;
+        self.gpudirect_threshold = threshold;
+        self.gpudirect_status = if enabled {
+            crate::gpudirect::probe()
+        } else {
+            crate::gpudirect::DirectStatus::Unavailable("ACCEL_GPUDIRECT is off")
+        };
+        self
+    }
+
+    /// `(direct, staged)` upload counts and the probe's verdict.
+    pub fn gpudirect_stats(&self) -> (u64, u64) {
+        (
+            self.gpudirect_direct.load(std::sync::atomic::Ordering::Relaxed),
+            self.gpudirect_staged.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The cached GPUDirect probe verdict (for `.accel` output and tests).
+    pub fn gpudirect_status(&self) -> crate::gpudirect::DirectStatus {
+        self.gpudirect_status
+    }
+
+    /// Decide, record and return the upload path for a `bytes`-sized corpus.
+    ///
+    /// Every upload goes through this exactly once, so the telemetry can never
+    /// claim a direct transfer that did not happen: `Direct` is only reachable
+    /// when the probe reported `Available`, which requires the binding.
+    fn note_upload_path(&self, bytes: u64) -> crate::gpudirect::UploadPath {
+        use std::sync::atomic::Ordering;
+        let path = crate::gpudirect::upload_plan(
+            self.gpudirect_enabled,
+            self.gpudirect_status,
+            bytes,
+            self.gpudirect_threshold,
+        );
+        match path {
+            crate::gpudirect::UploadPath::Direct => {
+                self.gpudirect_direct.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::gpudirect::UploadPath::Staged => {
+                self.gpudirect_staged.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        path
+    }
+
+    /// Rows per pipeline block for a corpus of dimension `dim`. At least 1;
+    /// a zero configured block size (or a corpus narrower than one block)
+    /// collapses to a single block.
+    fn prefetch_rows(&self, dim: usize, n: usize) -> usize {
+        if self.prefetch_block_bytes == 0 || n == 0 {
+            return n.max(1);
+        }
+        let row_bytes = dim.max(1) * std::mem::size_of::<f32>();
+        (self.prefetch_block_bytes / row_bytes).clamp(1, n.max(1))
     }
 
     /// Compile (once) the K-NN specialization for this exact `k`.
@@ -295,7 +460,11 @@ impl CudaBackend {
     /// memory, but it is non-swappable, so it matters for the host budget even
     /// though it never shows up in `mem_info`.
     pub fn staging_bytes(&self) -> usize {
-        let f32 = self.staging_f32.lock().map(|s| s.cap()).unwrap_or(0);
+        let f32: usize = self
+            .staging_f32
+            .lock()
+            .map(|s| s.iter().map(|b| b.cap()).sum())
+            .unwrap_or(0);
         let i64 = self.staging_i64.lock().map(|s| s.cap()).unwrap_or(0);
         f32 * std::mem::size_of::<f32>() + i64 * std::mem::size_of::<i64>()
     }
@@ -323,6 +492,15 @@ impl CudaBackend {
     /// Both the flat and the IVF corpus use this identical layout (column-major
     /// over *their own* row order); only the position list differs at query
     /// time. Sharing the upload is what keeps the two device paths from drifting.
+    ///
+    /// P1c: corpora larger than one prefetch block upload as a **block
+    /// pipeline** — block N+1's H2D copy (on [`Self::copy_stream`]) overlaps
+    /// the windowed transpose of block N (on the default stream), and the
+    /// pinned staging is double-buffered so the host fill of the next block
+    /// never waits on the previous DMA ("算第 N 块时预取第 N+1 块"). cudarc's
+    /// per-slice events order the streams: a transpose launch waits on its own
+    /// block's copy, and a staging slot's reuse waits on the transpose that
+    /// read it. Single-block corpora take the original one-bulk path unchanged.
     fn build_corpus(
         &self,
         name: &str,
@@ -341,62 +519,165 @@ impl CudaBackend {
         let n = data.len() / dim.max(1);
         let stream = self.ctx.default_stream();
 
-        // One bulk upload of the row-major corpus, then a device-side transpose.
-        // P1b-1: stage the pageable source through a write-combined pinned
-        // buffer first. DMA-ing from locked pages skips the driver's hidden
-        // bounce-buffer copy (measured at 33–45% in `bench_pcie_transfer`).
-        // The row-major device buffer is dropped as soon as the transpose is
-        // enqueued and the stream has consumed it (cudarc keeps the allocation
-        // alive until the stream is synchronized by the next D2H copy).
-        let d_rowmajor = {
-            let mut s = self
-                .staging_f32
-                .lock()
-                .map_err(|_| launch_err("pinned staging lock poisoned"))?;
-            {
-                let slice = s.ensure(data.len(), &self.ctx)?;
-                slice.copy_from_slice(data);
-            } // drop the `&mut` borrow before re-borrowing immutably
-            let buf = s.buf.as_ref().expect("staging allocated by ensure");
-            stream
-                .clone_htod(buf)
-                .map_err(|e| launch_err(format!("upload corpus: {e}")))?
-        };
+        // GPUDirect decision for this transfer, taken before any staging work.
+        // A `Direct` plan would skip the pinned buffer entirely; today's build
+        // always plans `Staged` because no `cufile` binding is compiled in, and
+        // the counter records which one actually ran.
+        let _upload_path = self.note_upload_path((data.len() * std::mem::size_of::<f32>()) as u64);
+
+        // P1c-1: fault cold host pages in before the upload reads them, so
+        // first-touch page faults land outside the critical path.
+        crate::warm::warm_slice(data);
+
+        let block_rows = self.prefetch_rows(dim, n);
+
+        if n <= block_rows {
+            // Single block: the original one-bulk upload + transpose (P1b-1:
+            // stage the pageable source through a write-combined pinned buffer
+            // so DMA runs at the pinned ceiling). Behavior unchanged.
+            let d_rowmajor = {
+                let mut s = self
+                    .staging_f32
+                    .lock()
+                    .map_err(|_| launch_err("pinned staging lock poisoned"))?;
+                {
+                    let slice = s[0].ensure(data.len(), &self.ctx)?;
+                    slice.copy_from_slice(data);
+                } // drop the `&mut` borrow before re-borrowing immutably
+                let buf = s[0].buf.as_ref().expect("staging allocated by ensure");
+                stream
+                    .clone_htod(buf)
+                    .map_err(|e| launch_err(format!("upload corpus: {e}")))?
+            };
+            let mut data_t = stream
+                .alloc_zeros::<f32>(n * dim)
+                .map_err(|e| launch_err(format!("alloc column-major corpus: {e}")))?;
+
+            let tiles_x = (dim as u32).div_ceil(TILE);
+            let tiles_y = (n as u32).div_ceil(TILE);
+            let cfg = LaunchConfig {
+                grid_dim: (tiles_x * tiles_y, 1, 1),
+                block_dim: (TILE, TILE, 1),
+                shared_mem_bytes: 0,
+            };
+            let rows = n as i32;
+            let dims = dim as i32;
+            let tiles_xi = tiles_x as i32;
+            let mut lb = stream.launch_builder(&self.transpose_fn);
+            lb.arg(&d_rowmajor)
+                .arg(&mut data_t)
+                .arg(&rows)
+                .arg(&dims)
+                .arg(&tiles_xi);
+            unsafe { lb.launch(cfg) }.map_err(|e| launch_err(format!("transpose launch: {e}")))?;
+            // Ensure the transpose finished before the row-major allocation can
+            // be reused by the driver; then release it.
+            self.ctx
+                .synchronize()
+                .map_err(|e| launch_err(format!("sync after transpose: {e}")))?;
+            drop(d_rowmajor);
+
+            return self.cache_corpus(cache, key, name, version, data_t, n, dim);
+        }
+
+        // P1c pipeline: double-buffered blocks.
         let mut data_t = stream
             .alloc_zeros::<f32>(n * dim)
             .map_err(|e| launch_err(format!("alloc column-major corpus: {e}")))?;
-
-        let tiles_x = (dim as u32).div_ceil(TILE);
-        let tiles_y = (n as u32).div_ceil(TILE);
-        let cfg = LaunchConfig {
-            grid_dim: (tiles_x * tiles_y, 1, 1),
-            block_dim: (TILE, TILE, 1),
-            shared_mem_bytes: 0,
-        };
-        let rows = n as i32;
+        let block_elems = block_rows * dim;
         let dims = dim as i32;
+        let n_total = n as i32;
+        let tiles_x = (dim as u32).div_ceil(TILE);
         let tiles_xi = tiles_x as i32;
-        let mut lb = stream.launch_builder(&self.transpose_fn);
-        lb.arg(&d_rowmajor)
-            .arg(&mut data_t)
-            .arg(&rows)
-            .arg(&dims)
-            .arg(&tiles_xi);
-        unsafe { lb.launch(cfg) }.map_err(|e| launch_err(format!("transpose launch: {e}")))?;
-        // Ensure the transpose finished before the row-major allocation can be
-        // reused by the driver; then release it.
+        let mut scratch: [Option<CudaSlice<f32>>; 2] = [None, None];
+
+        for b in 0..n.div_ceil(block_rows) {
+            let r0 = b * block_rows;
+            let n_in = block_rows.min(n - r0);
+            let slot = b % 2;
+            let rows = &data[r0 * dim..(r0 + n_in) * dim];
+
+            {
+                let mut staging = self
+                    .staging_f32
+                    .lock()
+                    .map_err(|_| launch_err("pinned staging lock poisoned"))?;
+                {
+                    let slice = staging[slot].ensure(rows.len(), &self.ctx)?;
+                    slice.copy_from_slice(rows);
+                } // drop the `&mut` borrow before re-borrowing immutably
+                let buf = staging[slot]
+                    .buf
+                    .as_ref()
+                    .expect("staging allocated by ensure");
+                // Reusable row-major scratch for this slot, full block size so
+                // the final short block does not reallocate.
+                if scratch[slot].as_ref().map_or(true, |s| s.len() < block_elems) {
+                    scratch[slot] = Some(
+                        self.copy_stream
+                            .alloc_zeros::<f32>(block_elems)
+                            .map_err(|e| launch_err(format!("alloc block scratch: {e}")))?,
+                    );
+                }
+                let dst = scratch[slot].as_mut().expect("scratch allocated above");
+                self.copy_stream
+                    .memcpy_htod(buf, dst)
+                    .map_err(|e| launch_err(format!("upload corpus block: {e}")))?;
+            }
+
+            // Windowed transpose into rows [r0, r0 + n_in) of the full
+            // column-major corpus. The launch waits on this block's H2D copy
+            // (cudarc records the copy as the scratch's write event), while
+            // the copy of block N+1 is already being enqueued on `copy_stream`.
+            let tiles_y = (n_in as u32).div_ceil(TILE);
+            let cfg = LaunchConfig {
+                grid_dim: (tiles_x * tiles_y, 1, 1),
+                block_dim: (TILE, TILE, 1),
+                shared_mem_bytes: 0,
+            };
+            let row0 = r0 as i32;
+            let n_ini = n_in as i32;
+            let d_block = scratch[slot].as_ref().expect("scratch allocated above");
+            let mut lb = stream.launch_builder(&self.transpose_window_fn);
+            lb.arg(d_block)
+                .arg(&mut data_t)
+                .arg(&n_total)
+                .arg(&dims)
+                .arg(&tiles_xi)
+                .arg(&row0)
+                .arg(&n_ini);
+            unsafe { lb.launch(cfg) }
+                .map_err(|e| launch_err(format!("windowed transpose launch: {e}")))?;
+        }
+
+        // Drain the pipeline before the scratch is freed and the corpus is
+        // published; then the row-major blocks are released in `scratch`'s drop.
         self.ctx
             .synchronize()
-            .map_err(|e| launch_err(format!("sync after transpose: {e}")))?;
-        drop(d_rowmajor);
+            .map_err(|e| launch_err(format!("sync after block pipeline: {e}")))?;
+        drop(scratch);
 
+        self.cache_corpus(cache, key, name, version, data_t, n, dim)
+    }
+
+    /// Wrap the transposed corpus and record it in `cache`, keeping one version
+    /// per name (an older version is dead weight).
+    fn cache_corpus(
+        &self,
+        cache: &Mutex<HashMap<(String, u64), Arc<DeviceCorpus>>>,
+        key: (String, u64),
+        name: &str,
+        version: u64,
+        data_t: CudaSlice<f32>,
+        n: usize,
+        dim: usize,
+    ) -> Result<Arc<DeviceCorpus>, AccelError> {
         let corpus = Arc::new(DeviceCorpus {
             data_t,
             n: n as i32,
             dim: dim as i32,
         });
         if let Ok(mut map) = cache.lock() {
-            // Keep one version per name: an older version is dead weight.
             map.retain(|(n, v), _| !(n == name && *v != version));
             map.insert(key, corpus.clone());
         }
@@ -579,24 +860,261 @@ impl CudaBackend {
             .map_err(|e| launch_err(format!("download distances: {e}")))?;
 
         // Position -> id, then the same comparator the CPU path uses.
-        let mut merged: Vec<RawHit> = dists
-            .iter()
-            .zip(out_ids.iter())
-            .filter(|(_, &pos)| pos >= 0)
-            .filter_map(|(&distance, &pos)| {
-                ids.get(pos as usize)
-                    .map(|&id| RawHit { distance, id })
-            })
-            .collect();
-        merged.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        let mut merged: Vec<RawHit> = Vec::with_capacity(k);
+        collect_hits(ids, &out_ids, &dists, &mut merged);
+        merged.sort_by(hits_order);
         merged.truncate(k);
         Ok(merged)
     }
+
+    /// P1c-3: the fused cold path. Runs the same block pipeline as
+    /// [`Self::build_corpus`], but scans each block with the top-K kernel as
+    /// soon as its transpose has been enqueued — the kernel over block N
+    /// overlaps the H2D copy of block N+1 ("算第 N 块时预取第 N+1 块") — and
+    /// merges the per-block candidates on the host. Exact top-K decomposes
+    /// over disjoint row sets, so the merged answer is identical to scanning
+    /// the finished corpus (which is what the next query does via the cache).
+    ///
+    /// The corpus is published to `cache` exactly like [`Self::build_corpus`]
+    /// would; callers use this only on a cache miss with more than one block.
+    fn build_and_scan(
+        &self,
+        name: &str,
+        version: u64,
+        data: &[f32],
+        dim: usize,
+        cache: &Mutex<HashMap<(String, u64), Arc<DeviceCorpus>>>,
+        scan: &BlockScan<'_>,
+    ) -> Result<Vec<RawHit>, AccelError> {
+        let key = (name.to_string(), version);
+        if let Ok(map) = cache.lock() {
+            if let Some(hit) = map.get(&key) {
+                // Lost a race with a concurrent build: scan what is there.
+                return self.topk(hit.clone(), scan.as_topk_query());
+            }
+        }
+
+        let n = data.len() / dim.max(1);
+        if scan.k == 0 || n == 0 {
+            return Ok(Vec::new());
+        }
+        if scan.k > MAX_K {
+            return Err(AccelError::Invalid(format!(
+                "k={} exceeds the device MAX_K={}; use the host path",
+                scan.k, MAX_K
+            )));
+        }
+        if dim == 0 || scan.query.len() != dim {
+            return Err(AccelError::Invalid(format!(
+                "query dim {} != corpus dim {}",
+                scan.query.len(),
+                dim
+            )));
+        }
+        if scan.ids.len() != n {
+            return Err(AccelError::Invalid("corpus shape mismatch".into()));
+        }
+
+        let stream = self.ctx.default_stream();
+        crate::warm::warm_slice(data);
+
+        let query_host: Cow<'_, [f32]> = if scan.normalized {
+            let mut q = scan.query.to_vec();
+            scan.metric.normalize_in_place(&mut q);
+            Cow::Owned(q)
+        } else {
+            Cow::Borrowed(scan.query)
+        };
+        let knn_fn = self.knn_function(scan.k)?;
+        // The query is uploaded once; the dummy mask keeps the kernel's mask
+        // pointer valid (`has_mask = 0`). Flat windows are pre-filtered by the
+        // label mask on the host here, exactly like the IVF probe plan always
+        // has been — so the mask uploads once per scan, not once per block.
+        let d_query = stream
+            .clone_htod(query_host.as_ref())
+            .map_err(|e| launch_err(format!("upload query: {e}")))?;
+        let d_mask = stream
+            .clone_htod(&[1u8])
+            .map_err(|e| launch_err(format!("upload mask: {e}")))?;
+        let has_mask = 0i32;
+
+        let block_rows = self.prefetch_rows(dim, n);
+        let mut data_t = stream
+            .alloc_zeros::<f32>(n * dim)
+            .map_err(|e| launch_err(format!("alloc column-major corpus: {e}")))?;
+        let block_elems = block_rows * dim;
+        let dims = dim as i32;
+        let n_total = n as i32;
+        let tiles_x = (dim as u32).div_ceil(TILE);
+        let tiles_xi = tiles_x as i32;
+        let metric_i = metric_code(scan.metric);
+        let k = scan.k;
+        let mut scratch: [Option<CudaSlice<f32>>; 2] = [None, None];
+        let mut pending: Vec<(CudaSlice<i32>, CudaSlice<f32>)> = Vec::new();
+
+        for b in 0..n.div_ceil(block_rows) {
+            let r0 = b * block_rows;
+            let n_in = block_rows.min(n - r0);
+            let slot = b % 2;
+            let rows = &data[r0 * dim..(r0 + n_in) * dim];
+
+            {
+                let mut staging = self
+                    .staging_f32
+                    .lock()
+                    .map_err(|_| launch_err("pinned staging lock poisoned"))?;
+                {
+                    let slice = staging[slot].ensure(rows.len(), &self.ctx)?;
+                    slice.copy_from_slice(rows);
+                }
+                let buf = staging[slot]
+                    .buf
+                    .as_ref()
+                    .expect("staging allocated by ensure");
+                if scratch[slot].as_ref().map_or(true, |s| s.len() < block_elems) {
+                    scratch[slot] = Some(
+                        self.copy_stream
+                            .alloc_zeros::<f32>(block_elems)
+                            .map_err(|e| launch_err(format!("alloc block scratch: {e}")))?,
+                    );
+                }
+                let dst = scratch[slot].as_mut().expect("scratch allocated above");
+                self.copy_stream
+                    .memcpy_htod(buf, dst)
+                    .map_err(|e| launch_err(format!("upload corpus block: {e}")))?;
+            }
+
+            // Transpose block b into rows [r0, r0 + n_in) — waits on this
+            // block's copy (cudarc slice events).
+            let tiles_y = (n_in as u32).div_ceil(TILE);
+            let cfg = LaunchConfig {
+                grid_dim: (tiles_x * tiles_y, 1, 1),
+                block_dim: (TILE, TILE, 1),
+                shared_mem_bytes: 0,
+            };
+            let row0 = r0 as i32;
+            let n_ini = n_in as i32;
+            let d_block = scratch[slot].as_ref().expect("scratch allocated above");
+            let mut lb = stream.launch_builder(&self.transpose_window_fn);
+            lb.arg(d_block)
+                .arg(&mut data_t)
+                .arg(&n_total)
+                .arg(&dims)
+                .arg(&tiles_xi)
+                .arg(&row0)
+                .arg(&n_ini);
+            unsafe { lb.launch(cfg) }
+                .map_err(|e| launch_err(format!("windowed transpose launch: {e}")))?;
+
+            // Scan block b right away on the same stream: the kernel waits for
+            // the transpose, while block b+1's copy is already in flight.
+            let pos = Self::block_positions(scan, r0, n_in);
+            if pos.is_empty() {
+                continue;
+            }
+            let npos = pos.len();
+            let d_pos = stream
+                .clone_htod(&pos)
+                .map_err(|e| launch_err(format!("upload block positions: {e}")))?;
+            let grid = (npos as u32).div_ceil(THREADS).clamp(1, MAX_BLOCKS);
+            let candidates = grid as usize * k;
+            let mut d_out_id = stream
+                .alloc_zeros::<i32>(candidates)
+                .map_err(|e| launch_err(format!("alloc candidates: {e}")))?;
+            let mut d_out_dist = stream
+                .alloc_zeros::<f32>(candidates)
+                .map_err(|e| launch_err(format!("alloc distances: {e}")))?;
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let npos_i = npos as i32;
+            let mut lb = stream.launch_builder(&knn_fn);
+            lb.arg(&data_t)
+                .arg(&d_query)
+                .arg(&d_mask)
+                .arg(&has_mask)
+                .arg(&n_total)
+                .arg(&npos_i)
+                .arg(&d_pos)
+                .arg(&dims)
+                .arg(&metric_i)
+                .arg(&mut d_out_id)
+                .arg(&mut d_out_dist);
+            unsafe { lb.launch(cfg) }.map_err(|e| launch_err(format!("topk launch: {e}")))?;
+            // Candidate downloads are deferred to one pass after the pipeline
+            // drains — a per-block `clone_dtoh` here would synchronize the
+            // stream and hide the very overlap this path exists for.
+            pending.push((d_out_id, d_out_dist));
+        }
+
+        self.ctx
+            .synchronize()
+            .map_err(|e| launch_err(format!("sync after fused scan: {e}")))?;
+        let mut merged: Vec<RawHit> = Vec::new();
+        for (d_out_id, d_out_dist) in &pending {
+            let out_ids: Vec<i32> = stream
+                .clone_dtoh(d_out_id)
+                .map_err(|e| launch_err(format!("download ids: {e}")))?;
+            let dists: Vec<f32> = stream
+                .clone_dtoh(d_out_dist)
+                .map_err(|e| launch_err(format!("download distances: {e}")))?;
+            collect_hits(scan.ids, &out_ids, &dists, &mut merged);
+        }
+        drop(pending);
+        drop(scratch);
+        merged.sort_by(hits_order);
+        merged.truncate(k);
+
+        // Publish the finished corpus exactly like `build_corpus` would.
+        self.cache_corpus(cache, key, name, version, data_t, n, dim)?;
+        Ok(merged)
+    }
+
+    /// Rows of the block window `[r0, r0 + n_in)` as kernel positions.
+    ///
+    /// The flat scan pre-applies the label mask here (so the kernel runs with
+    /// `has_mask = 0`); the IVF probe contributes only the planned positions
+    /// that fall inside this window.
+    fn block_positions(scan: &BlockScan<'_>, r0: usize, n_in: usize) -> Vec<i32> {
+        match scan.positions {
+            Some(all) => all
+                .iter()
+                .copied()
+                .filter(|&p| (p as usize) >= r0 && (p as usize) < r0 + n_in)
+                .map(|p| p as i32)
+                .collect(),
+            None => (r0..r0 + n_in)
+                .filter(|&r| scan.flat_mask.map_or(true, |m| m.value(r)))
+                .map(|r| r as i32)
+                .collect(),
+        }
+    }
+}
+
+/// Map `(out_row, distance)` candidate pairs from a kernel download into
+/// `RawHit`s appended to `into`. Out rows are corpus row indices; `-1` marks
+/// an unused candidate slot.
+fn collect_hits(ids: &[u64], out_ids: &[i32], dists: &[f32], into: &mut Vec<RawHit>) {
+    into.extend(
+        dists
+            .iter()
+            .zip(out_ids.iter())
+            .filter(|(_, &row)| row >= 0)
+            .filter_map(|(&distance, &row)| {
+                ids.get(row as usize).map(|&id| RawHit { distance, id })
+            }),
+    );
+}
+
+/// The host comparator: nearest-first, ties broken by ascending id — the same
+/// ordering `gtv_index::exact_topk` produces.
+fn hits_order(a: &RawHit, b: &RawHit) -> std::cmp::Ordering {
+    a.distance
+        .partial_cmp(&b.distance)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 fn metric_code(metric: Metric) -> i32 {
@@ -626,19 +1144,29 @@ impl AccelBackend for CudaBackend {
         if req.ids.len() > i32::MAX as usize {
             return Err(AccelError::Invalid("corpus shape overflow".into()));
         }
+        let scan = BlockScan {
+            ids: req.ids,
+            query: req.query,
+            metric: req.metric,
+            normalized: req.normalized,
+            k: req.k,
+            flat_mask: req.mask,
+            positions: None,
+        };
+        // Cache hit -> whole-corpus scan (steady state, untouched).
+        // Cold + multi-block -> P1c fused pipeline (build_and_scan).
+        // Cold + single block -> plain build + whole scan (the pre-P1c path).
+        if let Ok(map) = self.corpora.lock() {
+            if let Some(hit) = map.get(&(req.name.to_string(), req.version)) {
+                return self.topk(hit.clone(), scan.as_topk_query());
+            }
+        }
+        let n = req.ids.len();
+        if n > self.prefetch_rows(req.dim, n) {
+            return self.build_and_scan(req.name, req.version, req.data, req.dim, &self.corpora, &scan);
+        }
         let corpus = self.corpus(req)?;
-        self.topk(
-            corpus,
-            TopkQuery {
-                ids: req.ids,
-                query: req.query,
-                metric: req.metric,
-                normalized: req.normalized,
-                k: req.k,
-                mask: req.mask,
-                positions: None,
-            },
-        )
+        self.topk(corpus, scan.as_topk_query())
     }
 
     fn ivf_probe(&self, req: &IvfRequest<'_>) -> Result<Vec<RawHit>, AccelError> {
@@ -648,19 +1176,33 @@ impl AccelBackend for CudaBackend {
         if req.ids.len() > i32::MAX as usize {
             return Err(AccelError::Invalid("ivf corpus shape overflow".into()));
         }
+        let scan = BlockScan {
+            ids: req.ids,
+            query: req.query,
+            metric: req.metric,
+            normalized: req.normalized,
+            k: req.k,
+            flat_mask: None,
+            positions: Some(req.positions),
+        };
+        if let Ok(map) = self.ivf_corpora.lock() {
+            if let Some(hit) = map.get(&(req.name.to_string(), req.version)) {
+                return self.topk(hit.clone(), scan.as_topk_query());
+            }
+        }
+        let n = req.ids.len();
+        if n > self.prefetch_rows(req.dim, n) {
+            return self.build_and_scan(
+                req.name,
+                req.version,
+                req.data,
+                req.dim,
+                &self.ivf_corpora,
+                &scan,
+            );
+        }
         let corpus = self.ivf_corpus(req)?;
-        self.topk(
-            corpus,
-            TopkQuery {
-                ids: req.ids,
-                query: req.query,
-                metric: req.metric,
-                normalized: req.normalized,
-                k: req.k,
-                mask: None,
-                positions: Some(req.positions),
-            },
-        )
+        self.topk(corpus, scan.as_topk_query())
     }
 
     fn mem_info(&self) -> Option<(u64, u64)> {
@@ -744,6 +1286,36 @@ impl AccelBackend for CudaBackend {
             .into_iter()
             .map(|i| if i < 0 { None } else { Some(i as u32) })
             .collect())
+    }
+
+    /// P2 heat pump: build (or reuse) the device copy ahead of the query that
+    /// asked for it.
+    ///
+    /// This reuses [`Self::build_corpus`] verbatim, so the pump pays exactly
+    /// what a cold query would have paid — it just pays earlier, while no query
+    /// is waiting. A cache hit costs one mutex read.
+    ///
+    /// `RightSeries` / `BucketIndex` have no device-copy cache behind this seam
+    /// (the as-of path builds its series inside the call), so they report
+    /// "nothing held" instead of pretending.
+    fn prefetch_corpus(&self, req: &PrefetchRequest<'_>) -> Result<bool, AccelError> {
+        if req.dim == 0 || req.data.len() != req.ids.len() * req.dim {
+            return Err(AccelError::Invalid("prefetch corpus shape mismatch".into()));
+        }
+        if req.ids.len() > i32::MAX as usize {
+            return Err(AccelError::Invalid("prefetch corpus shape overflow".into()));
+        }
+        let cache = match req.kind {
+            ResidentKind::Corpus => &self.corpora,
+            ResidentKind::IvfCorpus => &self.ivf_corpora,
+            ResidentKind::RightSeries | ResidentKind::BucketIndex => return Ok(false),
+        };
+        let corpus = self.build_corpus(req.name, req.version, req.data, req.dim, cache)?;
+        Ok(corpus.n as usize == req.ids.len())
+    }
+
+    fn direct_upload_stats(&self) -> Option<(u64, u64)> {
+        Some(self.gpudirect_stats())
     }
 
     fn release(&self, kind: ResidentKind, name: &str) {

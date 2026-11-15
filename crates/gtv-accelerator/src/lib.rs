@@ -37,9 +37,11 @@
 
 pub mod backend;
 pub mod budget;
+pub mod gpudirect;
 pub mod host;
 pub mod resident;
 pub mod sweep;
+pub mod warm;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -51,15 +53,17 @@ pub use gtv_params::{AccelCache, ResolvedParams};
 
 pub use backend::{
     AccelBackend, AccelError, AccelOp, AsofRequest, DeviceInfo, DeviceKind, IvfRequest, KnnRequest,
-    RawHit,
+    PrefetchRequest, RawHit,
 };
 pub use budget::{VramBudget, DEFAULT_HEADROOM};
 pub use host::HostBackend;
 pub use resident::{
     Admission, BlockView, DeclineReason, ResidentKey, ResidentKind, ResidentRegistry,
-    ResidentTelemetry, SyncPolicy, ADMIT_MARGIN, DEFAULT_HEAT_HALF_LIFE, PROTECT_FLOOR,
+    ResidentTelemetry, SyncPolicy, ADMIT_MARGIN, DEFAULT_HEAT_HALF_LIFE, PREFETCH_HEAT_FLOOR,
+    PROTECT_FLOOR,
 };
 pub use sweep::asof_match;
+pub use warm::{warm_calls, warm_pages, warm_slice};
 
 /// Total VRAM of `ordinal`, if a device is present and the crate was built with
 /// the `cuda` feature.
@@ -101,6 +105,18 @@ pub struct AcceleratorTelemetry {
     pub executed_on_host: u64,
     pub fallbacks: u64,
     pub cache_declined: u64,
+    /// P1c page-warming hints served ([`AcceleratorRegistry::prefetch_hint`]).
+    pub prefetch_hints: u64,
+    /// P2 heat-pump uploads that completed (a hot non-resident block is now
+    /// resident before the query that wanted it).
+    pub prefetch_uploads: u64,
+    /// P2 heat-pump attempts the ledger or the backend refused. Expected and
+    /// harmless: the pump competes on the same budget a query would.
+    pub prefetch_failures: u64,
+    /// GPUDirect Storage `(direct, staged)` corpus uploads. `None` for a backend
+    /// that keeps no such counters (the host backend). `direct` is `0` until a
+    /// `cufile` binding is compiled in — see [`gpudirect`].
+    pub gpudirect: Option<(u64, u64)>,
     pub last_error: Option<String>,
     pub resident: ResidentTelemetry,
 }
@@ -136,6 +152,11 @@ pub struct AcceleratorRegistry {
     host_execs: AtomicU64,
     fallbacks: AtomicU64,
     cache_declined: AtomicU64,
+    prefetch_hints: AtomicU64,
+    prefetch_uploads: AtomicU64,
+    prefetch_failures: AtomicU64,
+    /// Blocks per heat-pump pass; `0` disables the pump (`ACCEL_PREFETCH=OFF`).
+    heat_pump_blocks: usize,
     last_error: RwLock<Option<String>>,
 }
 
@@ -162,7 +183,11 @@ impl AcceleratorRegistry {
         let backend: Arc<dyn AccelBackend> = if params.accel_cache.uses_device()
             && params.cuda_enabled
         {
-            match open_device(params.cuda_device) {
+            match open_device(
+                params.cuda_device,
+                params.accel_gpudirect,
+                params.accel_gpudirect_threshold_bytes,
+            ) {
                 Ok(b) => b,
                 Err(e) => {
                     last_error = Some(e.to_string());
@@ -190,6 +215,14 @@ impl AcceleratorRegistry {
             host_execs: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
             cache_declined: AtomicU64::new(0),
+            prefetch_hints: AtomicU64::new(0),
+            prefetch_uploads: AtomicU64::new(0),
+            prefetch_failures: AtomicU64::new(0),
+            heat_pump_blocks: if params.accel_prefetch {
+                params.accel_prefetch_blocks
+            } else {
+                0
+            },
             last_error: RwLock::new(last_error),
         }
     }
@@ -206,8 +239,36 @@ impl AcceleratorRegistry {
             host_execs: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
             cache_declined: AtomicU64::new(0),
+            prefetch_hints: AtomicU64::new(0),
+            prefetch_uploads: AtomicU64::new(0),
+            prefetch_failures: AtomicU64::new(0),
+            heat_pump_blocks: 0,
             last_error: RwLock::new(None),
         }
+    }
+
+    /// Enable the heat pump with an explicit block budget (the counterpart of
+    /// `ACCEL_PREFETCH=ON` + `ACCEL_PREFETCH_BLOCKS`).
+    pub fn with_heat_pump(mut self, blocks: usize) -> Self {
+        self.heat_pump_blocks = blocks;
+        self
+    }
+
+    /// Blocks one heat-pump pass may pull in; `0` means the pump is off.
+    pub fn heat_pump_blocks(&self) -> usize {
+        self.heat_pump_blocks
+    }
+
+    /// Whether `(kind, name)` has a device block right now.
+    ///
+    /// Used by the engine probe path to skip a page-warming hint for data that
+    /// is already resident — a hint is only worth its syscall when the upload
+    /// (or a host scan) is actually imminent.
+    pub fn is_resident(&self, kind: ResidentKind, name: &str) -> bool {
+        self.resident
+            .read()
+            .map(|r| r.is_resident(&ResidentKey::new(kind, name)))
+            .unwrap_or(false)
     }
 
     /// The active device description.
@@ -235,11 +296,39 @@ impl AcceleratorRegistry {
         rows: u64,
         version: u64,
     ) -> Option<Admission> {
+        self.admit_inner(key, bytes, rows, version, false)
+    }
+
+    /// Admission on behalf of the idle heat pump: it may only fill VRAM that is
+    /// free right now, and it consumes heat instead of adding to it. The policy
+    /// lives in [`ResidentRegistry::admit_prefetch`].
+    fn admit_for_prefetch(
+        &self,
+        key: &ResidentKey,
+        bytes: u64,
+        rows: u64,
+        version: u64,
+    ) -> Option<Admission> {
+        self.admit_inner(key, bytes, rows, version, true)
+    }
+
+    fn admit_inner(
+        &self,
+        key: &ResidentKey,
+        bytes: u64,
+        rows: u64,
+        version: u64,
+        prefetch: bool,
+    ) -> Option<Admission> {
         let mut guard = self.resident.write().ok()?;
         if !guard.mode().tracks_residency() {
             return None;
         }
-        let admission = guard.admit(key, bytes, rows, version);
+        let admission = if prefetch {
+            guard.admit_prefetch(key, bytes, rows, version)
+        } else {
+            guard.admit(key, bytes, rows, version)
+        };
         // Keep the backend's buffers in step with the ledger.
         for evicted in guard.take_evictions() {
             self.backend.release(evicted.kind, &evicted.name);
@@ -249,6 +338,15 @@ impl AcceleratorRegistry {
 
     fn note_error(&self, err: AccelError) {
         self.fallbacks.fetch_add(1, Ordering::Relaxed);
+        self.record_error(err);
+    }
+
+    /// Store the diagnosis without counting a query fallback.
+    ///
+    /// A failed heat-pump upload is not a query outcome; counting it as a
+    /// fallback would break the §6 invariant that every request ends on exactly
+    /// one execution surface.
+    fn record_error(&self, err: AccelError) {
         if let Ok(mut slot) = self.last_error.write() {
             *slot = Some(err.to_string());
         }
@@ -352,6 +450,128 @@ impl AcceleratorRegistry {
         }
     }
 
+    /// Non-resident keys worth pulling in proactively, hottest first.
+    ///
+    /// This reads the shadow ledger, which only ever holds keys a query was
+    /// *refused*: the list is therefore "what the workload keeps asking for and
+    /// does not have". `min_heat` (use [`PREFETCH_HEAT_FLOOR`]) keeps one-shot
+    /// scans out, and `limit` is the caller's bandwidth budget.
+    pub fn prefetch_candidates(&self, min_heat: f64, limit: usize) -> Vec<ResidentKey> {
+        self.resident
+            .read()
+            .map(|r| {
+                r.hottest_shadows(min_heat, limit)
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drop a key's shadow evidence — the dataset was dropped, so no pump should
+    /// ever try to upload it again.
+    pub fn forget_candidate(&self, kind: ResidentKind, name: &str) {
+        if let Ok(mut r) = self.resident.write() {
+            r.forget_shadow(&ResidentKey::new(kind, name));
+        }
+    }
+
+    /// Hand a dataset's device copy back to the budget, shadow entry included.
+    ///
+    /// This is the heat pump's *reclaim* step: a collection dropped from the
+    /// engine map can never be a hit again, so keeping its VRAM only shrinks the
+    /// working set. Returns the bytes freed (`0` when nothing was resident), and
+    /// is a no-op on a host-only registry.
+    pub fn release(&self, kind: ResidentKind, name: &str) -> u64 {
+        self.resident
+            .write()
+            .map(|mut r| r.release(&ResidentKey::new(kind, name)))
+            .unwrap_or(0)
+    }
+
+    /// `(kind, name)` of every resident block, for the pump's reclaim sweep.
+    pub fn resident_blocks(&self) -> Vec<(ResidentKind, String)> {
+        self.resident
+            .read()
+            .map(|r| r.blocks().into_iter().map(|b| (b.kind, b.name)).collect())
+            .unwrap_or_default()
+    }
+
+    /// P2 heat pump: upload a hot non-resident corpus *before* the query that
+    /// wants it, so that query's first use is a resident hit.
+    ///
+    /// The key goes through [`ResidentRegistry::admit_prefetch`], not the query
+    /// path: the pump may only take VRAM that is free *right now*, so it can
+    /// neither evict a block a query is using nor inflate a corpus's heat. A
+    /// refusal is normal and expected — the pump exists to convert idle slack
+    /// (typically the region a dropped or shrunk collection just released) into
+    /// a warm block; it is counted in `prefetch_failures` and never fails a
+    /// query. See [`Self::release`] for the reclaim half of that loop.
+    ///
+    /// Returns `true` when the device now holds the corpus.
+    pub fn prefetch_upload(
+        &self,
+        kind: ResidentKind,
+        name: &str,
+        ids: &[u64],
+        data: &[f32],
+        dim: usize,
+        version: u64,
+    ) -> bool {
+        if !self.is_device_backed() || dim == 0 || data.len() != ids.len() * dim {
+            return false;
+        }
+        let req = PrefetchRequest {
+            kind,
+            name,
+            version,
+            ids,
+            data,
+            dim,
+        };
+        let key = ResidentKey::new(kind, name);
+        let admitted = matches!(
+            self.admit_for_prefetch(&key, req.resident_bytes(), req.rows(), version),
+            Some(Admission::Resident)
+        );
+        if !admitted {
+            self.prefetch_failures.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        match self.backend.prefetch_corpus(&req) {
+            Ok(true) => {
+                self.prefetch_uploads.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Ok(false) => {
+                self.prefetch_failures.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(e) => {
+                self.record_error(e);
+                self.prefetch_failures.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// P1c 预取预告: warm `host`'s pages so an imminent upload or scan does not
+    /// pay page faults on its critical path.
+    ///
+    /// `kind`/`name` identify the dataset the range belongs to — the P2
+    /// heat-driven prefetch correlates these hints with later admissions — but
+    /// the warming itself acts on the host range because only the caller holds
+    /// the pointer (`storage-tiering-ssd-ram-vram.md` §4.2 row 1: "数据仍在 RAM
+    /// 层预热，不占 VRAM"). The call never fails and never waits on I/O
+    /// completion: every backend path must also warm at upload time on its own
+    /// (`CudaBackend::build_corpus` does), so a missed hint costs latency,
+    /// never correctness.
+    pub fn prefetch_hint(&self, kind: ResidentKind, name: &str, host: &[f32]) {
+        let _ = (kind, name);
+        self.prefetch_hints.fetch_add(1, Ordering::Relaxed);
+        warm::warm_slice(host);
+    }
+
     /// Per-block view of the resident cache.
     pub fn blocks(&self) -> Vec<BlockView> {
         self.resident
@@ -379,6 +599,10 @@ impl AcceleratorRegistry {
             executed_on_host: self.host_execs.load(Ordering::Relaxed),
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
             cache_declined: self.cache_declined.load(Ordering::Relaxed),
+            prefetch_hints: self.prefetch_hints.load(Ordering::Relaxed),
+            prefetch_uploads: self.prefetch_uploads.load(Ordering::Relaxed),
+            prefetch_failures: self.prefetch_failures.load(Ordering::Relaxed),
+            gpudirect: self.backend.direct_upload_stats(),
             last_error: self.last_error.read().ok().and_then(|e| e.clone()),
             resident,
         }
@@ -392,12 +616,22 @@ impl Default for AcceleratorRegistry {
 }
 
 #[cfg(feature = "cuda")]
-fn open_device(ordinal: usize) -> Result<Arc<dyn AccelBackend>, AccelError> {
-    cuda::CudaBackend::probe(ordinal).map(|b| Arc::new(b) as Arc<dyn AccelBackend>)
+fn open_device(
+    ordinal: usize,
+    gpudirect: bool,
+    gpudirect_threshold: u64,
+) -> Result<Arc<dyn AccelBackend>, AccelError> {
+    cuda::CudaBackend::probe(ordinal).map(|b| {
+        Arc::new(b.with_gpudirect(gpudirect, gpudirect_threshold)) as Arc<dyn AccelBackend>
+    })
 }
 
 #[cfg(not(feature = "cuda"))]
-fn open_device(_ordinal: usize) -> Result<Arc<dyn AccelBackend>, AccelError> {
+fn open_device(
+    _ordinal: usize,
+    _gpudirect: bool,
+    _gpudirect_threshold: u64,
+) -> Result<Arc<dyn AccelBackend>, AccelError> {
     Err(AccelError::NoDevice(
         "built without the `cuda` feature".to_string(),
     ))
@@ -415,6 +649,7 @@ mod tests {
     struct FakeDevice {
         info: DeviceInfo,
         calls: AtomicU64,
+        prefetches: AtomicU64,
         released: RwLock<Vec<String>>,
     }
 
@@ -427,11 +662,15 @@ mod tests {
                     total_bytes: 1 << 30,
                 },
                 calls: AtomicU64::new(0),
+                prefetches: AtomicU64::new(0),
                 released: RwLock::new(Vec::new()),
             }
         }
         fn calls(&self) -> u64 {
             self.calls.load(Ordering::Relaxed)
+        }
+        fn prefetches(&self) -> u64 {
+            self.prefetches.load(Ordering::Relaxed)
         }
         fn released(&self) -> Vec<String> {
             self.released.read().map(|v| v.clone()).unwrap_or_default()
@@ -461,6 +700,13 @@ mod tests {
             if let Ok(mut v) = self.released.write() {
                 v.push(name.to_string());
             }
+        }
+        fn prefetch_corpus(&self, req: &PrefetchRequest<'_>) -> Result<bool, AccelError> {
+            self.prefetches.fetch_add(1, Ordering::Relaxed);
+            Ok(matches!(
+                req.kind,
+                ResidentKind::Corpus | ResidentKind::IvfCorpus
+            ))
         }
     }
 
@@ -673,6 +919,137 @@ mod tests {
         let t = reg.telemetry();
         assert_eq!(t.resident.pending_rows, 0);
         assert!(t.resident.upload_bytes >= 40);
+    }
+
+    #[test]
+    fn the_heat_pump_fills_vram_a_dropped_collection_released() {
+        let fake = Arc::new(FakeDevice::new());
+        // Room for exactly one 48-byte corpus.
+        let reg = AcceleratorRegistry::with_backend(fake.clone(), ledger(60));
+        let corpus_req = corpus(&IDS, &DATA, &[0.1, 0.1], 1);
+        let other = KnnRequest {
+            name: "other",
+            version: 1,
+            ids: &IDS,
+            data: &DATA,
+            dim: 2,
+            metric: Metric::L2,
+            normalized: false,
+            query: &[0.0, 0.0],
+            k: 1,
+            mask: None,
+        };
+
+        // Five references put "songs" at heat 5.0, above PROTECT_FLOOR.
+        reg.exact_knn(&corpus_req);
+        for _ in 0..4 {
+            reg.exact_knn(&corpus_req);
+        }
+        // Six refusals leave "other" at shadow heat 6.0: above the pump floor,
+        // still below the 1.25x the *query* path requires (6.25), so every one
+        // of those queries ran on the host and paid its own upload.
+        for _ in 0..6 {
+            reg.exact_knn(&other);
+        }
+        let t = reg.telemetry();
+        assert_eq!(t.executed_on_host, 6);
+        assert_eq!(t.cache_declined, 6);
+
+        let candidates = reg.prefetch_candidates(PREFETCH_HEAT_FLOOR, 4);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "other");
+        assert_eq!(candidates[0].kind, ResidentKind::Corpus);
+
+        // A saturated cache has no slack, and the pump does not create any: it
+        // declines rather than evict the block the queries are using.
+        assert!(!reg.prefetch_upload(ResidentKind::Corpus, "other", &IDS, &DATA, 2, 1));
+        assert_eq!(fake.prefetches(), 0, "no slack, no upload");
+        assert!(reg.is_resident(ResidentKind::Corpus, "songs"));
+
+        // The collection behind the resident block is dropped: its device copy
+        // can never be a hit again, so the registry hands the bytes back. This
+        // is where a slack-only pump gets its room.
+        assert_eq!(
+            reg.release(ResidentKind::Corpus, "songs"),
+            other.resident_bytes(),
+            "the dropped collection's whole device copy comes back"
+        );
+        assert!(!reg.is_resident(ResidentKind::Corpus, "songs"));
+
+        // With nothing waiting, the released region is filled by the corpus the
+        // workload kept asking for, so the next transfer is off the critical
+        // path instead of on it.
+        assert!(reg.prefetch_upload(ResidentKind::Corpus, "other", &IDS, &DATA, 2, 1));
+        assert_eq!(fake.prefetches(), 1);
+
+        let before = fake.calls();
+        let hits = reg.exact_knn(&other);
+        assert_eq!(hits.len(), 1, "k=1");
+        assert_eq!(fake.calls(), before + 1, "the pumped query runs on the device");
+
+        let t = reg.telemetry();
+        assert_eq!(t.prefetch_uploads, 1);
+        assert_eq!(t.prefetch_failures, 1, "the saturated pass declined once");
+        assert!(t.accounting_holds(), "a pump must not disturb query accounting");
+    }
+
+    #[test]
+    fn a_saturated_cache_makes_the_pump_decline_without_evicting() {
+        let fake = Arc::new(FakeDevice::new());
+        let reg = AcceleratorRegistry::with_backend(fake.clone(), ledger(60));
+        let cold = KnnRequest {
+            name: "cold",
+            version: 1,
+            ids: &IDS,
+            data: &DATA,
+            dim: 2,
+            metric: Metric::L2,
+            normalized: false,
+            query: &[0.0, 0.0],
+            k: 1,
+            mask: None,
+        };
+        // "songs" owns the whole budget and its heat protects it.
+        reg.exact_knn(&corpus(&IDS, &DATA, &[0.1, 0.1], 1));
+        for _ in 0..4 {
+            reg.exact_knn(&corpus(&IDS, &DATA, &[0.1, 0.1], 1));
+        }
+        reg.exact_knn(&cold); // one refusal: shadow heat 1.0
+
+        // The query path is allowed to evict here; the pump is not. It declines
+        // with `no-slack` and leaves the resident set exactly as it found it.
+        assert!(!reg.prefetch_upload(ResidentKind::Corpus, "cold", &IDS, &DATA, 2, 1));
+        assert_eq!(fake.prefetches(), 0, "a pump never displaces a resident block");
+        assert_eq!(reg.resident_blocks().len(), 1);
+        assert!(reg.is_resident(ResidentKind::Corpus, "songs"));
+        let t = reg.telemetry();
+        assert_eq!(t.prefetch_failures, 1);
+        assert_eq!(t.prefetch_uploads, 0);
+        assert_eq!(t.resident.evictions, 0, "nothing was thrown out to make room");
+    }
+
+    #[test]
+    fn a_refused_pump_is_counted_but_never_fatal() {
+        let fake = Arc::new(FakeDevice::new());
+        // Too small for the corpus, so admission declines every time.
+        let reg = AcceleratorRegistry::with_backend(fake.clone(), ledger(16));
+        assert!(!reg.prefetch_upload(ResidentKind::Corpus, "songs", &IDS, &DATA, 2, 1));
+        assert_eq!(fake.prefetches(), 0, "a declined pump never reaches the device");
+        let t = reg.telemetry();
+        assert_eq!(t.prefetch_failures, 1);
+        assert_eq!(t.prefetch_uploads, 0);
+        assert_eq!(t.requests, 0, "prefetching is not a query");
+        assert!(t.accounting_holds());
+    }
+
+    #[test]
+    fn prefetch_is_a_no_op_without_a_device() {
+        let reg = AcceleratorRegistry::host_only();
+        assert!(!reg.prefetch_upload(ResidentKind::Corpus, "songs", &IDS, &DATA, 2, 1));
+        assert!(reg.prefetch_candidates(PREFETCH_HEAT_FLOOR, 4).is_empty());
+        let t = reg.telemetry();
+        assert_eq!(t.prefetch_uploads, 0);
+        assert_eq!(t.prefetch_failures, 0);
     }
 
     #[test]
