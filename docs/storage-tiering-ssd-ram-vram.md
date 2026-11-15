@@ -128,7 +128,7 @@ Strata 相对传统 offload 的质变是**把「同步串行搬运」改成「�
 |---|---|---|
 | P1 | **下一个候选块的 `MADV_WILLNEED` + `cudaHostRegister` 提前发起** | 在 `AcceleratorRegistry` 里加一个「预告」接口，engine 在探测某集合时顺带预告可能下一个要用的集合。数据仍在 RAM 层预热，不占 VRAM |
 | P1 | **`cudaMemcpyAsync` + CUDA stream 与 kernel 重叠** | 上传与上一个 kernel 执行重叠，隐藏 PCIe 延迟 |
-| P2 | **heat 驱动的预取**：shadow ledger 里 heat 最高但未 resident 的块，空闲时主动拉入 | 复用 `resident.rs` 已有的 shadow ledger（`note_reference` 已在积累非 resident 块的热度），把「被动淘汰」升级为「主动预热」 |
+| P2 | **heat 驱动的预取**：shadow ledger 里 heat 最高但未 resident 的块，空闲时主动拉入 | 复用 `resident.rs` 已有的 shadow ledger（`note_reference` 已在积累非 resident 块的热度），把「被动淘汰」升级为「主动预热」。**实测修正**：预取只准填「此刻真正空闲」的 VRAM，绝不许淘汰（否则把查询刚换进来的块再搬一遍，见 §6 P2 行） |
 
 预期效果：命中率不变的前提下，**隐藏 PCIe 8 GB/s 的搬运墙**；对「上传与计算重叠良好」的负载，端到端可提升 **1.5–2×**（数据说话，先 benchmark 后宣称）。
 
@@ -144,8 +144,10 @@ Strata 相对传统 offload 的质变是**把「同步串行搬运」改成「�
 | `ResidentRegistry::admit` 接受 `BytesSource`（Owned / Mapped / PinnedMapped）而非强制 `Vec` | `gtv-accelerator/src/resident.rs` | 让 resident 块的来源从「第三份拷贝」变成「mmap 视图引用」 |
 | `AccelBackend` 增加 `upload_from_mapped(ptr, len, kind, name)` | `gtv-accelerator/src/backend.rs` | 后端负责 `cudaHostRegister` + `cudaMemcpyAsync`，把 pin 细节封装在 CUDA 侧 |
 | `Segment`（GTVSeg）暴露列地址/长度给上传路径 | `gtv-storage/src/segment.rs` | 已能 `cast_slice`，只需把 `MappedCol` 的指针暴露成可上传的 `(ptr, len)` |
-| 预取预告接口 | `gtv-accelerator/src/lib.rs`（`AcceleratorRegistry`） | 新增 `prefetch_hint(kind, name)`，engine 在探测路径调用 |
-| 新参数 `ACCEL_*` | `gtv-params` / `gtvdb.params.example` | `ACCEL_PIN_MODE`、`ACCEL_PREFETCH` 等，默认关，与 `ACCEL_CACHE` 同风格 |
+| 预取预告接口 | `gtv-accelerator/src/lib.rs`（`AcceleratorRegistry`） | ✅ 已交付 `prefetch_hint(kind, name, host)`；`KnnCollection::search_with` 只在 `!is_resident` 时调用——驻留块没有主机读需要预热 |
+| heat 预取 + 空闲回收 | `resident.rs`（`hottest_shadows` / `admit_prefetch` / `release`）+ `gtv-engine/src/knn.rs::pump_heat_prefetch` | ✅ 已交付：shadow ledger → 候选（`PREFETCH_HEAT_FLOOR = 1.5`）→ **slack-only** 准入（`DeclineReason::NoSlack`，不淘汰、不加热度）；每轮起手 reclaim 掉「已从集合表消失」的语料，把 DROP 掉的 VRAM 变成可填的空位 |
+| 新参数 `ACCEL_*` | `gtv-params` / `gtvdb.params.example` | ✅ `ACCEL_PREFETCH`（默认 OFF）、`ACCEL_PREFETCH_BLOCKS`（默认 1）、`ACCEL_GPUDIRECT`（默认 OFF，被 `CUDA_MODE=OFF` 一票否决）、`ACCEL_GPUDIRECT_THRESHOLD`（默认 1 GiB）；与 `ACCEL_CACHE` 同风格 |
+| GPUDirect 策略接缝 | `gtv-accelerator/src/gpudirect.rs` | ✅ 纯策略、无 FFI/unsafe：`probe()` + `upload_plan()` + `DirectStatus`；`DIRECT_TRANSFER_COMPILED = false` ⇒ 当前二进制**永不**宣称直传（诚实属性） |
 
 **不碰**：`csr.rs` 1180 行算子、`edge_slices()` 签名、`Col<T>` 的 `Deref` 语义、GTVSeg 字节格式（v1 不变）。所有改动是**在两层之间加接线**，不是改任何一层的内部。
 
@@ -158,8 +160,23 @@ Strata 相对传统 offload 的质变是**把「同步串行搬运」改成「�
 | **P1a 测量基线** | `bench_pcie_transfer`：对 100M/1G 边测「普通 Vec 上传 vs pinned mmap 上传 vs 无上传」，量化 DMA 墙 | 一张表：三种路径的 GB/s 与延迟，作为是否值得做 pinned 的判据 |
 | **P1b pinned 上传** | `upload_from_mapped` + `cudaHostRegister`，host backend 为 no-op 等价 | GPU 上大语料上传带宽提升；host/无 GPU 路径零回归 |
 | **P1c 预取预告** | `prefetch_hint` + `MADV_WILLNEED`（Linux）/ `PrefetchVirtualMemory`（Windows） | 冷启动首查延迟下降；稳态无回归 |
-| **P2 heat 预取 + async 上传** | shadow-ledger 驱动预热 + `cudaMemcpyAsync` stream 重叠 | 复用型负载端到端 1.5×+（benchmark 说话） |
-| **P2 GPUDirect（可选）** | `#[cfg(linux)]` + `cufile`，`gpudirect_threshold` 开关 | 仅 Linux + NVMe 拓扑，大表扫描省一次 RAM 往返 |
+| **P2 heat 预取** | shadow-ledger 驱动预热（`pump_heat_prefetch`）+ idle reclaim（`release`）+ 引擎侧 `prefetch_hint` 调用点 | ✅ 已交付。**验收改为诚实的可观测指标**（见下「P2 实测」）：pump 不产生任何额外搬运，只把「重建空闲位后的第一次上传」移出关键路径 |
+| **P2 GPUDirect（可选）** | `#[cfg(target_os="linux")]` 探测 `/dev/nvidia-fs*` + `upload_plan` 分派 + `note_upload_path` 计数 | ⏳ 接缝已交付，`cufile` 未编入 ⇒ 恒 `Unavailable`；真机验收需 Linux + nvidia-fs + NVMe 拓扑 |
+
+**P2 实测**（RTX 4060 Laptop，3×200k×128 ≈ 99 MiB/份，`CUDA_VRAM` 198 MiB，查询间隔 50 ms）：
+
+| 场景 | pump off | pump on |
+|---|---|---|
+| drop-and-refill（reclaim） | device 19 / host 6，p99 26.9 ms，上传 297 MiB | device 20 / host 5，p99 21.3 ms，上传 **297 MiB**（零额外搬运），pump 1 upload / 4 refused |
+
+**为什么不做「淘汰式 pump」**（同一台机、同一批语料，100 ms 间隔，3 份轮转 + bursty）：
+
+| 场景 | pump off | pump on（淘汰式，已废弃） |
+|---|---|---|
+| rotate A,B,C | p50 16.39 ms / p99 39.24 ms，device 20 / host 4，上传 1388 MiB | p50 3.91 ms / p99 19.49 ms，device **14** / host **10**，上传 **2380 MiB（+71%）** |
+| bursty A×4,B×4,C×4 | p50 1.52 ms / p99 27.22 ms，device 36 / host 12，上传 495 MiB | p50 1.64 ms / p99 28.04 ms，device **32** / host **16**，上传 **2182 MiB（+341%）** |
+
+结论：允许 pump 淘汰，等于把「查询刚换进来的块」再搬一遍——字节数暴涨、设备命中率反而下降（rotate 的 p50 变好只是把延迟搬到别的查询上）。因此 pump 改成 **slack-only + 只消费不加热度**，可证不倒退；它需要的空位由 `release`（DROP 掉的集合）或「集合重注册变小」腾出。收益天然有上界：只有在空位出现之后仍有查询打到该集合时才拿得到。
 
 **风险边界**：P1 全部是「在现有回退框架上加一条更快的路径」，任何失败都落到「现状路径」（普通上传 / host 执行），不改变正确性。这是与 `storage-mmap-design.md` P0「最小闭环」一致的工程哲学。
 

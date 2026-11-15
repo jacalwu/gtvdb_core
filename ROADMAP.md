@@ -93,7 +93,7 @@
 | **P1-2** | 段内节点区间窄化 / `(time_bucket, src_range)` 分片 | 🧊 冻结（M6-b） | 持续段数进入 **100–500** 且 **B/edge > 256** 才启动。实测 1/10/100/500 段 → 0.8/8/80/**400** B/edge（跨平台几何常量）；目标 1,439 → ~145 B/edge。验收须复用 `crates/gtv-storage/tests/l2_time_box.rs` 断言，不破坏 `Skip/FullHit/Scan` |
 | **P1-3** | 热循环 measured-first 调优 | 🧊 冻结（M6-b） | 先做 Linux `perf stat`（`cache-misses` / `dTLB-load-misses` / `branch-misses`），再**只做被证明是瓶颈的一项**（16B 窄化 / SIMD 时间谓词 / Eytzinger / 大页 / 并行 frontier）；每项 A/B，输了回滚 |
 | **P1-4** | `gtv-pattern` motif / 环路 SQL 出口（业主追加） | ✅ **GO**，已交付 | 逐点 UDTF 与批量表逐条一致；`bench_motif_gate` Q1 在 N=32/128 为 11.82× / 49.79×（owned）、30.49× / 111.55×（shared）。详 §3.3 |
-| **P1-5** | SSD→RAM→VRAM 三级数据分层（业主追加） | 🔵 进行中 | 把 KDB mmap（已交付，见 M6-P0）作为 RAM warm 层，向上与 `ResidentRegistry` 的 VRAM hot 层打通：pinned 上传 / 异步预取 / （可选）GPUDirect。详 [`docs/storage-tiering-ssd-ram-vram.md`](docs/storage-tiering-ssd-ram-vram.md) 与 §3.5 |
+| **P1-5** | SSD→RAM→VRAM 三级数据分层（业主追加） | ✅ 已交付（GPUDirect 待 Linux 真机） | 把 KDB mmap（已交付，见 M6-P0）作为 RAM warm 层，向上与 `ResidentRegistry` 的 VRAM hot 层打通：pinned 上传（P1b）/ 异步预取流水线（P1c）/ heat pump + 空闲回收（P2）。详 [`docs/storage-tiering-ssd-ram-vram.md`](docs/storage-tiering-ssd-ram-vram.md) 与 §3.5 |
 
 **红线**：`csr.rs` 的 `neighbors()` 热循环、GTVSeg v1 的 `disk == memory == cache line` 定宽列区恒等式、L2 交集/并集两组标量语义不得因优化而合并。U0–U3 用四个里程碑换来的「读路径零回归」是当前最值钱的资产。
 
@@ -150,8 +150,8 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 **背景**：`gtv-accelerator` 的 `ResidentRegistry`（VRAM hot 层）与 `gtv-storage` 的 GTVSeg mmap（SSD→RAM 层）已分别交付，但二者之间缺一根「传送带」——当前查询上传是**同步 H2D 拷贝**，等价于传统 offload 的低效形态。参考三个系统的思想并统一到 gtvdb：
 
 - **KDB+/q 的 mmap 极致 IO**：内存映射即存储（无解码）、分区+枚举字典、OS page cache 即缓存层。gtvdb 已落地前两者（M6-P0 + `hdb.rs`），缺的是「页级调度向上延伸到 VRAM」。
-- **PG-Strom 的 GPUDirect / GPU Cache**：SSD→GPU P2P DMA 绕过 CPU、热表驻留。驻留缓存已吸收（`resident.rs`），GPUDirect 未做。
-- **Strata 的热度分层 + 异步预取流水线**：VRAM hot + pinned host RAM warm + 按需冷读；算第 N 块时第 N+1 块已在 PCIe 上流。热度淘汰已吸收（decayed-heat），pinned/预取未做。
+- **PG-Strom 的 GPUDirect / GPU Cache**：SSD→GPU P2P DMA 绕过 CPU、热表驻留。驻留缓存已吸收（`resident.rs`），GPUDirect 已留**诚实接缝**（`gpudirect.rs` 策略层 + `probe`/`upload_plan`/计数；`cufile` 未编入前恒报 `Unavailable`，P2）。
+- **Strata 的热度分层 + 异步预取流水线**：VRAM hot + pinned host RAM warm + 按需冷读；算第 N 块时第 N+1 块已在 PCIe 上流。热度淘汰已吸收（decayed-heat）；pinned 上传已吸收（P1b/V-3）；异步预取流水线已吸收（P1c：块双缓冲 copy∥transpose∥topk + 页面预热）；**heat 驱动的空闲预热**已吸收（P2：shadow ledger → `pump_heat_prefetch`，且实测证明「只填空闲、绝不淘汰」才是对的）。
 
 设计文档：[`docs/storage-tiering-ssd-ram-vram.md`](docs/storage-tiering-ssd-ram-vram.md)。三条红线：三级共用同一份定宽 POD 字节布局；数据单向流动 SSD→RAM→VRAM（反向只失效不回写，GTVSeg 不可变 COW）；每一跳独立可观测 fallback。
 
@@ -159,13 +159,25 @@ Windows 本机 release，合成账户图 V=20,000 / `ring3` / `valid_at=100`；�
 |:--|:--|:--|:--|
 | **P1a** | 量化 PCIe DMA 墙：同步 H2D 带宽 vs pinned 上传 vs 理想设备带宽 | ✅ 已交付 | `bench_pcie_transfer` 现状表（见下）：稳态 pinned 拿回 33–45% 带宽，小载荷 4.37× |
 | **P1b** | pinned 上传：P1b-1 `cudaHostAlloc` write-combined staging（✅ 已交付）；P1b-2 `cudaHostRegister` 注册 mmap 视图（✅ 封装已交付，V-3；Windows WDDM 拒绝 register 文件页，零拷贝仅 Linux/TCC 可达） | ✅ 已交付 | [`docs/pinned-upload-p1b.md`](docs/pinned-upload-p1b.md)，P1b-1 实测 staging 达 pinned 上限（稳态 +14~43%） |
-| **P1c** | 异步预取流水线：算第 N 块时预取第 N+1 块 | ⏳ 待做 | 隐藏 PCIe 搬运延迟 |
-| **P2** | heat 预取 + async 上传整合；GPUDirect（`#[cfg(linux)]` 可选，依赖 `nvidia-fs`） | ⏳ 待做 | 大表扫描省 CPU+PCIe 往返 |
+| **P1c** | 异步预取流水线：算第 N 块时预取第 N+1 块 | ✅ 已交付 | **块双缓冲流水线**：`copy(b+1) ∥ transpose(b) ∥ topk(b)`（`build_corpus` 分块上传 + `build_and_scan` 冷路径融合扫描，cudarc slice-event 自动跨流排序；标签掩码按块主机预过滤，内核恒 `has_mask=0`）+ **页面预热**（`warm.rs`：`madvise(MADV_WILLNEED)`/`PrefetchVirtualMemory`/touch 回退 + `prefetch_hint(kind,name,host)` 遥测）+ 窗口转置 kernel（`transpose_rowmajor_to_colmajor_window`）。**实测**（P1a 主机，195 MiB 语料冷首查 k=10）：bulk 94.6 ms → 8 MiB 块 **46.9 ms（2.0×）**；块扫描 64/16/8/4/1 MiB = 72.2/49.9/**46.9**/47.0/57.7 ms（拐点 8 MiB，`DEFAULT_PREFETCH_BLOCK_BYTES` 据此定）；稳态 cache-hit 1.5 ms **无回归**。验证：`cuda_prefetch` 4 测试（多块 flat/IVF/cosine/标签掩码与单块+host 逐位一致）+ acceptance 7 门禁全过 |
+| **P2** | heat 预取（shadow ledger → 主动预热）+ 空闲回收；GPUDirect 接缝（`#[cfg(linux)]`，依赖 `nvidia-fs`+`cufile`） | ✅ 已交付（GPUDirect 为诚实接缝，待 Linux 真机实测） | **heat pump**：`resident.rs` 新增 `hottest_shadows(PREFETCH_HEAT_FLOOR=1.5)` / `admit_prefetch` / `release`，`AcceleratorRegistry::{prefetch_candidates, prefetch_upload, release, resident_blocks}`，引擎 `knn.rs::pump_heat_prefetch` 在每次 `knn()` 收尾跑一轮（`ACCEL_PREFETCH[_BLOCKS]`），`search_with` 只在非驻留时发 `prefetch_hint`。**设计修正（实测驱动）**：淘汰式 pump 是净负——3×99 MiB / 198 MiB 缓存下 rotate 上传 **+71%**（1388→2380 MiB）、device 20→14、host 4→10，bursty p50 0.93×/p99 0.97×；故改成 **slack-only**（`DeclineReason::NoSlack`，绝不淘汰）+ **只消费不加热度**，并配 `release`+每轮起手 reclaim（DROP 集合的 VRAM 归还），否则本轮永无空位可用。**实测（reclaim 场景）**：pump off device 19/host 6 p99 26.9 ms；pump on device 20/host 5 p99 21.3 ms，**上传字节完全相同 297 MiB**（1 upload / 4 refused）——收益 = 把空位出现后的首次上传移出关键路径，零额外搬运。**GPUDirect**：`gpudirect.rs` 纯策略接缝（`probe`/`upload_plan`/`DirectStatus`，`DIRECT_TRANSFER_COMPILED=false` ⇒ 永不虚报直传）+ `note_upload_path` 计数进 `.accel`（`GPUDIRECT = A direct / B staged`）。参数：`ACCEL_PREFETCH` / `ACCEL_PREFETCH_BLOCKS` / `ACCEL_GPUDIRECT` / `ACCEL_GPUDIRECT_THRESHOLD`（后两者被 `CUDA_MODE=OFF` 否决）。验证：`gtv-accelerator` 61 单测 + `cuda_heat_pump` 门禁（真机）+ `gtv-engine` 65 单测与全部集成 + `gtv-cli`/`gtv-params` 全绿；`cargo check --workspace --tests` 与 `--features cuda --tests` **零告警** |
 | **V-0** | 向量语料上 GTVSeg 立项 + `Pod` 扩展 `f32` | ✅ 已交付 | [`docs/vector-corpus-gtvseg.md`](docs/vector-corpus-gtvseg.md)：GTVVEC v1 格式定稿；`column.rs` seal 开 `f32`（NaN/±0 位模式单测） |
 | **V-1** | GTVVEC v1 格式模块：`encode`/`open`（header 校验 + 列目录 + blake3）+ index-store 落盘（`write_atomic`）/ mmap 读回（`memmap2`） | ✅ 已交付 | `gtv-index/src/vector_segment.rs`（6 单测）+ `gtv-index-store/src/vector_segment_io.rs`（3 单测）；旧 `GFLATv1`/`.gtvidx` 路径未动 |
-| **V-2** | `FlatIndex` `Col<f32>` 化（镜像 TemporalCSR）+ `gtv-index-store` load mmap 化 + 引擎 save/load 接线 | ✅ 已交付 | 冷打开 O(1)、3 份拷贝→1 份 mmap 视图；旧 `.gtvidx` 兼容 |
+| **V-2** | `FlatIndex` `Col<f32>` 化（镜像 TemporalCSR）+ `gtv-index-store` load mmap 化 + 引擎 save/load **API** 接线（`ann()`/`AnyIndex` 路径） | ✅ 已交付 | 冷打开 O(1)、3 份拷贝→1 份 mmap 视图；旧 `.gtvidx` 兼容。⚠️ 原「引擎 save/load 接线」**过度宣称**：`ann()` 仅打通**引擎 API**（`register_any_index`）与 store（`IndexStore::load`）；**REPL 冷开命令（`.knn-index`/`.ann-index`）已在 V-5 落地**；`knn()` 端接線见 **V-5** |
 | **V-3** | `cudaHostRegister` 封装（mmap 页直接 DMA）+ 基准 + fallback | ✅ 已交付 | `register_and_upload` + `HostRegister` RAII；`Col::stable_bytes()`；**平台发现**：Windows WDDM 拒绝 register 文件映射页，零拷贝仅 Linux/TCC 可达，register 失败回落 P1b-1 staging |
 | **V-4** | IVF 语料落盘复用（`GIVFCMP` compound payload）+ 冷打开 / 常驻 pinned 占用端到端基准 | ✅ 已交付 | `IvfIndex` `Col` 化 + `from_columns`；store 三路分派（GTVVEC / GIVFCMP / Legacy）。**实测**：1e6×128 冷开 885 ms → **0.85 ms**（1040×），常驻增量 1487.7 → **495.8 MiB**（3.0×）；IVF 1e5×128 冷开 75 ms → **1.1 ms** |
+| **V-5** | `KnnCollection` ↔ mmap 冷開接線（**双向 + 标签**）：引擎 `from_any_index`/`register_knn_from_index`（load）+ `to_any_index`/`build_options`（save）+ `gtv-index-store::load_index` + REPL `.knn-index <name> <file> [labels.txt]`/`.ann-index`（冷開）与 `.knn-save`（落盤） | ✅ 已交付 | load 方向 `knn.rs` 3 单测（含 IVF 冷開后标签过滤、长度不匹配拒绝）；REPL 冷開 + save 往返 `gtv-cli/tests/cold_open_knn.rs` **5 集成测试**（Flat→GTVVEC、IVF→GIVFCMP 逐位一致；IVF + labels 侧车冷開后过滤结果与内存集合一致）。**关键事实**：`IvfIndex::probe_positions` 用 `mask[orig_pos[p]]`，`orig_pos` 随 `GIVFCMP` 持久化 ⇒ 标签域是**原始输入序**（非 cell 序），故冷開无需重排；纠正 V-2 过度宣称 |
+| **T5** | 向量 SQL 双表面决策：`knn()` vs `ann()` 是否收敛 | ✅ 已决策（**Option C：合并执行内核、保留双表面**） | 见下方「分工契约」；不 deprecate 任一表面——`knn` 被 Quantum MCP（gtvdb_ext）/TC-11 oracle/M18 硬件门槛依赖，`ann` 持有 Hnsw + B3-3/CBO 规划遥测。执行内核统一落在 `gtv-engine/src/vec_surface.rs`（T5.2） |
+
+**向量 SQL 表面分工契约（T5 决策，2026-11-15）**：
+
+| 表面 | 语义保证 | 过滤 | 硬件 | 规划/遥测 | 何时用 |
+|:--|:--|:--|:--|:--|:--|
+| `knn()` / `vector_search` | 精确（Flat 全扫；IVF 按注册 `nprobe` 探测） | **标签字符串**（`'rock'`，KDB.AI `metadata_filtering` 对应） | ✅ AcceleratorRegistry（VRAM 常驻 / IVF probe 卸载，M18） | — | 标签过滤、GPU 常驻语料、精确 oracle 场景 |
+| `ann()` / `ann_search` | 近似 + exact rerank（B3-3 策略路由，可 `force_exact`） | **id allow-list**（`'1,2,3'`） | — | `ann_explain` / `cbo_explain` | Hnsw、大语料近似、需要 CBO/召回估计 |
+| `embedding_search` | 精确（治理集合） | tenant + `as_of` 时间窗 | — | — | 需要 provenance / 租户隔离 / 过期语义 |
+
+**执行内核边界（T5.2 落地）**：三条表面的机械管线（query 解析、距离报告、`(id, distance)` schema、dim/metric 守卫、hits→batch）统一收在 `gtv-engine/src/vec_surface.rs`，防止 facade 漂移；CPU 搜索内核统一走 `gtv-index`（`exact_topk*` / `execute_ann`）；`knn` 的 GPU overlay 保持在 engine 层（P1c/P2 的接缝就在这里）。标签过滤与 id 过滤**刻意不合并**（语义不同域），如需互备另立任务（T5.3，未排期）。
 
 **P1a 现状表（Windows 本机 RTX 4060 Laptop，`bench_pcie_transfer`，`--features cuda --release`，warm-up 后）**：
 
