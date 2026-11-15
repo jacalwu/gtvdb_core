@@ -12,14 +12,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, RecordBatch, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::BooleanArray;
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
-use datafusion::datasource::{MemTable, TableProvider};
+use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
-use gtv_accelerator::{AcceleratorRegistry, IvfRequest, KnnRequest, RawHit};
+use gtv_accelerator::{
+    AcceleratorRegistry, IvfRequest, KnnRequest, RawHit, ResidentKind, PREFETCH_HEAT_FLOOR,
+};
 use gtv_core::{GtvError, Metric};
-use gtv_index::{CorpusView, FlatIndex, IvfIndex, ProbePlan};
+use gtv_index::{AnyIndex, BuildOptions, CorpusView, FlatIndex, IvfIndex, ProbePlan};
 
 use crate::expr_util::{expr_to_i64, expr_to_string};
 
@@ -231,9 +232,94 @@ impl KnnCollection {
         })
     }
 
+    /// Build a collection from a (possibly mmap-backed) persisted index, so the
+    /// `knn()` SQL surface can serve a corpus loaded cold from the index store
+    /// without re-decoding it into owned `Vec<Vec<f32>>`.
+    ///
+    /// `Flat` and `Ivf` indexes become zero-copy views over the mapping; `Hnsw`
+    /// is rejected because the `knn()` surface only has `Flat`/`Ivf`
+    /// representations (use `ann()` for Hnsw).
+    ///
+    /// `labels`, if supplied, are in the **original input order** the corpus was
+    /// registered with — for both reprs. That is the same domain
+    /// [`Self::label_mask`] produces and, for an `Ivf`, the domain
+    /// `IvfIndex::probe_positions` maps into cell order via `orig_pos` (which
+    /// the `GIVFCMP` payload persists, so a cold-opened index keeps the
+    /// mapping). Hence no cell-order reordering is needed here.
+    pub fn from_any_index(
+        any: AnyIndex,
+        labels: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let index = match any {
+            AnyIndex::Flat(flat) => Repr::Flat(flat),
+            AnyIndex::Ivf(ivf) => Repr::Ivf(ivf),
+            AnyIndex::Hnsw(_) => {
+                return Err(DataFusionError::Execution(
+                    "knn collection: Hnsw index is not supported by the knn() surface; use ann()"
+                        .into(),
+                ))
+            }
+        };
+        if let Some(labels) = &labels {
+            if labels.len() != index.ids().len() {
+                return Err(DataFusionError::Execution(format!(
+                    "knn collection: labels/index length mismatch ({} labels vs {} vectors)",
+                    labels.len(),
+                    index.ids().len()
+                )));
+            }
+        }
+        Ok(Self {
+            index,
+            labels,
+            version: 0,
+        })
+    }
+
+    /// Snapshot this collection as an [`AnyIndex`] so it can be persisted.
+    ///
+    /// This is the save-direction counterpart of [`Self::from_any_index`]: the
+    /// returned index shares the same POD layout (`Col` views are `Arc`-backed
+    /// for mmap corpora and clone-once for in-memory corpora), so a caller can
+    /// hand it to `gtv_index_store::IndexStore::save` (or a bare-file writer)
+    /// and the payload is re-encoded as a mmap-friendly `GTVVEC` / `GIVFCMP`
+    /// container. A later `.knn-index` cold-open then serves it with no
+    /// re-decode.
+    pub fn to_any_index(&self) -> AnyIndex {
+        match &self.index {
+            Repr::Flat(i) => AnyIndex::Flat(i.clone()),
+            Repr::Ivf(i) => AnyIndex::Ivf(i.clone()),
+        }
+    }
+
+    /// Build parameters that match the backing index, for the persisted
+    /// manifest. IVF carries its trained `nlist` / `nprobe`; flat carries none.
+    pub fn build_options(&self) -> BuildOptions {
+        match &self.index {
+            Repr::Flat(_) => BuildOptions::Flat,
+            Repr::Ivf(i) => BuildOptions::Ivf {
+                nlist: i.nlist(),
+                nprobe: i.nprobe(),
+            },
+        }
+    }
+
     /// Whether this collection uses an IVF probe rather than a flat scan.
     pub fn is_ivf(&self) -> bool {
         matches!(self.index, Repr::Ivf(_))
+    }
+
+    /// Which device cache this collection belongs in.
+    ///
+    /// Flat and IVF corpora are stored in different device buffers on purpose:
+    /// their row order differs, so a shared buffer would silently score the
+    /// wrong rows.
+    pub fn resident_kind(&self) -> ResidentKind {
+        if self.is_ivf() {
+            ResidentKind::IvfCorpus
+        } else {
+            ResidentKind::Corpus
+        }
     }
 
     /// Vector dimension.
@@ -250,6 +336,15 @@ impl KnnCollection {
     /// collection this is the cell order, consistent with [`Self::vectors`].
     pub fn ids(&self) -> &[u64] {
         self.index.ids()
+    }
+
+    /// The corpus as one contiguous row-major `f32` buffer.
+    ///
+    /// This is the buffer the accelerator uploads (cell order for an IVF
+    /// collection, parallel to [`Self::ids`]) — handed over by reference, with
+    /// no per-vector copy and no `Vec<Vec<f32>>` rebuild.
+    pub fn data(&self) -> &[f32] {
+        self.index.data()
     }
 
     /// The collection's vectors (exposed for the Quantum MCP surface).
@@ -318,6 +413,17 @@ impl KnnCollection {
     ) -> Vec<(u64, f64)> {
         let mask = self.label_mask(label);
         let plan = self.index.probe_plan(query, mask.as_ref());
+        let kind = self.resident_kind();
+
+        // P1c 预取预告 from the one place that actually knows the corpus: the
+        // scan is imminent, so fault its pages in now instead of inside the
+        // upload (or the host kernel). Skipped when the device already holds
+        // the block — there is no host read to warm for.
+        if let Some(reg) = accel {
+            if !reg.is_resident(kind, name) {
+                reg.prefetch_hint(kind, name, self.index.data());
+            }
+        }
 
         let raw: Vec<RawHit> = match (plan.as_ref(), accel) {
             // IVF: only the (small) position list moves per query; the whole
@@ -363,18 +469,8 @@ impl KnnCollection {
 
         let metric = self.metric();
         raw.into_iter()
-            .map(|h| (h.id, report_distance(metric, h.distance)))
+            .map(|h| (h.id, crate::vec_surface::report_distance(metric, h.distance)))
             .collect()
-    }
-}
-
-/// Convert the canonical metric distance to the value surfaced to SQL/CLI.
-/// L2 keeps its historical Euclidean (sqrt) report; cosine/IP report as-is.
-#[inline]
-fn report_distance(metric: Metric, raw: f32) -> f64 {
-    match metric {
-        Metric::L2 => (raw.max(0.0) as f64).sqrt(),
-        _ => raw as f64,
     }
 }
 
@@ -397,12 +493,84 @@ impl KnnTableFunction {
             accelerators,
         }
     }
+}
 
-    fn schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt64, false),
-            Field::new("distance", DataType::Float64, false),
-        ]))
+/// P2 heat pump: pull the hottest non-resident collections onto the device while
+/// no query is waiting on them.
+///
+/// Candidates come from the accelerator's shadow ledger — collections a query
+/// was *refused*, ranked by decayed heat — and each one goes through
+/// [`AcceleratorRegistry::prefetch_upload`], which admits it into VRAM that is
+/// free right now. The pass is bounded by the registry's `ACCEL_PREFETCH_BLOCKS`
+/// (`ACCEL_PREFETCH=OFF` ⇒ `0` ⇒ no-op), so a deployment that did not opt in
+/// pays a single branch here.
+///
+/// The pass starts with a **reclaim sweep**: a collection dropped from the map
+/// keeps its device copy until someone says otherwise, and those bytes can never
+/// be a hit again. Releasing them is what gives the pump something to fill — the
+/// scenario is `DROP TABLE t` followed by queries that keep asking for `u`. It is
+/// also the only reason a slack-only pump is useful at all: a pump that evicts
+/// would have to throw out a block a query is using (measured: +71% transferred
+/// bytes, p99 × 1.41 on a 3-corpus rotation — see `bench_heat_pump_rotate`).
+///
+/// Nothing about the pass can fail a query: a candidate whose collection is gone
+/// is dropped from the ledger, one whose representation differs is skipped, and
+/// a refused admission is simply counted. Returns how many uploads completed.
+pub fn pump_heat_prefetch(
+    collections: &HashMap<String, KnnCollection>,
+    accel: &AcceleratorRegistry,
+) -> usize {
+    let budget = accel.heat_pump_blocks();
+    if budget == 0 || !accel.is_device_backed() {
+        return 0;
+    }
+    reclaim_dropped(collections, accel);
+    let mut uploaded = 0;
+    // Over-fetch: a candidate may name a dropped collection or the other
+    // representation, and the pass should still fill its budget from the
+    // next-hottest name rather than stop at the first miss.
+    for key in accel.prefetch_candidates(PREFETCH_HEAT_FLOOR, budget * 4) {
+        if uploaded >= budget {
+            break;
+        }
+        let Some(collection) = collections.get(&key.name) else {
+            // The dataset no longer exists; never pump it again.
+            accel.forget_candidate(key.kind, &key.name);
+            continue;
+        };
+        if collection.resident_kind() != key.kind {
+            continue;
+        }
+        if accel.prefetch_upload(
+            key.kind,
+            &key.name,
+            collection.ids(),
+            collection.data(),
+            collection.dim(),
+            collection.version(),
+        ) {
+            uploaded += 1;
+        }
+    }
+    uploaded
+}
+
+/// Return the device copy of every corpus whose collection is gone.
+///
+/// `collections` is the engine's authoritative set of live knn datasets, and the
+/// two corpus resident kinds are written only by this module, so "resident but
+/// absent from the map" means the dataset was dropped. The block can never be a
+/// hit again; holding it only shrinks the working set the pump may use.
+fn reclaim_dropped(collections: &HashMap<String, KnnCollection>, accel: &AcceleratorRegistry) {
+    for (kind, name) in accel.resident_blocks() {
+        if !matches!(kind, ResidentKind::Corpus | ResidentKind::IvfCorpus) {
+            continue;
+        }
+        if collections.contains_key(&name) {
+            continue;
+        }
+        accel.release(kind, &name);
+        accel.forget_candidate(kind, &name);
     }
 }
 
@@ -434,14 +602,7 @@ impl TableFunctionImpl for KnnTableFunction {
             _ => label,
         };
 
-        let query: Vec<f32> = query
-            .split(',')
-            .map(|t| {
-                t.trim().parse::<f32>().map_err(|_| {
-                    DataFusionError::Execution(format!("knn: invalid query component `{t}`"))
-                })
-            })
-            .collect::<Result<_>>()?;
+        let query = crate::vec_surface::parse_query("knn", &query)?;
 
         let collections = self.collections.read().map_err(|_| {
             DataFusionError::Execution("knn: collection registry poisoned".into())
@@ -450,24 +611,12 @@ impl TableFunctionImpl for KnnTableFunction {
             DataFusionError::Execution(format!("knn: unknown collection `{name}`"))
         })?;
 
-        if let Some(m) = requested_metric.as_deref() {
-            let metric = Metric::parse(m).ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "knn: unknown metric `{m}` (expected l2|cosine|dot)"
-                ))
-            })?;
-            collection
-                .check_metric(metric)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-        }
-
-        if query.len() != collection.dim() {
-            return Err(DataFusionError::Execution(format!(
-                "knn: query dim {} != collection dim {}",
-                query.len(),
-                collection.dim()
-            )));
-        }
+        crate::vec_surface::check_requested_metric(
+            "knn",
+            collection.metric(),
+            requested_metric.as_deref(),
+        )?;
+        crate::vec_surface::check_dim("knn", &query, collection.dim())?;
 
         let rows = collection.search_with(
             &name,
@@ -476,21 +625,11 @@ impl TableFunctionImpl for KnnTableFunction {
             k,
             label.as_deref(),
         );
-        let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
-        let dists: Vec<f64> = rows.iter().map(|(_, d)| *d).collect();
-
-        let batch = RecordBatch::try_new(
-            Self::schema(),
-            vec![
-                Arc::new(UInt64Array::from(ids)) as ArrayRef,
-                Arc::new(Float64Array::from(dists)) as ArrayRef,
-            ],
-        )?;
-
-        Ok(Arc::new(MemTable::try_new(
-            Self::schema(),
-            vec![vec![batch]],
-        )?))
+        // P2: the query has now either filled the device cache or left shadow
+        // evidence; spend the idle window pulling in the hottest refused
+        // collection so the *next* query finds it resident.
+        pump_heat_prefetch(&collections, self.accelerators.as_ref());
+        crate::vec_surface::hits_table(&rows)
     }
 }
 
@@ -535,6 +674,56 @@ mod tests {
             assert_eq!(f, v, "label {label} must select the same rows");
             assert!(v.iter().all(|id| (id % 2 == 0) == (label == "a")));
         }
+    }
+
+    #[test]
+    fn ivf_cold_open_keeps_label_filtering() {
+        // A cold-opened IVF must still honour labels. The mask is indexed by
+        // `orig_pos` (cell position → original input position), and that column
+        // is part of the persisted `GIVFCMP` payload, so labels stay in
+        // original input order through save/load — no cell-order remap needed.
+        let ids: Vec<u64> = (0..12).collect();
+        let vectors: Vec<Vec<f32>> = (0..12)
+            .map(|i| vec![i as f32, (11 - i) as f32 * 0.5])
+            .collect();
+        let labels: Vec<String> = (0..12)
+            .map(|i| if i % 3 == 0 { "x" } else { "y" }.to_string())
+            .collect();
+
+        let built = KnnCollection::with_ivf(
+            ids,
+            vectors,
+            Some(labels.clone()),
+            Metric::L2,
+            4,
+            4,
+        )
+        .unwrap();
+        let cold = KnnCollection::from_any_index(built.to_any_index(), Some(labels)).unwrap();
+        assert!(cold.is_ivf());
+
+        for label in [None, Some("x"), Some("y")] {
+            let want = built.search(&[5.0, 3.0], 12, label);
+            let got = cold.search(&[5.0, 3.0], 12, label);
+            assert_eq!(got, want, "label {label:?} must select the same rows");
+            if let Some(label) = label {
+                let want_x = label == "x";
+                for (id, _) in &got {
+                    assert_eq!(*id % 3 == 0, want_x, "id {id} violates label {label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn from_any_index_rejects_label_length_mismatch() {
+        let c = songs();
+        let err = KnnCollection::from_any_index(c.to_any_index(), Some(vec!["pop".into()]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("labels/index length mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     fn songs() -> KnnCollection {
@@ -633,5 +822,258 @@ mod tests {
         assert_eq!(c.metric(), Metric::Cosine);
         let got = c.search(&[1.0, 0.0], 3, None);
         assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn knn_collection_from_any_index_flat_serves_mmap_corpus() {
+        // The shape `IndexStore::load` returns for a GTVVEC payload: a `Flat`
+        // AnyIndex wrapping a possibly mmap-backed `FlatIndex`. Wrapping it into
+        // a `KnnCollection` must serve the corpus without re-decoding into
+        // `Vec<Vec<f32>>`.
+        let ids: Vec<u64> = (0..10).collect();
+        let vectors = vec![
+            vec![0.0, 0.0],
+            vec![0.5, 0.5],
+            vec![5.0, 5.0],
+            vec![5.2, 5.1],
+            vec![1.0, 1.0],
+            vec![1.1, 1.0],
+            vec![9.0, 9.0],
+            vec![9.1, 9.0],
+            vec![0.2, 0.1],
+            vec![4.9, 5.0],
+        ];
+        let flat = FlatIndex::with_metric(ids.clone(), vectors.clone(), Metric::L2).unwrap();
+        let c = KnnCollection::from_any_index(AnyIndex::Flat(flat), None).unwrap();
+        assert!(!c.is_ivf());
+        // Same oracle as `songs_knn_matches_oracle`: q=[0.1,0.1], k=3 = [8,0,1].
+        let got = c.search(&[0.1, 0.1], 3, None);
+        assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![8, 0,1]);
+    }
+
+    #[test]
+    fn knn_collection_from_any_index_ivf_serves_mmap_corpus() {
+        let ids: Vec<u64> = (0..12).collect();
+        let vectors: Vec<Vec<f32>> = (0..12)
+            .map(|i| vec![i as f32 * 0.5, (11 - i) as f32 * 0.25])
+            .collect();
+        let dim = 2;
+        let mut data = Vec::with_capacity(ids.len() * dim);
+        for v in &vectors {
+            data.extend_from_slice(v);
+        }
+        let ivf = IvfIndex::with_metric(ids.clone(), data, dim, 4, 4, Metric::L2).unwrap();
+        let c = KnnCollection::from_any_index(AnyIndex::Ivf(ivf), None).unwrap();
+        assert!(c.is_ivf());
+        // A full probe (nprobe == nlist) must match the flat reference
+        // bit-for-bit, including distances.
+        let flat = KnnCollection::with_metric(ids, vectors, None, Metric::L2).unwrap();
+        assert_eq!(flat.search(&[2.0, 1.0], 5, None), c.search(&[2.0, 1.0], 5, None));
+    }
+
+    // ---- P2: engine-side prefetch hints and the heat pump -------------------
+
+    use gtv_accelerator::{
+        AccelCache, AccelError, AccelOp, AccelBackend, AsofRequest, DeviceInfo, DeviceKind,
+        HostBackend, PrefetchRequest, ResidentRegistry, VramBudget,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// A "device" that runs the host kernels and counts calls: enough to drive
+    /// the pump's routing without hardware.
+    #[derive(Debug)]
+    struct FakeDevice {
+        info: DeviceInfo,
+        calls: AtomicU64,
+        prefetches: AtomicU64,
+    }
+
+    impl FakeDevice {
+        fn new() -> Self {
+            Self {
+                info: DeviceInfo {
+                    name: "fake-gpu".to_string(),
+                    kind: DeviceKind::Cuda,
+                    total_bytes: 1 << 30,
+                },
+                calls: AtomicU64::new(0),
+                prefetches: AtomicU64::new(0),
+            }
+        }
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::Relaxed)
+        }
+        fn prefetches(&self) -> u64 {
+            self.prefetches.load(Ordering::Relaxed)
+        }
+    }
+
+    impl AccelBackend for FakeDevice {
+        fn device(&self) -> &DeviceInfo {
+            &self.info
+        }
+        fn supports(&self, _op: AccelOp) -> bool {
+            true
+        }
+        fn exact_knn(&self, req: &KnnRequest<'_>) -> std::result::Result<Vec<RawHit>, AccelError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            HostBackend::new().exact_knn(req)
+        }
+        fn ivf_probe(&self, req: &IvfRequest<'_>) -> std::result::Result<Vec<RawHit>, AccelError> {
+            HostBackend::new().ivf_probe(req)
+        }
+        fn asof_join(
+            &self,
+            req: &AsofRequest<'_>,
+        ) -> std::result::Result<Vec<Option<u32>>, AccelError> {
+            HostBackend::new().asof_join(req)
+        }
+        fn prefetch_corpus(
+            &self,
+            _req: &PrefetchRequest<'_>,
+        ) -> std::result::Result<bool, AccelError> {
+            self.prefetches.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+    }
+
+    fn fake_registry(capacity: u64, pump_blocks: usize) -> (Arc<FakeDevice>, AcceleratorRegistry) {
+        let fake = Arc::new(FakeDevice::new());
+        let ledger = ResidentRegistry::new(
+            AccelCache::On,
+            VramBudget::new(capacity, capacity, 0.0),
+            0,
+            Duration::from_secs(5),
+        );
+        let reg = AcceleratorRegistry::with_backend(fake.clone(), ledger)
+            .with_heat_pump(pump_blocks);
+        (fake, reg)
+    }
+
+    #[test]
+    fn search_with_hints_pages_only_while_the_block_is_not_resident() {
+        let (_fake, reg) = fake_registry(1 << 20, 0);
+        let c = songs();
+        c.search_with("songs", Some(&reg), &[0.1, 0.1], 3, None);
+        assert_eq!(reg.telemetry().prefetch_hints, 1, "a cold corpus is warmed");
+        assert!(reg.is_resident(ResidentKind::Corpus, "songs"));
+        c.search_with("songs", Some(&reg), &[0.1, 0.1], 3, None);
+        assert_eq!(
+            reg.telemetry().prefetch_hints,
+            1,
+            "a resident corpus has no host read to warm"
+        );
+        // An IVF collection warms under its own resident kind.
+        let ids: Vec<u64> = (0..12).collect();
+        let vectors: Vec<Vec<f32>> = (0..12)
+            .map(|i| vec![i as f32 * 0.5, (11 - i) as f32 * 0.25])
+            .collect();
+        let ivf = KnnCollection::with_ivf(ids, vectors, None, Metric::L2, 4, 4).unwrap();
+        assert_eq!(ivf.resident_kind(), ResidentKind::IvfCorpus);
+        ivf.search_with("ivf", Some(&reg), &[2.0, 1.0], 3, None);
+        assert!(reg.is_resident(ResidentKind::IvfCorpus, "ivf"));
+    }
+
+    #[test]
+    fn accel_prefetch_param_drives_the_pump_budget() {
+        let (p, _w) = gtv_params::GtvParams::from_reader(
+            "ACCEL_PREFETCH=ON\nACCEL_PREFETCH_BLOCKS=3\n".as_bytes(),
+        )
+        .unwrap();
+        let reg = AcceleratorRegistry::from_resolved(&p.resolve(None).unwrap());
+        assert_eq!(reg.heat_pump_blocks(), 3, "ACCEL_PREFETCH=ON arms the pump");
+
+        let (p, _w) = gtv_params::GtvParams::from_reader("".as_bytes()).unwrap();
+        let reg = AcceleratorRegistry::from_resolved(&p.resolve(None).unwrap());
+        assert_eq!(reg.heat_pump_blocks(), 0, "the pump is off by default");
+    }
+
+    #[test]
+    fn pump_pulls_in_the_hottest_refused_collection() {
+        // Room for two 160-byte corpora; "hot" and "keep" take both slots.
+        let (fake, reg) = fake_registry(400, 1);
+        let mut map = HashMap::new();
+        map.insert("hot".to_string(), songs());
+        map.insert("keep".to_string(), songs());
+        map.insert("cold".to_string(), songs());
+
+        for name in ["hot", "keep"] {
+            let c = map.get(name).unwrap();
+            for _ in 0..5 {
+                c.search_with(name, Some(&reg), &[0.1, 0.1], 3, None);
+            }
+        }
+        let cold = map.get("cold").unwrap();
+        for _ in 0..5 {
+            // Refused every time: 80 B are free where 160 B are wanted, and both
+            // resident corpora are protected by their heat.
+            cold.search_with("cold", Some(&reg), &[0.1, 0.1], 3, None);
+        }
+        assert_eq!(reg.telemetry().cache_declined, 5);
+        assert!(reg
+            .prefetch_candidates(PREFETCH_HEAT_FLOOR, 4)
+            .iter()
+            .any(|k| k.name == "cold"));
+
+        // A saturated cache gives the pump nothing: it declines rather than
+        // evict a corpus a query is using.
+        assert_eq!(pump_heat_prefetch(&map, &reg), 0);
+        assert_eq!(fake.prefetches(), 0);
+        assert!(!reg.is_resident(ResidentKind::Corpus, "cold"));
+
+        // Drop "keep": its device copy can never be a hit again, so the pass
+        // reclaims those bytes first and fills them in the same breath.
+        map.remove("keep");
+        assert_eq!(pump_heat_prefetch(&map, &reg), 1);
+        assert_eq!(fake.prefetches(), 1, "the backend performed the upload");
+        assert!(!reg.is_resident(ResidentKind::Corpus, "keep"));
+        assert!(reg.is_resident(ResidentKind::Corpus, "cold"));
+
+        // The next query is a device hit, not a supply-path miss.
+        let cold = map.get("cold").unwrap();
+        let before = fake.calls();
+        cold.search_with("cold", Some(&reg), &[0.1, 0.1], 3, None);
+        assert_eq!(fake.calls(), before + 1);
+    }
+
+    #[test]
+    fn the_pump_is_a_no_op_when_disabled() {
+        let (fake, reg) = fake_registry(200, 0);
+        let mut map = HashMap::new();
+        map.insert("hot".to_string(), songs());
+        map.insert("cold".to_string(), songs());
+        let hot = map.get("hot").unwrap();
+        for _ in 0..5 {
+            hot.search_with("hot", Some(&reg), &[0.1, 0.1], 3, None);
+        }
+        let cold = map.get("cold").unwrap();
+        for _ in 0..5 {
+            cold.search_with("cold", Some(&reg), &[0.1, 0.1], 3, None);
+        }
+        assert_eq!(pump_heat_prefetch(&map, &reg), 0);
+        assert_eq!(fake.prefetches(), 0);
+        assert!(!reg.is_resident(ResidentKind::Corpus, "cold"));
+    }
+
+    #[test]
+    fn a_candidate_whose_collection_is_gone_is_forgotten() {
+        let (fake, reg) = fake_registry(200, 2);
+        let mut map = HashMap::new();
+        map.insert("hot".to_string(), songs());
+        map.insert("cold".to_string(), songs());
+        let hot = map.get("hot").unwrap();
+        for _ in 0..5 {
+            hot.search_with("hot", Some(&reg), &[0.1, 0.1], 3, None);
+        }
+        let cold = map.get("cold").unwrap();
+        for _ in 0..5 {
+            cold.search_with("cold", Some(&reg), &[0.1, 0.1], 3, None);
+        }
+        // Drop the collection: the pump must not retry it forever.
+        map.remove("cold");
+        assert_eq!(pump_heat_prefetch(&map, &reg), 0);
+        assert_eq!(fake.prefetches(), 0);
+        assert!(reg.prefetch_candidates(PREFETCH_HEAT_FLOOR, 4).is_empty());
     }
 }

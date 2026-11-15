@@ -41,6 +41,7 @@ pub mod quantum_state;
 pub mod registry;
 pub mod segment;
 pub mod udf;
+pub mod vec_surface;
 pub mod workload;
 
 pub mod expr_util;

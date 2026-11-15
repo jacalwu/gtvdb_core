@@ -13,7 +13,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result};
-use gtv_core::{Metric, VectorIndex};
+use gtv_core::VectorIndex;
 use gtv_index::{
     estimate_recall, execute_ann, plan_ann, AnnConfig, AnyIndex,
 };
@@ -33,33 +33,6 @@ impl AnnTableFunction {
     pub fn new(indexes: IndexRegistry) -> Self {
         Self { indexes }
     }
-
-    fn schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt64, false),
-            Field::new("distance", DataType::Float64, false),
-        ]))
-    }
-}
-
-/// Report a distance the same way the `knn` UDTF does (L2 → Euclidean).
-fn report_distance(metric: Metric, raw: f32) -> f64 {
-    match metric {
-        Metric::L2 => (raw.max(0.0) as f64).sqrt(),
-        _ => raw as f64,
-    }
-}
-
-/// Parse a comma-separated query vector.
-fn parse_query(query: &str) -> Result<Vec<f32>> {
-    query
-        .split(',')
-        .map(|t| {
-            t.trim()
-                .parse::<f32>()
-                .map_err(|_| DataFusionError::Execution(format!("ann: bad query `{t}`")))
-        })
-        .collect()
 }
 
 /// Parse the filter argument. `None`/`*`/empty means no filter; otherwise a
@@ -121,7 +94,7 @@ pub(crate) fn parse_ann_args(
             .first()
             .ok_or_else(|| DataFusionError::Execution(format!("{usage}: missing `name`")))?,
     )?;
-    let query = parse_query(&expr_to_string(exprs.get(1).ok_or_else(|| {
+    let query = crate::vec_surface::parse_query("ann", &expr_to_string(exprs.get(1).ok_or_else(|| {
         DataFusionError::Execution(format!("{usage}: missing `query`"))
     })?)?)?;
     let k = expr_to_i64(exprs.get(2).ok_or_else(|| {
@@ -140,21 +113,10 @@ pub(crate) fn parse_ann_args(
     })
 }
 
-/// Reject a caller metric that disagrees with the index metric.
+/// Reject a caller metric that disagrees with the index metric (shared guard,
+/// see [`crate::vec_surface::check_requested_metric`]).
 fn check_metric(index: &AnyIndex, requested: Option<&str>, who: &str) -> Result<()> {
-    if let Some(m) = requested {
-        let metric = Metric::parse(m).ok_or_else(|| {
-            DataFusionError::Execution(format!("{who}: unknown metric `{m}` (l2|cosine|dot)"))
-        })?;
-        if metric != index.metric() {
-            return Err(DataFusionError::Execution(format!(
-                "{who}: metric mismatch — index is {}, query asked for {}",
-                index.metric().as_str(),
-                metric.as_str()
-            )));
-        }
-    }
-    Ok(())
+    crate::vec_surface::check_requested_metric(who, index.metric(), requested)
 }
 
 impl TableFunctionImpl for AnnTableFunction {
@@ -194,21 +156,12 @@ impl TableFunctionImpl for AnnTableFunction {
         let metric = index.metric();
         let (result, _tel) = execute_ann(index, &query, k, mask.as_ref(), &plan)
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-        let ids: Vec<u64> = result.hits.iter().map(|h| h.id).collect();
-        let dists: Vec<f64> = result
+        let hits: Vec<(u64, f64)> = result
             .hits
             .iter()
-            .map(|h| report_distance(metric, h.exact))
+            .map(|h| (h.id, crate::vec_surface::report_distance(metric, h.exact)))
             .collect();
-
-        let batch = RecordBatch::try_new(
-            Self::schema(),
-            vec![
-                Arc::new(UInt64Array::from(ids)) as ArrayRef,
-                Arc::new(Float64Array::from(dists)) as ArrayRef,
-            ],
-        )?;
-        Ok(Arc::new(MemTable::try_new(Self::schema(), vec![vec![batch]])?))
+        crate::vec_surface::hits_table(&hits)
     }
 }
 

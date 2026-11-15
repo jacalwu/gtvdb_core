@@ -25,6 +25,7 @@ use gtv_catalog::{EmbeddingGovernance, EmbeddingProvenance};
 use gtv_core::Metric;
 
 use crate::expr_util::{expr_to_i64, expr_to_string};
+use crate::vec_surface::report_distance;
 
 /// Shared registry of governed embedding collections, keyed by name.
 pub type EmbeddingRegistry = Arc<RwLock<HashMap<String, EmbeddingCollection>>>;
@@ -152,14 +153,6 @@ impl EmbeddingCollection {
     }
 }
 
-/// Report a distance the same way `knn`/`ann` do (L2 → Euclidean).
-fn report_distance(metric: Metric, raw: f32) -> f64 {
-    match metric {
-        Metric::L2 => (raw.max(0.0) as f64).sqrt(),
-        _ => raw as f64,
-    }
-}
-
 /// `embedding_search` table function over governed collections.
 #[derive(Debug)]
 pub struct EmbeddingSearchTableFunction {
@@ -214,14 +207,7 @@ impl TableFunctionImpl for EmbeddingSearchTableFunction {
             Some(t) => Some(t),
         };
 
-        let query: Vec<f32> = query
-            .split(',')
-            .map(|t| {
-                t.trim().parse::<f32>().map_err(|_| {
-                    DataFusionError::Execution(format!("embedding_search: bad query `{t}`"))
-                })
-            })
-            .collect::<Result<_>>()?;
+        let query = crate::vec_surface::parse_query("embedding_search", &query)?;
 
         let collections = self
             .collections
@@ -230,13 +216,7 @@ impl TableFunctionImpl for EmbeddingSearchTableFunction {
         let collection = collections.get(&name).ok_or_else(|| {
             DataFusionError::Execution(format!("embedding_search: unknown collection `{name}`"))
         })?;
-        if query.len() != collection.dim() {
-            return Err(DataFusionError::Execution(format!(
-                "embedding_search: query dim {} != collection dim {}",
-                query.len(),
-                collection.dim()
-            )));
-        }
+        crate::vec_surface::check_dim("embedding_search", &query, collection.dim())?;
 
         let hits = collection.search(&query, k, tenant, as_of);
         let ids: Vec<u64> = hits.iter().map(|h| h.id).collect();

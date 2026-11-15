@@ -1156,11 +1156,55 @@ impl GtvContext {
         Ok(())
     }
 
+    /// Register a `knn` collection from a (possibly mmap-backed) persisted index.
+    ///
+    /// This is the missing link that lets the `knn()` surface serve a corpus
+    /// loaded cold from the index store (`gtv_index_store::IndexStore::load` →
+    /// `AnyIndex`) instead of re-decoding owned `Vec<Vec<f32>>`. For a `Flat`
+    /// index `labels` may be supplied (insertion order); for an `Ivf` index
+    /// labels are rejected until the orig→cell mapping is plumbed (see
+    /// [`KnnCollection::from_any_index`]); `Hnsw` is rejected (use `ann()`).
+    pub fn register_knn_from_index(
+        &self,
+        name: &str,
+        index: AnyIndex,
+        labels: Option<Vec<String>>,
+    ) -> Result<()> {
+        let mut collection = KnnCollection::from_any_index(index, labels)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        // Fresh content version: registering under an existing name replaces
+        // the collection, and the device copy must follow.
+        collection.assign_version(self.accelerators.next_version());
+        self.knn_collections
+            .write()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution(
+                    "knn collection registry poisoned".into(),
+                )
+            })?
+            .insert(name.to_string(), collection);
+        Ok(())
+    }
+
     /// Register a persisted (loaded) index for `ann(name, query, k [, metric])`.
     pub fn register_any_index(&self, name: &str, index: AnyIndex) {
         if let Ok(mut map) = self.any_indexes.write() {
             map.insert(name.to_string(), index);
         }
+    }
+
+    /// Snapshot a registered `knn` collection as an [`AnyIndex`] plus its build
+    /// parameters, so a caller (e.g. the REPL `.knn-save` command) can persist
+    /// it with `gtv_index_store::IndexStore::save` and later cold-open it via
+    /// [`Self::register_knn_from_index`]. Returns `None` if the collection is
+    /// unknown. This is the save-direction mirror of the wrapper above.
+    pub fn knn_to_any_index(
+        &self,
+        name: &str,
+    ) -> Option<(AnyIndex, gtv_index::BuildOptions)> {
+        let guard = self.knn_collections.read().ok()?;
+        let collection = guard.get(name)?;
+        Some((collection.to_any_index(), collection.build_options()))
     }
 
     /// Register a governed embedding batch (catalog standard schema) for

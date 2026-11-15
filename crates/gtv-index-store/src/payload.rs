@@ -21,7 +21,8 @@ use gtv_core::column::{subregion, MappedRegion};
 use gtv_index::{open_ivf_payload, open_vector_segment, AnyIndex, FlatIndex};
 use memmap2::Mmap;
 
-use crate::container::{split_container_header, CONTAINER_MAGIC, HEADER_LEN};
+use crate::container::{decode, split_container_header, CONTAINER_MAGIC, HEADER_LEN};
+use crate::manifest::IndexManifest;
 use crate::{IndexStoreError, Result};
 
 /// What a container's payload is, decided by its leading magic.
@@ -140,6 +141,27 @@ pub fn open_mapped_payload(path: impl AsRef<Path>) -> Result<Option<AnyIndex>> {
         }
         PayloadKind::Legacy => Ok(None),
     }
+}
+
+/// Load an `AnyIndex` from a single `.gtvidx` container file, transparently
+/// choosing the cold-open (mmap) path when the payload is mmap-friendly
+/// (`GTVVEC` / `GIVFCMP`) and falling back to the materializing decode path
+/// for legacy payloads.
+///
+/// This is the bare-file counterpart of [`IndexStore::load`]: it needs no
+/// store registry or version directory, which is exactly what a REPL
+/// `.knn-index` / `.ann-index` cold-open command wants.
+pub fn load_index(path: impl AsRef<Path>) -> Result<AnyIndex> {
+    // Cold-open path first: zero-copy mmap view for GTVVEC / GIVFCMP payloads.
+    if let Some(any) = open_mapped_payload(&path)? {
+        return Ok(any);
+    }
+    // Legacy payload: read the file, split the container, and hand the payload
+    // to `AnyIndex` with the manifest-recorded index type.
+    let bytes = std::fs::read(path.as_ref()).map_err(IndexStoreError::Io)?;
+    let (manifest_json, payload) = decode(&bytes)?;
+    let manifest: IndexManifest = serde_json::from_slice(&manifest_json)?;
+    AnyIndex::from_bytes(manifest.index_type, &payload).map_err(IndexStoreError::Index)
 }
 
 /// Run the O(file size) data-integrity check over a container's mapped payload.

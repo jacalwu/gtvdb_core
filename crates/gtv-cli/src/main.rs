@@ -9,6 +9,7 @@
 use anyhow::{anyhow, Result};
 use arrow::util::pretty::print_batches;
 use gtv_engine::GtvContext;
+use gtv_index_store::load_index;
 use gtv_params::{GtvParams, QueryMode};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -30,6 +31,17 @@ Core commands
                             register every segment published by a P1 SegmentStore
   .csv       <name> <file>  register a CSV as table <name>
   .parquet   <name> <path>  register a Parquet file / directory as <name>
+  .knn-index <name> <file> [labels.txt]
+                            cold-open a vector index from <file> for knn(name,query,k[,label])
+                            (Flat/IVF; mmap-backed, no re-decode). Hnsw → use .ann-index.
+                            labels.txt: one label per line, in the corpus's original input
+                            order, to restore metadata filtering without a rebuild
+  .ann-index <name> <file> cold-open a vector index from <file> for ann(name,query,k[,metric])
+                            (Flat/IVF/Hnsw; mmap-backed, no re-decode)
+  .knn-save  <name> <store-dir>
+                            persist the in-memory knn collection <name> into an
+                            IndexStore at <store-dir> (prints the .gtvidx path to
+                            feed back into .knn-index)
   .params                 show the effective parameter file (MEMORY_TARGET, CUDA_*,
                           DEFAULT_MODE, …)
   .accel                  show device acceleration: VRAM budget, resident cache,
@@ -56,6 +68,9 @@ enum Command {
     Store { prefix: String, path: String, node_count: usize },
     Csv { name: String, path: String },
     Parquet { name: String, path: String },
+    KnnIndex { name: String, path: String, labels: Option<String> },
+    AnnIndex { name: String, path: String },
+    KnnSave { name: String, path: String },
     Params,
     Accel,
     Sql(String),
@@ -66,6 +81,25 @@ fn args(head: &str, rest: &[&str], n: usize, usage: &str) -> Result<Vec<String>>
         return Err(anyhow!("usage: .{head} {usage}"));
     }
     Ok(rest.iter().map(|s| (*s).to_string()).collect())
+}
+
+/// Read a per-vector label sidecar for `.knn-index`.
+///
+/// Format: one label per line, in the **original input order** the corpus was
+/// built with (for an IVF that is *not* cell order — the index maps masks back
+/// through `orig_pos`). Trailing blank lines are ignored; inner blanks are
+/// legal labels (an empty label simply never matches a filter).
+fn read_labels(path: &str) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("labels: cannot read `{path}`: {e}"))?;
+    let mut labels: Vec<String> = text.lines().map(|l| l.trim().to_string()).collect();
+    while labels.last().map(|l| l.is_empty()).unwrap_or(false) {
+        labels.pop();
+    }
+    if labels.is_empty() {
+        return Err(anyhow!("labels: `{path}` contains no labels"));
+    }
+    Ok(labels)
 }
 
 /// Split a line into a dot-command or a SQL statement.
@@ -106,6 +140,26 @@ fn parse(line: &str) -> Result<Command> {
         "parquet" => {
             let a = args(&head, &tail, 2, "<name> <path>")?;
             Ok(Command::Parquet { name: a[0].clone(), path: a[1].clone() })
+        }
+        "knn-index" => {
+            if !(2..=3).contains(&tail.len()) {
+                return Err(anyhow!(
+                    "usage: .knn-index <name> <file.gtvidx> [labels.txt]"
+                ));
+            }
+            Ok(Command::KnnIndex {
+                name: tail[0].to_string(),
+                path: tail[1].to_string(),
+                labels: tail.get(2).map(|s| (*s).to_string()),
+            })
+        }
+        "ann-index" => {
+            let a = args(&head, &tail, 2, "<name> <file.gtvidx>")?;
+            Ok(Command::AnnIndex { name: a[0].clone(), path: a[1].clone() })
+        }
+        "knn-save" => {
+            let a = args(&head, &tail, 2, "<name> <store-dir>")?;
+            Ok(Command::KnnSave { name: a[0].clone(), path: a[1].clone() })
         }
         "store" => {
             let a = args(&head, &tail, 3, "<prefix> <dir> <node_count>")?;
@@ -224,6 +278,20 @@ fn print_accel(ctx: &GtvContext) {
         t.resident.pending_rows,
         mib(t.resident.pending_bytes)
     );
+    println!(
+        "  PREFETCH         = {} hint(s) | pump {} ok / {} refused ({} block(s)/pass)",
+        t.prefetch_hints,
+        t.prefetch_uploads,
+        t.prefetch_failures,
+        ctx.accelerators().heat_pump_blocks()
+    );
+    println!(
+        "  GPUDIRECT        = {}",
+        match t.gpudirect {
+            Some((direct, staged)) => format!("{direct} direct / {staged} staged"),
+            None => "n/a (host backend)".to_string(),
+        }
+    );
     if let Some(err) = &t.last_error {
         println!("  LAST_ERROR       = {err}");
     }
@@ -290,6 +358,43 @@ async fn run(ctx: &GtvContext, cmd: Command) -> Result<bool> {
             let count = store.segments().len();
             ctx.register_segment_store(&store, &prefix)?;
             println!("registered {count} published segment(s) from `{path}` as `{prefix}_*`");
+        }
+        Command::KnnIndex { name, path, labels } => {
+            let index = load_index(&path)?;
+            let labels = labels.as_deref().map(read_labels).transpose()?;
+            let with_labels = labels.is_some();
+            ctx.register_knn_from_index(&name, index, labels)?;
+            println!(
+                "cold-opened `{path}` as knn collection `{name}` (mmap-backed, no re-decode{})",
+                if with_labels {
+                    "; labels restored from sidecar"
+                } else {
+                    ""
+                }
+            );
+        }
+        Command::AnnIndex { name, path } => {
+            let index = load_index(&path)?;
+            ctx.register_any_index(&name, index);
+            println!(
+                "cold-opened `{path}` as ann index `{name}` (mmap-backed, no re-decode)"
+            );
+        }
+        Command::KnnSave { name, path } => {
+            let (index, options) = ctx
+                .knn_to_any_index(&name)
+                .ok_or_else(|| anyhow!("knn-save: unknown collection `{name}`"))?;
+            let store = gtv_index_store::IndexStore::open(&path)?;
+            let v = store.save(&name, &index, &options, &gtv_index_store::IndexMeta::default())?;
+            let container = store
+                .root()
+                .join(v.index_id.to_string())
+                .join(format!("v{}", v.version))
+                .join("index.gtvidx");
+            println!(
+                "saved knn collection `{name}` → `{}` (cold-open with .knn-index <name> <file>)",
+                container.display()
+            );
         }
         Command::Sql(query) => show(ctx, &query).await?,
     }
@@ -374,6 +479,32 @@ mod tests {
         assert_eq!(
             parse(".store batch /tmp/seg 128").unwrap(),
             Command::Store { prefix: "batch".into(), path: "/tmp/seg".into(), node_count: 128 }
+        );
+        assert_eq!(
+            parse(".knn-index songs data/songs.gtvidx").unwrap(),
+            Command::KnnIndex {
+                name: "songs".into(),
+                path: "data/songs.gtvidx".into(),
+                labels: None,
+            }
+        );
+        assert_eq!(
+            parse(".knn-index songs data/songs.gtvidx data/genres.txt").unwrap(),
+            Command::KnnIndex {
+                name: "songs".into(),
+                path: "data/songs.gtvidx".into(),
+                labels: Some("data/genres.txt".into()),
+            }
+        );
+        assert!(parse(".knn-index songs").is_err());
+        assert!(parse(".knn-index a b c d").is_err());
+        assert_eq!(
+            parse(".ann-index idx data/idx.gtvidx").unwrap(),
+            Command::AnnIndex { name: "idx".into(), path: "data/idx.gtvidx".into() }
+        );
+        assert_eq!(
+            parse(".knn-save songs data/store").unwrap(),
+            Command::KnnSave { name: "songs".into(), path: "data/store".into() }
         );
     }
 

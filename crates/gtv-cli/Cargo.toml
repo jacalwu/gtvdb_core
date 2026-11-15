@@ -17,9 +17,13 @@ cuda = ["gtv-engine/cuda"]
 [dependencies]
 gtv-core = { path = "../gtv-core" }
 gtv-engine = { path = "../gtv-engine" }
+gtv-index-store = { path = "../gtv-index-store" }
 gtv-params = { path = "../gtv-params" }
 gtv-storage = { path = "../gtv-storage" }
 arrow.workspace = true
 anyhow.workspace = true
 rustyline.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+gtv-index = { path = "../gtv-index" }

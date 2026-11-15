@@ -1963,6 +1963,8 @@ dependencies = [
  "arrow",
  "gtv-core",
  "gtv-engine",
+ "gtv-index",
+ "gtv-index-store",
  "gtv-params",
  "gtv-storage",
  "rustyline",
