@@ -2006,6 +2006,7 @@ dependencies = [
  "gtv-index",
  "gtv-params",
  "gtv-pattern",
+ "gtv-pgq",
  "gtv-storage",
  "serde",
  "serde_json",
@@ -2075,13 +2076,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "gtv-pgq"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "gtv-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "gtv-core",
  "prost",
  "protoc-bin-vendored",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

@@ -12,6 +12,7 @@ gtv-array = { path = "../gtv-array" }
 gtv-index = { path = "../gtv-index" }
 gtv-catalog = { path = "../gtv-catalog" }
 gtv-pattern = { path = "../gtv-pattern" }
+gtv-pgq = { path = "../gtv-pgq" }
 gtv-storage = { path = "../gtv-storage" }
 gtv-accelerator = { path = "../gtv-accelerator" }
 gtv-params = { path = "../gtv-params" }
