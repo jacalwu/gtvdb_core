@@ -15,6 +15,7 @@ pub mod graph;
 pub mod metric;
 pub mod provenance;
 pub mod quantum_state;
+pub mod receipt;
 pub mod selection;
 pub mod table;
 pub mod temporal;
@@ -43,6 +44,12 @@ pub use provenance::{
 };
 pub use quantum_state::{
     Gate, ProbabilitySemantics, QuantumStateLog, QuantumStateRecord, Reconstruction, StateError,
+};
+pub use receipt::{
+    allows_partial_rows, is_supported_version, negotiate_version, plan_hash, topk_dedup,
+    topk_dedup_by_score, tri_state_str, DedupKey, EdgeRef, Incomplete, IncompleteReason,
+    PathEvidence, QueryReceipt, QueryStats, ENGINE_VERSION, MIN_SUPPORTED_PROTOCOL,
+    PROTOCOL_VERSION, RECEIPT_METADATA_JSON, RECEIPT_METADATA_PREFIX,
 };
 pub use selection::{Sel, SelIter, SelRepr, UNBOUND_SNAPSHOT};
 pub use table::{EdgeTable, NodeTable};
