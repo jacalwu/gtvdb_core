@@ -38,6 +38,7 @@ pub mod lineage;
 pub mod monitor;
 pub mod motif;
 pub mod quantum_state;
+pub mod receipt;
 pub mod registry;
 pub mod segment;
 pub mod udf;
@@ -63,7 +64,12 @@ pub use invalidation::{
 };
 pub use lineage::{extract_udfs, ReplayError, ENGINE_VERSION, LINEAGE_TABLE};
 pub use motif::{
-    build_motif_tables, edge_schema, find_matches, match_schema, MotifBatches, MotifEdgeTable,
-    MotifFromTableFunction, MotifMatchTable, MotifShape, MotifSpec, MotifTableFunction,
+    build_motif_tables, build_receipt_batch, edge_schema, find_matches, find_matches_bounded,
+    match_schema, receipt_schema, MotifBatches, MotifEdgeTable, MotifFromTableFunction,
+    MotifMatchTable, MotifReceiptTable, MotifShape, MotifSpec, MotifSummary, MotifTableFunction,
+    MotifOutcome,
+};
+pub use receipt::{
+    attach_receipt, count_rows, receipt_for_statement, receipt_from_batches, QueryOutcome,
 };
 pub use registry::{AsofResource, HftRegistry, PitResource, ResourceRegistry};

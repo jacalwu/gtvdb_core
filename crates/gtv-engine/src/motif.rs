@@ -41,14 +41,19 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch, UInt16Array, UInt32Array, UInt64Array};
+use arrow::array::{
+    ArrayRef, Int64Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
-use gtv_core::TemporalCSR;
+use gtv_core::{
+    Incomplete, QueryReceipt, Sel, TemporalCSR, TraversalBudget, TraversalStats,
+    TriState, Truncation, UNBOUND_SNAPSHOT,
+};
 use gtv_pattern::{Match, Pattern, WindowedMotif};
 
 use crate::expr_util::{expr_to_i64, expr_to_string, expr_to_u64};
@@ -115,7 +120,7 @@ impl MotifShape {
 }
 
 /// Complete specification of one motif query.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct MotifSpec {
     pub shape: MotifShape,
     pub valid_at: i64,
@@ -124,6 +129,22 @@ pub struct MotifSpec {
     pub max_event_span: Option<i64>,
     /// Matched edge types, ordered by event time, must equal this sequence.
     pub sequence: Vec<u16>,
+    /// Optional resource cap. When set, the matcher runs through
+    /// `gtv_pattern::find_bounded`, counts every scanned edge, and reports
+    /// truncation instead of pretending the prefix is the answer.
+    pub budget: Option<TraversalBudget>,
+}
+
+/// Spec equality ignores the resource budget: two queries asking the same
+/// thing of the same snapshot are the same query even if one is budgeted.
+impl PartialEq for MotifSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.shape == other.shape
+            && self.valid_at == other.valid_at
+            && self.limit == other.limit
+            && self.max_event_span == other.max_event_span
+            && self.sequence == other.sequence
+    }
 }
 
 impl MotifSpec {
@@ -134,7 +155,16 @@ impl MotifSpec {
             limit: DEFAULT_LIMIT,
             max_event_span: None,
             sequence: Vec::new(),
+            budget: None,
         }
+    }
+
+    /// Cap the search. `budget` is ignored for windowed specs (the bounded
+    /// kernel takes a plain `Pattern`), which [`find_matches_bounded`] rejects
+    /// explicitly rather than silently running unbounded.
+    pub fn with_budget(mut self, budget: TraversalBudget) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     pub fn with_limit(mut self, limit: usize) -> Self {
@@ -219,6 +249,130 @@ pub fn find_matches(
         }
     }
     Ok(out)
+}
+
+/// Result of a motif run plus everything a receipt needs.
+#[derive(Debug, Clone)]
+pub struct MotifOutcome {
+    pub matches: Vec<Match>,
+    /// `Some` when a resource cap stopped the search. The matches are then a
+    /// prefix and must not be reported as the answer (A4 / R2).
+    pub truncation: Option<Truncation>,
+    pub stats: TraversalStats,
+    pub valid_at: i64,
+    pub limit: usize,
+}
+
+impl MotifOutcome {
+    pub fn is_complete(&self) -> bool {
+        self.truncation.is_none()
+    }
+
+    pub fn tri_state(&self) -> TriState {
+        match (self.matches.is_empty(), self.truncation.is_some()) {
+            (_, true) => TriState::Incomplete,
+            (false, false) => TriState::Found,
+            (true, false) => TriState::NoMatch,
+        }
+    }
+
+    /// Human-readable reason, phrased as what to change rather than what broke.
+    pub fn incomplete(&self) -> Option<Incomplete> {
+        self.truncation.as_ref().map(Incomplete::from)
+    }
+
+    /// Build a receipt for this run. `query_id` is the caller's correlation id.
+    pub fn receipt(&self, query_id: impl Into<String>) -> QueryReceipt {
+        let mut receipt = QueryReceipt::new(query_id, self.tri_state())
+            .with_as_of(self.valid_at)
+            .with_stats(self.stats.clone().into());
+        if let Some(t) = &self.truncation {
+            receipt.incomplete = Some(t.into());
+        }
+        receipt
+    }
+}
+
+/// Like [`find_matches`], but honours `spec.budget`.
+///
+/// With no budget this is exactly [`find_matches`] plus default stats. With a
+/// budget it routes through `gtv_pattern::find_bounded`, which accounts for
+/// every scanned edge; exceeding the cap returns the prefix **and** a
+/// [`Truncation`] instead of an error, so the caller decides whether a partial
+/// answer is acceptable.
+///
+/// Windowed specs (`max_event_span` / `sequence`) cannot be combined with a
+/// budget yet: the bounded kernel takes a plain [`Pattern`]. Rather than
+/// silently running unbounded — which would make the budget a lie — that
+/// combination is rejected.
+pub fn find_matches_bounded(
+    csr: &TemporalCSR,
+    spec: &MotifSpec,
+    seeds: Option<&[u64]>,
+) -> Result<MotifOutcome> {
+    let Some(budget) = spec.budget.as_ref() else {
+        let matches = find_matches(csr, spec, seeds)?;
+        let mut stats = TraversalStats {
+            rows: matches.len() as u64,
+            ..Default::default()
+        };
+        stats.hops = matches
+            .iter()
+            .map(|m| m.edges.len())
+            .max()
+            .unwrap_or_default();
+        return Ok(MotifOutcome {
+            matches,
+            truncation: None,
+            stats,
+            valid_at: spec.valid_at,
+            limit: spec.limit,
+        });
+    };
+
+    if spec.is_windowed() {
+        return Err(DataFusionError::Execution(
+            "motif: a resource budget cannot be combined with a window/sequence spec yet".into(),
+        ));
+    }
+    if spec.limit == 0 {
+        return Ok(MotifOutcome {
+            matches: Vec::new(),
+            truncation: None,
+            stats: TraversalStats::default(),
+            valid_at: spec.valid_at,
+            limit: 0,
+        });
+    }
+
+    let pattern = spec.shape.pattern();
+    let set = match seeds {
+        Some(seeds) if !seeds.is_empty() => {
+            let snapshot = csr.snapshot_id().unwrap_or(UNBOUND_SNAPSHOT);
+            let candidates = Sel::from_ids(snapshot, csr.node_count() as u64, seeds.iter().copied())
+                .map_err(kernel_err)?;
+            gtv_pattern::find_bounded(
+                csr,
+                &pattern,
+                spec.valid_at,
+                spec.limit,
+                &candidates,
+                budget,
+                None,
+            )
+            .map_err(kernel_err)?
+        }
+        _ => gtv_pattern::find_bounded_all(csr, &pattern, spec.valid_at, spec.limit, budget, None)
+            .map_err(kernel_err)?,
+    };
+
+    Ok(MotifOutcome {
+        matches: set.matches,
+        truncation: set.truncation,
+        stats: set.stats,
+        valid_at: spec.valid_at,
+        limit: spec.limit,
+    })
 }
 
 /// One row per match: `match_id`, `n0..n{k-1}`, `event_min`, `event_max`.
@@ -317,10 +471,98 @@ pub fn build_edge_batch(matches: &[Match]) -> Result<RecordBatch> {
     )?)
 }
 
-/// Materialize both batch tables from a single kernel run.
+/// Lightweight summary of a motif run: everything a receipt needs, without
+/// holding on to the matches.
+#[derive(Debug, Clone)]
+pub struct MotifSummary {
+    pub tri_state: TriState,
+    pub incomplete: Option<Incomplete>,
+    pub stats: TraversalStats,
+    pub valid_at: i64,
+    pub limit: usize,
+}
+
+impl MotifSummary {
+    pub fn is_complete(&self) -> bool {
+        self.tri_state != TriState::Incomplete
+    }
+
+    /// Build a receipt. `query_id` is the caller's correlation id.
+    pub fn receipt(&self, query_id: impl Into<String>) -> QueryReceipt {
+        let mut receipt = QueryReceipt::new(query_id, self.tri_state)
+            .with_as_of(self.valid_at)
+            .with_stats(self.stats.clone().into());
+        receipt.incomplete = self.incomplete.clone();
+        receipt
+    }
+}
+
+impl MotifOutcome {
+    pub fn summary(&self) -> MotifSummary {
+        MotifSummary {
+            tri_state: self.tri_state(),
+            incomplete: self.incomplete(),
+            stats: self.stats.clone(),
+            valid_at: self.valid_at,
+            limit: self.limit,
+        }
+    }
+}
+
+/// One row: whether `gtv_motif_matches` is a complete answer, and what to do
+/// about it when it is not.
+///
+/// This is the SQL-visible form of [`Incomplete`]. It is always exactly one
+/// row, so `SELECT tri_state FROM gtv_motif_receipt` is a cheap assertion in a
+/// test or a notebook, and a join against it cannot fan out.
+pub fn receipt_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("tri_state", DataType::Utf8, false),
+        Field::new("incomplete_reason", DataType::Utf8, true),
+        Field::new("hop", DataType::UInt64, false),
+        Field::new("observed", DataType::UInt64, true),
+        Field::new("cap", DataType::UInt64, true),
+        Field::new("rows", DataType::UInt64, false),
+        Field::new("edges_scanned", DataType::UInt64, false),
+        Field::new("nodes_visited", DataType::UInt64, false),
+    ]))
+}
+
+pub fn build_receipt_batch(summary: &MotifSummary) -> Result<RecordBatch> {
+    let (reason, hop, observed, cap) = match &summary.incomplete {
+        Some(i) => (
+            Some(i.reason.as_str()),
+            i.hop as u64,
+            i.observed,
+            i.limit,
+        ),
+        None => (None, 0, None, None),
+    };
+    Ok(RecordBatch::try_new(
+        receipt_schema(),
+        vec![
+            Arc::new(StringArray::from(vec![match summary.tri_state {
+                TriState::Found => "found",
+                TriState::NoMatch => "no_match",
+                TriState::Incomplete => "incomplete",
+            }])) as ArrayRef,
+            Arc::new(StringArray::from(vec![reason])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![hop])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![observed])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![cap])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![summary.stats.rows])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![summary.stats.edges_scanned])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![summary.stats.nodes_visited])) as ArrayRef,
+        ],
+    )?)
+}
+
+/// Materialize the match / edge / receipt tables from a single kernel run.
 pub struct MotifBatches {
     pub matches: MotifMatchTable,
     pub edges: MotifEdgeTable,
+    pub receipt: MotifReceiptTable,
+    pub summary: MotifSummary,
 }
 
 pub fn build_motif_tables(
@@ -328,9 +570,11 @@ pub fn build_motif_tables(
     spec: MotifSpec,
     seeds: &[u64],
 ) -> Result<MotifBatches> {
-    let found = find_matches(csr.as_ref(), &spec, Some(seeds))?;
-    let match_batch = build_match_batch(&found, spec.num_vars())?;
-    let edge_batch = build_edge_batch(&found)?;
+    let outcome = find_matches_bounded(csr.as_ref(), &spec, Some(seeds))?;
+    let summary = outcome.summary();
+    let match_batch = build_match_batch(&outcome.matches, spec.num_vars())?;
+    let edge_batch = build_edge_batch(&outcome.matches)?;
+    let receipt_batch = build_receipt_batch(&summary)?;
     Ok(MotifBatches {
         matches: MotifMatchTable {
             spec,
@@ -338,6 +582,10 @@ pub fn build_motif_tables(
             batch: match_batch,
         },
         edges: MotifEdgeTable { batch: edge_batch },
+        receipt: MotifReceiptTable {
+            batch: receipt_batch,
+        },
+        summary,
     })
 }
 
@@ -368,6 +616,18 @@ pub struct MotifEdgeTable {
 }
 
 impl MotifEdgeTable {
+    pub fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+}
+
+/// One-row table reporting whether the match table is conclusive.
+#[derive(Debug, Clone)]
+pub struct MotifReceiptTable {
+    batch: RecordBatch,
+}
+
+impl MotifReceiptTable {
     pub fn batch(&self) -> &RecordBatch {
         &self.batch
     }
@@ -418,6 +678,35 @@ impl TableProvider for MotifMatchTable {
 impl TableProvider for MotifEdgeTable {
     fn schema(&self) -> SchemaRef {
         edge_schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        scan_batch(
+            self.schema(),
+            self.batch.clone(),
+            state,
+            projection,
+            filters,
+            limit,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for MotifReceiptTable {
+    fn schema(&self) -> SchemaRef {
+        receipt_schema()
     }
 
     fn table_type(&self) -> TableType {

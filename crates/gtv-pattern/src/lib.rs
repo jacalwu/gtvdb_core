@@ -8,8 +8,8 @@
 //! `valid_from`) ordering constraints.
 
 use gtv_core::{
-    BudgetTracker, CancelToken, Result, Sel, TemporalCSR, TraversalBudget, TraversalStats,
-    TriState, Truncation, UNBOUND_SNAPSHOT,
+    BudgetTracker, CancelToken, DedupKey, EdgeRef, PathEvidence, Result, Sel, TemporalCSR,
+    TraversalBudget, TraversalStats, TriState, Truncation, UNBOUND_SNAPSHOT,
 };
 
 /// A pattern edge from variable `from` to variable `to`.
@@ -227,6 +227,48 @@ pub struct Match {
     /// `nodes[var]` is the bound node id for variable `var`.
     pub nodes: Vec<u64>,
     pub edges: Vec<MatchedEdge>,
+}
+
+impl Match {
+    /// Convert this match into transportable evidence (A3).
+    ///
+    /// `segment_id` identifies the segment the CSR was built from: the CSR
+    /// stores edge *slots*, and a slot only becomes a citable row once paired
+    /// with the segment it belongs to. Callers that do not track segments can
+    /// pass `0` and keep the slot as the row offset.
+    ///
+    /// Edges whose slot was not recoverable (`u32::MAX`, which cannot happen
+    /// for pattern matching but is defended against anyway) are reported as an
+    /// error rather than silently mapped to row 0 — a wrong row reference is
+    /// worse than a refused one.
+    pub fn evidence(&self, segment_id: u64) -> Result<PathEvidence> {
+        let mut edges = Vec::with_capacity(self.edges.len());
+        for e in &self.edges {
+            let edge = EdgeRef::from_slot(segment_id, e.edge_idx).ok_or_else(|| {
+                gtv_core::GtvError::InvalidArgument(format!(
+                    "match edge {}->{} has no recoverable slot",
+                    e.src, e.dst
+                ))
+            })?;
+            edges.push(edge);
+        }
+        PathEvidence::new(
+            self.nodes.clone(),
+            edges,
+            self.edges.iter().map(|e| e.valid_from).collect(),
+            self.edges.iter().map(|e| e.valid_to).collect(),
+        )
+    }
+
+    /// Canonical dedup identity: `ring = true` for cycles (rotation-invariant),
+    /// `false` for ordered paths (direction-sensitive).
+    pub fn dedup_key(&self, ring: bool) -> DedupKey {
+        if ring {
+            DedupKey::ring(self.nodes.iter().copied())
+        } else {
+            DedupKey::path(self.nodes.iter().copied())
+        }
+    }
 }
 
 /// Find up to `limit` matches anchoring variable 0 at `start`, at time `valid_at`.

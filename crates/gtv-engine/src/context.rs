@@ -916,10 +916,102 @@ impl GtvContext {
         Ok(registered)
     }
 
+    /// Execute a statement that may contain SQL/PGQ `GRAPH_TABLE` clauses (C1).
+    ///
+    /// `graphs` resolves labels to tables the session already has. A statement
+    /// without `GRAPH_TABLE` runs unchanged, so one entry point serves both
+    /// plain SQL and standard graph queries.
+    ///
+    /// The rewrite produces ordinary joins — there is no second planner, and
+    /// `EXPLAIN` shows the base relations. Unsupported standard features fail
+    /// with the feature's name instead of silently running something else.
+    pub async fn sql_pgq(
+        &self,
+        query: &str,
+        graphs: &gtv_pgq::PropertyGraphRegistry,
+    ) -> Result<Vec<RecordBatch>> {
+        if !gtv_pgq::contains_graph_table(query) {
+            return self.sql(query).await;
+        }
+        let rewritten = self.rewrite_pgq(query, graphs)?;
+        self.sql(&rewritten.sql).await
+    }
+
+    /// Rewrite a PGQ statement without executing it.
+    ///
+    /// Returns `None` when the statement contains no `GRAPH_TABLE`. Handy for
+    /// `EXPLAIN`-style tooling and for asserting that a rewrite stays a plain
+    /// SQL join.
+    pub fn rewrite_pgq(
+        &self,
+        query: &str,
+        graphs: &gtv_pgq::PropertyGraphRegistry,
+    ) -> Result<gtv_pgq::Rewrite> {
+        gtv_pgq::rewrite(query, graphs)
+            .map_err(|e| datafusion::error::DataFusionError::Plan(e.to_string()))
+    }
+
     /// Run a SQL query and collect all result batches.
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         let df = self.ctx.sql(query).await?;
         df.collect().await
+    }
+
+    /// Run a SQL query and return its rows **and** a receipt for them (A1).
+    ///
+    /// `summaries` lists the graph tables the statement may read, as
+    /// `(table name, summary)` — normally the values returned by
+    /// [`Self::register_motif_batch_shared`]. If any of them was truncated the
+    /// statement's tri-state is `Incomplete`, because a join against a partial
+    /// table is itself partial even when it returns rows.
+    ///
+    /// The receipt is validated before it is returned: a receipt that claims
+    /// completeness it cannot prove is a bug here, not at the caller.
+    pub async fn sql_with_receipt(
+        &self,
+        query_id: impl Into<String>,
+        query: &str,
+        as_of: Option<i64>,
+        snapshot_id: Option<u64>,
+        summaries: &[(String, crate::motif::MotifSummary)],
+    ) -> Result<crate::receipt::QueryOutcome> {
+        let df = self.ctx.sql(query).await?;
+        // Hash the *optimized* plan: the receipt should identify what ran, not
+        // what the parser first produced.
+        let rendered = df.logical_plan().display_indent().to_string();
+        let batches = df.collect().await?;
+        let receipt = crate::receipt::receipt_for_statement(
+            query_id,
+            &batches,
+            as_of,
+            snapshot_id,
+            &rendered,
+            summaries,
+        );
+        receipt
+            .validate()
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        Ok(crate::receipt::QueryOutcome { batches, receipt })
+    }
+
+    /// [`Self::sql_with_receipt`], plus the receipt stamped onto the Arrow
+    /// schema metadata so it travels with the result.
+    pub async fn sql_with_attached_receipt(
+        &self,
+        query_id: impl Into<String>,
+        query: &str,
+        as_of: Option<i64>,
+        snapshot_id: Option<u64>,
+        summaries: &[(String, crate::motif::MotifSummary)],
+    ) -> Result<crate::receipt::QueryOutcome> {
+        let outcome = self
+            .sql_with_receipt(query_id, query, as_of, snapshot_id, summaries)
+            .await?;
+        let batches = crate::receipt::attach_receipt(outcome.batches, &outcome.receipt)?;
+        Ok(crate::receipt::QueryOutcome {
+            batches,
+            receipt: outcome.receipt,
+        })
     }
 
     /// Register the `neighbors(src, valid_at)` graph table function.
@@ -1023,23 +1115,76 @@ impl GtvContext {
         csr: &TemporalCSR,
         spec: &MotifSpec,
         seeds: &[u64],
-    ) -> Result<()> {
+    ) -> Result<crate::motif::MotifSummary> {
         self.register_motif_batch_shared(&Arc::new(csr.clone()), spec, seeds)
     }
 
     /// See [`Self::register_batch_graph_shared`]: seed sets change far more
     /// often than the graph image does.
+    ///
+    /// Also registers `gtv_motif_receipt` (one row) so a SQL caller can tell a
+    /// complete answer from a budget-truncated prefix without leaving SQL:
+    ///
+    /// ```sql
+    /// SELECT tri_state, incomplete_reason FROM gtv_motif_receipt;
+    /// ```
     pub fn register_motif_batch_shared(
         &self,
         csr: &Arc<TemporalCSR>,
         spec: &MotifSpec,
         seeds: &[u64],
-    ) -> Result<()> {
-        let pair = crate::motif::build_motif_tables(csr, spec.clone(), seeds)?;
+    ) -> Result<crate::motif::MotifSummary> {
+        let built = crate::motif::build_motif_tables(csr, spec.clone(), seeds)?;
+        let summary = built.summary.clone();
+        self.install_motif_tables(built)?;
+        Ok(summary)
+    }
+
+    /// Register motif tables only when the answer is conclusive.
+    ///
+    /// This is the **standard SQL path** (R2): when a resource budget truncates
+    /// the search, the query fails with the reason instead of returning a
+    /// prefix that `WHERE NOT EXISTS` would read as "no match". Extensions that
+    /// want partial rows must call [`Self::register_motif_batch_shared`] and
+    /// inspect `gtv_motif_receipt` (or the returned summary) explicitly.
+    pub fn register_motif_batch_strict(
+        &self,
+        csr: &Arc<TemporalCSR>,
+        spec: &MotifSpec,
+        seeds: &[u64],
+    ) -> Result<crate::motif::MotifSummary> {
+        let built = crate::motif::build_motif_tables(csr, spec.clone(), seeds)?;
+        if let Some(incomplete) = &built.summary.incomplete {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "gtv_motif: result is incomplete ({} at hop {}, observed {}, cap {}); \
+                 raise the budget, narrow the pattern, or query gtv_motif_receipt explicitly",
+                incomplete.reason,
+                incomplete.hop,
+                incomplete
+                    .observed
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                incomplete
+                    .limit
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            )));
+        }
+        let summary = built.summary.clone();
+        self.install_motif_tables(built)?;
+        Ok(summary)
+    }
+
+    fn install_motif_tables(&self, built: crate::motif::MotifBatches) -> Result<()> {
         let _ = self.ctx.deregister_table("gtv_motif_matches");
         let _ = self.ctx.deregister_table("gtv_motif_edges");
-        self.ctx.register_table("gtv_motif_matches", Arc::new(pair.matches))?;
-        self.ctx.register_table("gtv_motif_edges", Arc::new(pair.edges))?;
+        let _ = self.ctx.deregister_table("gtv_motif_receipt");
+        self.ctx
+            .register_table("gtv_motif_matches", Arc::new(built.matches))?;
+        self.ctx
+            .register_table("gtv_motif_edges", Arc::new(built.edges))?;
+        self.ctx
+            .register_table("gtv_motif_receipt", Arc::new(built.receipt))?;
         Ok(())
     }
 
