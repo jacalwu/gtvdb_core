@@ -132,6 +132,8 @@ let ctx = GtvContext::with_extensions(
 
 | 文档 | 内容 |
 |:--|:--|
+| [docs/user-guide.md](docs/user-guide.md) | **用户手册**：菜单式索引、5 分钟上手、图/向量/段/量子/DQ 的可跑示例（输出为实测）、REPL 指令表、参数调优、报错速查 |
+| [docs/product-design.md](docs/product-design.md) | **产品设计文档**：已交付功能全清单（带代码落点）、关键设计决策与被否掉的方案、性能现状、路线图与冻结项、已知限制 |
 | [docs/design-review-2026-11.md](docs/design-review-2026-11.md) | **第三方评审用设计文档**：架构、存储格式、读写路径、正确性策略、已知限制、评审问题清单 |
 | [docs/cuda-acceleration-plan.md](docs/cuda-acceleration-plan.md) | CUDA 边界、C0 实测（传输/filter/点积）、常驻设计与准入门禁；探针见 `tools/cuda-probe/` |
 | [docs/aml-core-ext-enablement.md](docs/aml-core-ext-enablement.md) | **AML 就绪方案**：边界四问、10 项评审逐条裁定（含 3 处事实修正）、五项 P0 通用原语、ext 分层、CPU/CUDA 两个发行物的落地顺序 |
