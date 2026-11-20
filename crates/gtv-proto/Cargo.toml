@@ -14,3 +14,11 @@ arrow.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tonic-prost = "0.14"
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
+gtv-core = { path = "../gtv-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }

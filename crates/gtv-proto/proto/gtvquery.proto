@@ -2,15 +2,60 @@ syntax = "proto3";
 
 package gtvquery;
 
-// A cross-node query dispatch service: a client sends SQL, the server executes
-// it against its local DataFusion context and returns the result batches as an
-// Arrow IPC stream (the Flight wire format).
+// Cross-boundary query dispatch (A1 / B1 / B5).
+//
+// `Execute` is the v0 shape and stays for one compatibility cycle: it carries
+// SQL and returns Arrow IPC, with no version, no as-of and no receipt. New
+// callers must use `ExecuteQuery`, which adds the fields a receipt needs.
+//
+// Both RPCs share `QueryRequest` / `QueryResponse`, and the v0 fields keep
+// their numbers: a v0 client sending `sql = 1` to a v1 server is understood; a
+// v1 client is refused with `UNSUPPORTED_VERSION` when the server cannot honour
+// its protocol version.
 service QueryService {
+  // v0, deprecated: no protocol version, no as-of, no receipt.
   rpc Execute (QueryRequest) returns (QueryResponse);
+
+  // v1: versioned, as-of aware, receipt-carrying.
+  rpc ExecuteQuery (QueryRequest) returns (QueryResponse);
+
+  // Version handshake, so a client can fail early with a readable message.
+  rpc Negotiate (VersionRequest) returns (VersionResponse);
+}
+
+message VersionRequest {
+  // Highest protocol version the client speaks.
+  uint32 protocol_version = 1;
+  // Client build string, for support ("gtvdb-py 0.3.1").
+  string client = 2;
+}
+
+message VersionResponse {
+  // Version the server will use for this connection, or 0 when the ranges do
+  // not overlap (in which case `error` explains why).
+  uint32 protocol_version = 1;
+  uint32 min_supported = 2;
+  uint32 max_supported = 3;
+  string engine_version = 4;
+  string error = 5;
 }
 
 message QueryRequest {
   string sql = 1;
+
+  // --- v1 additions (optional on the wire) ---
+  // Protocol version the client speaks. 0 means "v0 client".
+  uint32 protocol_version = 2;
+  // Business-time instant the query should be answered at.
+  optional int64 as_of = 3;
+  // Snapshot the client believes it is reading; mismatches are refused rather
+  // than silently answered from another snapshot.
+  optional uint64 snapshot_id = 4;
+  // Caller correlation id, echoed into the receipt.
+  string request_id = 5;
+  // Wall-clock budget; the server reports `INCOMPLETE`/`DEADLINE_EXCEEDED`
+  // instead of returning a silently truncated prefix.
+  optional uint64 timeout_ms = 6;
 }
 
 message QueryResponse {
@@ -18,4 +63,38 @@ message QueryResponse {
   bytes arrow_ipc = 1;
   // Non-empty when execution or serialization failed.
   string error = 2;
+
+  // --- v1 additions ---
+  uint32 protocol_version = 3;
+  ErrorCode code = 4;
+  TriState tri_state = 5;
+  // Full `QueryReceipt`, JSON-encoded (see `gtv_core::QueryReceipt`).
+  // Also stamped into the Arrow schema metadata, so a client that ignores this
+  // field still receives the receipt with the data.
+  string receipt_json = 6;
+}
+
+// Stable numeric codes. Clients branch on these, never on `error` text.
+enum ErrorCode {
+  OK = 0;
+  INVALID_ARGUMENT = 1;
+  UNSUPPORTED_VERSION = 2;
+  // The query did not finish (budget/deadline/cancel). Rows may be partial and
+  // must be read together with `tri_state`. Prefixed because proto3 enum
+  // values are package-scoped and would collide with `TriState.INCOMPLETE`.
+  RESULT_INCOMPLETE = 3;
+  SNAPSHOT_MISMATCH = 4;
+  CANCELLED = 5;
+  DEADLINE_EXCEEDED = 6;
+  INTERNAL = 7;
+}
+
+// Three-state result classification (R2): `NO_MATCH` proves absence,
+// `INCOMPLETE` proves nothing.
+enum TriState {
+  FOUND = 0;
+  NO_MATCH = 1;
+  INCOMPLETE = 2;
+  // v0 server that did not compute a tri-state.
+  UNSPECIFIED = 3;
 }
