@@ -10,6 +10,7 @@ pub mod delta;
 pub mod error;
 pub mod gc;
 pub mod hdb;
+pub mod lock;
 pub mod maintenance;
 pub mod mem_segment;
 pub mod node_lifetime;
@@ -25,6 +26,7 @@ pub use aggregate::{AggregateView, EdgeInterval, LogicalEdge, RangeBucket};
 pub use atomic::{fsync_dir, tmp_path, write_atomic, write_batch_atomic};
 pub use bitemporal::BitemporalStore;
 pub use gc::{GcPolicy, GcReport, ReadScope};
+pub use lock::{LockOwner, OpenMode, StoreLock, LOCK_FILE};
 
 pub use cache::StaticCache;
 pub use csv::read_csv;

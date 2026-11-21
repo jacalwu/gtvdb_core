@@ -120,6 +120,11 @@ fn observation_versions_survive_restart_and_feed_as_of() {
         .unwrap();
     assert_eq!(s.observations().len(), 2);
 
+    // A data directory has one writer. "A fresh handle" therefore means a
+    // restart: release the first handle before reopening, exactly as a new
+    // process would have to (the exclusive lock enforces it).
+    drop(s);
+
     // A fresh handle sees exactly the published versions; the session store
     // is rehydrated from them, so `as_of` keeps both axes after a restart.
     let reopened = SegmentStore::open(&root, NODE_COUNT).unwrap();
@@ -164,6 +169,7 @@ fn worker_compaction_matches_synchronous_and_survives_restart() {
     assert_eq!(s.visible_edges_at(20).unwrap(), expected);
     assert_eq!(s.delta_depth(), 0);
 
+    drop(s); // one writer per directory — reopening models a restart
     let reopened = SegmentStore::open(&root, NODE_COUNT).unwrap();
     assert_eq!(reopened.visible_edges_at(30).unwrap(), expected);
     assert_eq!(reopened.visible_edges_at(20).unwrap(), expected);
@@ -311,6 +317,7 @@ fn delayed_gc_preserves_head_reclaims_history_and_cleans_orphans() {
     // The newest observation version at/below the floor is kept for `as_of`.
     assert_eq!(value_of(&s.observation_batches("cpi", 30).unwrap()), 2.0);
 
+    drop(s); // one writer per directory — reopening models a restart
     let reopened = SegmentStore::open(&root, NODE_COUNT).unwrap();
     assert_eq!(reopened.visible_edges_at(30).unwrap(), head);
     assert!(reopened.visible_edges_at(10).is_err());

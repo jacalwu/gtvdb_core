@@ -65,6 +65,7 @@ use crate::delta::{
 };
 use crate::error::{Result, StorageError};
 use crate::gc::{reader_count, remove_file, GcPolicy, GcReport, ReadScope};
+use crate::lock::{OpenMode, StoreLock};
 use crate::mem_segment::{IngestedEdge, MemSegment};
 use crate::node_lifetime::{decode_node_lifetime, encode_node_lifetime};
 use crate::observation::{
@@ -544,33 +545,86 @@ pub struct SegmentStore {
     /// In-flight version queries / background compactions. Delayed GC refuses
     /// to unlink anything while this is non-zero.
     readers: Arc<AtomicUsize>,
+    /// What this handle is allowed to do. A read-only store still *loads*
+    /// everything (the manifest, the deltas, the WAL tail) — it just refuses
+    /// every write, so the refusal is a property of the handle rather than a
+    /// promise the caller has to remember.
+    mode: OpenMode,
+    /// Ownership guard; released when the store drops. `None` only for
+    /// `ro-shared`, which takes no lock by design.
+    lock: Option<StoreLock>,
 }
 
 impl SegmentStore {
-    /// Open a store, replaying any WAL frames not covered by the manifest
-    /// checkpoint. `node_count` is fixed for the lifetime of the store so all
-    /// segments share the same `offsets` width.
+    /// Open a data directory for writing, replaying any WAL frames not covered
+    /// by the manifest checkpoint.
+    ///
+    /// This is the writable default and takes the exclusive directory lock, so
+    /// it is the only way a writer may open a directory. `node_count` is fixed
+    /// for the lifetime of the store so all segments share the same `offsets`
+    /// width; use [`Self::open_existing`] to take it from the manifest instead.
     pub fn open(root: impl AsRef<Path>, node_count: usize) -> Result<Self> {
-        if node_count == 0 {
-            return Err(err("SegmentStore node_count must be > 0"));
-        }
+        Self::open_with(root, Some(node_count), OpenMode::ReadWriteExclusive)
+    }
+
+    /// Open an existing data directory under an explicit [`OpenMode`], deriving
+    /// `node_count` from the manifest.
+    ///
+    /// This is what a server wants: the node width is a property of the data,
+    /// not something an operator should have to restate (and get wrong) on every
+    /// start. A directory without a manifest is refused rather than initialised,
+    /// because "start serving a typo" is worse than "refuse to start".
+    pub fn open_existing(root: impl AsRef<Path>, mode: OpenMode) -> Result<Self> {
+        Self::open_with(root, None, mode)
+    }
+
+    /// Open a data directory under an explicit [`OpenMode`].
+    ///
+    /// `node_count: None` means "read it from the manifest".
+    pub fn open_with(
+        root: impl AsRef<Path>,
+        node_count: Option<usize>,
+        mode: OpenMode,
+    ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("segments"))?;
+        // **Lock first, replay second.** The opposite order lets two processes
+        // replay the same WAL frames into their own `MemSegment` and then both
+        // checkpoint — the frames land twice, and the second writer's manifest
+        // silently wins. Acquiring the lock before touching `wal.log` is the
+        // only thing that makes "replay exactly once" true.
+        let lock = StoreLock::acquire(&root, mode)?;
+        if !mode.is_read_only() {
+            fs::create_dir_all(root.join("segments"))?;
+        }
 
         let manifest_path = root.join("manifest.json");
-        let (manifest, fresh) = if manifest_path.exists() {
+        let has_manifest = manifest_path.exists();
+        if !has_manifest && mode.is_read_only() {
+            return Err(err(format!(
+                "`{}` is not a gtvdb data directory (no manifest.json); {mode} never initialises one",
+                root.display()
+            )));
+        }
+        let (manifest, fresh) = if has_manifest {
             let bytes = fs::read(&manifest_path)?;
             let m: Manifest = serde_json::from_slice(&bytes)
                 .map_err(|e| err(format!("cannot parse {}: {e}", manifest_path.display())))?;
             (m, false)
         } else {
-            (Manifest::new(node_count), true)
+            let n = node_count.ok_or_else(|| {
+                err("SegmentStore needs a node_count when initialising a new directory")
+            })?;
+            (Manifest::new(n), true)
         };
         if manifest.version != MANIFEST_VERSION {
             return Err(err(format!(
                 "unsupported manifest version {} (reader supports {MANIFEST_VERSION})",
                 manifest.version
             )));
+        }
+        let node_count = node_count.unwrap_or(manifest.node_count as usize);
+        if node_count == 0 {
+            return Err(err("SegmentStore node_count must be > 0"));
         }
         if manifest.node_count as usize != node_count {
             return Err(err(format!(
@@ -671,7 +725,35 @@ impl SegmentStore {
             flush_threshold_bytes: DEFAULT_FLUSH_THRESHOLD,
             last_recovery: report,
             readers: Arc::new(AtomicUsize::new(0)),
+            mode,
+            lock: Some(lock),
         })
+    }
+
+    /// How this handle was opened.
+    pub fn mode(&self) -> OpenMode {
+        self.mode
+    }
+
+    /// The ownership guard, when this mode holds one.
+    pub fn lock(&self) -> Option<&StoreLock> {
+        self.lock.as_ref()
+    }
+
+    /// Refuse a mutation on a read-only handle.
+    ///
+    /// Every write goes through this rather than through a `&mut self` the
+    /// caller promised not to use: a read-only *server* still holds `&mut`
+    /// access internally (GC, compaction), so the check has to be explicit.
+    fn require_write(&self) -> Result<()> {
+        if self.mode.is_read_only() {
+            return Err(err(format!(
+                "data directory `{}` is open {} — refusing to write",
+                self.root.display(),
+                self.mode
+            )));
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -826,6 +908,7 @@ impl SegmentStore {
         partition_id: u32,
         edges: &[EdgeRecord],
     ) -> Result<u64> {
+        self.require_write()?;
         if edges.is_empty() {
             return Err(err("ingest batch is empty"));
         }
@@ -863,6 +946,7 @@ impl SegmentStore {
     /// Publish the current delta as new immutable segments bound to a global
     /// snapshot point `system_ts`. All pending edges must be visible at `T`.
     pub fn flush_at(&mut self, system_ts: i64) -> Result<FlushReport> {
+        self.require_write()?;
         let edges_flushed = self.mem.len();
         let reused_segments = self.manifest.segments.len();
         if edges_flushed == 0 {
@@ -1219,6 +1303,7 @@ impl SegmentStore {
     /// unreferenced orphans until that write becomes durable. This is what
     /// makes `gtv_invalidations()` atomically visible (review R4).
     pub fn publish_delta(&mut self, draft: DeltaDraft) -> Result<PublishReport> {
+        self.require_write()?;
         if !self.mem.is_empty() {
             return Err(err("flush pending inserts before publishing a delta: positional retract targets published segments only"));
         }
@@ -1411,6 +1496,7 @@ impl SegmentStore {
     /// `AS KNOWN AT t < system_ts` queries still see the original set. The new
     /// segments carry exactly the folded head row set.
     pub fn materialize_at(&mut self, system_ts: i64) -> Result<MaterializeReport> {
+        self.require_write()?;
         if !self.mem.is_empty() {
             return Err(err("flush pending inserts before materializing"));
         }
@@ -1437,6 +1523,7 @@ impl SegmentStore {
     /// publishes one manifest. A plan prepared against an older head is
     /// rejected outright — its row positions no longer describe the store.
     pub fn apply_compaction(&mut self, plan: CompactionPlan) -> Result<MaterializeReport> {
+        self.require_write()?;
         let _scope = ReadScope::new(&self.readers);
         if !self.mem.is_empty() {
             return Err(err("flush pending inserts before applying a compaction"));
@@ -1577,6 +1664,7 @@ impl SegmentStore {
     /// `checkpoint_txn` are untouched, so an in-flight compaction plan stays
     /// valid. Tags are references, not branches: the history stays linear.
     pub fn create_tag(&mut self, name: &str, system_ts: i64) -> Result<()> {
+        self.require_write()?;
         validate_tag_name(name)?;
         if system_ts > self.manifest.system_ts {
             return Err(err(format!(
@@ -1594,6 +1682,7 @@ impl SegmentStore {
 
     /// Remove a tag. Returns whether it existed.
     pub fn drop_tag(&mut self, name: &str) -> Result<bool> {
+        self.require_write()?;
         validate_tag_name(name)?;
         if !self.manifest.tags.contains_key(name) {
             return Ok(false);
@@ -1638,6 +1727,7 @@ impl SegmentStore {
         system_ts: i64,
         batches: Vec<RecordBatch>,
     ) -> Result<ObservationEntry> {
+        self.require_write()?;
         if table.trim().is_empty() {
             return Err(err("observation table name is empty"));
         }
@@ -1736,6 +1826,7 @@ impl SegmentStore {
     /// Reclaim files whose only consumers are snapshots below the retention
     /// floor. Default policy is a no-op dry run; see [`GcPolicy`].
     pub fn gc(&mut self, policy: GcPolicy) -> Result<GcReport> {
+        self.require_write()?;
         let active = reader_count(&self.readers);
         if active != 0 {
             return Err(err(format!(

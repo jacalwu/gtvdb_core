@@ -273,6 +273,7 @@ fn legacy_manifest_without_tags_still_loads() {
     value.as_object_mut().unwrap().remove("tags");
     fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
+    drop(s); // one writer per directory — reopening models a restart
     let reopened = SegmentStore::open(&root, NODE_COUNT).unwrap();
     assert!(reopened.tags().is_empty());
     assert!(read_tag_log(&root).unwrap().is_empty());

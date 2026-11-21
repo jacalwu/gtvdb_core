@@ -138,6 +138,8 @@ fn crash_before_flush_replays_wal_then_flushes_exactly_once() {
     assert_eq!(store.pending_edges(), 0);
 
     // Reopen after checkpoint: no frame is replayed, no edge is duplicated.
+    // The first handle must go first — a data directory takes one writer.
+    drop(store);
     let store2 = SegmentStore::open(&root, 128).unwrap();
     assert_eq!(store2.recovery().frames_replayed, 0);
     assert_eq!(store2.pending_edges(), 0);
@@ -145,7 +147,6 @@ fn crash_before_flush_replays_wal_then_flushes_exactly_once() {
     assert_eq!(store2.verify_all().unwrap(), 2);
     assert_no_csv(&root);
 
-    drop(store);
     drop(store2);
     let _ = fs::remove_dir_all(&root);
 }
@@ -179,13 +180,13 @@ fn torn_wal_tail_is_truncated_and_ingest_continues() {
     // Appending after truncation must land on a clean frame boundary.
     store.ingest(0, 0, &edges(20, 5, 3)).unwrap();
     store.flush_at(50).unwrap();
+    drop(store); // one writer per directory — reopening models a restart
     let reopened = SegmentStore::open(&root, 128).unwrap();
     assert_eq!(reopened.recovery().torn_tail_bytes, 0);
     assert_eq!(reopened.recovery().frames_replayed, 0);
     assert_eq!(reopened.graph_at(i64::MAX).unwrap().edge_count(), 25);
     assert_no_csv(&root);
 
-    drop(store);
     drop(reopened);
     let _ = fs::remove_dir_all(&root);
 }

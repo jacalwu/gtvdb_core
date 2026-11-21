@@ -61,7 +61,7 @@
 | gtvdb_core | 协议 | Arrow | DataFusion | Rust MSRV | 备注 |
 |:--|:--|:--|:--|:--|:--|
 | 0.1.x | v1 | 59 | 55 | 1.82 | 当前（回执无 `freshness`） |
-| 下一版（未发布） | v1 | 59 | 55 | 1.82 | 回执含 `freshness`；协议仍 v1，0.1 对端忽略新键即可 |
+| 下一版（未发布） | v1 | 59 | 55 | **1.89** | 回执含 `freshness`；协议仍 v1，0.1 对端忽略新键即可。MSRV 由 `std::fs::File::{try_lock,try_lock_shared}`（1.89 稳定）决定，见 `docs/data-directory.md` |
 | 0.0.x | v0 | 59 | 55 | 1.82 | `Execute` only |
 
 扩展仓升级路径：改 `Cargo.toml` 里的 git rev → `cargo test` → 若编译失败，先看本文件 §3 是否命中破坏性改动，再决定是否同步改扩展代码。CI 的 `core-boundary` 继续阻止 core 依赖领域 crate。
@@ -90,3 +90,4 @@
 | 未发布 | 2026-11-21 | Python 驱动进入可发布状态：版本单一来源（`gtvdb/_version.py`，`pyproject.toml` 用 `dynamic`/`attr` 读回）；许可证改为 SPDX 表达式 `Apache-2.0` + PEP 639 `license-files`（`python/LICENSE.md` 为仓库根文件的逐字节副本，PEP 639 不允许 `..`）；新增 `py.typed`、`MANIFEST.in`、`check_release.py` 预检；`.github/workflows/publish-python.yml` 以 `py-v*` 标签 + OIDC 发布。**驱动版本与 crate 版本解耦**：协议兼容性靠 `Negotiate` 协商，不靠版本号推断 |
 | 未发布 | 2026-11-21 | **回执新增时点绑定**（`PointBinding{Applied,Declared}`）：`as_of` / `snapshot_id` 必须说明是"被执行"还是"仅被记录"，只是记录时不得给结论性 `tri-state`（`validate` 拒绝）。新增 `IncompleteReason::TimePointNotApplied`、`QueryReceipt::{with_as_of_applied,with_snapshot_verified,as_of_applied,snapshot_verified,has_declared_point}`、`GtvContext::{set_head_snapshot,clear_head_snapshot,head_snapshot,verify_snapshot,sql_with_receipt_binding,sql_with_attached_receipt_binding}`、`gtv_engine::QueryBinding`。`receipt_for_statement` 改收 `QueryBinding`（签名破坏性，见 §3 末段关于字面量构造的边界）。Arrow metadata 新增 `as_of_binding` / `snapshot_binding`；新字段均 `#[serde(default)]`，旧回执仍可解析。`GtvError::SnapshotMismatch` 文案改为中性的 `expected/got`。**协议版本仍为 v1**（纯增量，0.1 对端忽略新键即可） |
 | 未发布 | 2026-11-21 | 语义变更（无破坏性编译影响，但会改变结果）：带 `as_of` / `snapshot_id` 且未声明执行时，`sql_with_receipt*` 的结果从 `found`/`no_match` 变为 `incomplete` + `time_point_not_applied`。此前回执把请求原样抄回，等于为未执行的时点背书（见 `docs/time-point-contract.md`）。`serve_demo` 声明 head snapshot=1，并在此之前调用 `verify_snapshot`，因此错配会得到 `SNAPSHOT_MISMATCH`（该错误码此前从未被产生过） |
+| 未发布 | 2026-11-22 | **数据目录所有权（P2 地基）**：`gtv-storage` 新增 `OpenMode{rw-exclusive,ro-shared,ro-shared-locked}`、`StoreLock`、`LockOwner`、`StorageError::Locked`、`SegmentStore::{open_with,open_existing,mode,lock}`，锁文件 `OWNER.lock` + 提示文件 `OWNER.json`。**行为变更（重要）**：`SegmentStore::open` 现在取目录级排他锁，同一目录第二个写句柄会被拒绝并指出持有者——此前两个进程可同开一目录（`docs/data-directory.md`）。次序固定为「先取锁，再重放 WAL」。只读句柄的每个写路径返回「refusing to write」。`gtv-storage` 不在承诺列表（§2），但这条语义变化会改变部署行为，故记录 |
