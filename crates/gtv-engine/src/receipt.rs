@@ -220,7 +220,7 @@ mod tests {
         );
         assert_eq!(r.tri_state, TriState::Incomplete);
         assert_eq!(r.incomplete.as_ref().unwrap().reason, IncompleteReason::Edges);
-        assert!(r.plan_hash.unwrap().ends_with("@gtv_motif_matches"));
+        assert!(r.plan_hash.as_ref().unwrap().ends_with("@gtv_motif_matches"));
         assert!(r.validate().is_ok());
     }
 

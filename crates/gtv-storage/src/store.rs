@@ -762,6 +762,31 @@ impl SegmentStore {
     pub fn system_ts(&self) -> i64 {
         self.manifest.system_ts
     }
+
+    /// Knowledge state of this store, for stamping onto a query receipt.
+    ///
+    /// Reports [`gtv_core::KnowledgeClock::SegmentSystemTs`] because that is
+    /// what the store physically knows: the publish time of the newest flushed
+    /// segment. A refresh pipeline that carries the ingestion row's
+    /// `recorded_at` should stamp that clock instead — core does not pick
+    /// between them (v3 plan Q22).
+    ///
+    /// `history_floor` is the delayed-GC retention floor. Once set, `AS KNOWN
+    /// AT` below it fails hard in [`Self::check_history`]; the receipt needs the
+    /// same number so a reviewer can tell "no such edge" from "history gone".
+    pub fn freshness(&self) -> gtv_core::Freshness {
+        let mut freshness = gtv_core::Freshness::new(
+            self.manifest.system_ts,
+            gtv_core::KnowledgeClock::SegmentSystemTs,
+        );
+        if let Some(floor) = self.manifest.gc_floor {
+            freshness = freshness.with_history_floor(floor);
+        }
+        if let Some((_, hi)) = self.business_span() {
+            freshness = freshness.with_business_max(hi);
+        }
+        freshness
+    }
     pub fn recovery(&self) -> &RecoveryReport {
         &self.last_recovery
     }

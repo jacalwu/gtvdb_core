@@ -138,6 +138,12 @@ pub struct GtvContext {
     embedding_collections: EmbeddingRegistry,
     /// Bitemporal system-time versions for `as_of` (B3-2).
     bitemporal: crate::bitemporal::BitemporalRegistry,
+    /// Knowledge watermark stamped onto every receipt (G8 / G9).
+    ///
+    /// The host owns this because only the host knows what it refreshed from:
+    /// `SegmentStore::freshness()` for a store-backed load, or a `recorded_at`
+    /// high-water mark when the refresh pipeline carries one.
+    freshness: Arc<RwLock<Option<gtv_core::Freshness>>>,
     /// Multimodal cost-based optimizer state (B3-5).
     cbo: crate::cbo::CboRegistry,
     /// Workload admission / isolation manager (B3-6).
@@ -506,6 +512,7 @@ impl GtvContext {
             catalog,
             invalidation_root,
             aggregate,
+            freshness: Arc::new(RwLock::new(None)),
             table_sources: Arc::new(RwLock::new(HashMap::new())),
             params: params.clone(),
             resolved,
@@ -957,6 +964,32 @@ impl GtvContext {
         df.collect().await
     }
 
+    /// Declare the knowledge state this context's results reflect.
+    ///
+    /// Stamped onto every receipt produced by [`Self::sql_with_receipt`] and
+    /// [`Self::sql_with_attached_receipt`], so an empty result can be told
+    /// apart from a not-yet-refreshed one (plan R1 / R3).
+    pub fn set_freshness(&self, freshness: gtv_core::Freshness) {
+        *self.freshness.write().unwrap_or_else(|e| e.into_inner()) = Some(freshness);
+    }
+
+    /// Take the watermark from a storage handle: newest published segment plus
+    /// the delayed-GC retention floor.
+    pub fn set_freshness_from_store(&self, store: &gtv_storage::SegmentStore) {
+        self.set_freshness(store.freshness());
+    }
+
+    /// Stop stamping a watermark. Receipts then report freshness unknown, which
+    /// callers must not read as zero lag.
+    pub fn clear_freshness(&self) {
+        *self.freshness.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Current watermark, if one was set.
+    pub fn freshness(&self) -> Option<gtv_core::Freshness> {
+        *self.freshness.read().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Run a SQL query and return its rows **and** a receipt for them (A1).
     ///
     /// `summaries` lists the graph tables the statement may read, as
@@ -980,7 +1013,7 @@ impl GtvContext {
         // what the parser first produced.
         let rendered = df.logical_plan().display_indent().to_string();
         let batches = df.collect().await?;
-        let receipt = crate::receipt::receipt_for_statement(
+        let mut receipt = crate::receipt::receipt_for_statement(
             query_id,
             &batches,
             as_of,
@@ -988,6 +1021,9 @@ impl GtvContext {
             &rendered,
             summaries,
         );
+        if let Some(freshness) = self.freshness() {
+            receipt = receipt.with_freshness(freshness);
+        }
         receipt
             .validate()
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;

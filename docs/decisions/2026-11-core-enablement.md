@@ -41,6 +41,16 @@
 - **第二层（量子）**：只留适配 SPI，core **不出现** quantum 依赖、QAOA/QuEST 求解或 QPU 加速宣称（`positioning.md` §7 保持有效）。
 - 本轮 core 侧交付的是第二层所需的**结构与协议**（receipt、证据引用、错误码），不是量子能力本身。
 
+## D6｜回执必须带认知水位线，「没有」不自动等于「不存在」
+
+来自银行三场景工作计划的 G8 / G9（`06_銀行三場景定位盤點與分析工作計劃_2026-11-21_v3.md` §5.3、§9.4 R1–R3）。
+
+- **两条时间轴分离**：业务时间仍是 `as_of`；新增 `freshness.as_known_at` 表示「本结果包含到哪个知识时点」。二者可任意组合，不可互相推导。
+- **权威时钟显式**：`KnowledgeClock::{RecordedAt, SegmentSystemTs}` 必填。core **不选边**——`SegmentStore::freshness()` 报 `SegmentSystemTs`，刷新管线带 `recorded_at` 时自行覆盖。这属于工作计划的 Q22，裁决前不写死。
+- **空结果分三态**：`Absence::{Proven, NotYetRefreshed, HistoryCollected, NotApplicable}`。只有 `Proven` 能当结论；未设水位线时返回 `NotApplicable`，**不是** `Proven`。
+- **低于保留下限的 `NoMatch` 不允许出站**：`validate()` 直接报错，宁可让查询失败，也不把已回收的历史报成空集。
+- 契约细节见 [`docs/freshness-contract.md`](../freshness-contract.md)；协议版本不变（v1，新增可选键）。
+
 ## 本轮 core 交付清单
 
 | 项 | 落点 | 验收 |
@@ -50,6 +60,7 @@
 | 语句级回执 + Arrow metadata 搭载（A1） | `gtv-engine/src/receipt.rs`、`context.rs::sql_with_receipt` | 同上 |
 | 协议 v1 + v0 兼容（A1/B5） | `gtv-proto`（proto + lib） | `cargo test -p gtv-proto`（12 项，含 4 项 loopback） |
 | SQL/PGQ L1 改写（C1/C2/C3） | `gtv-pgq` + `context.rs::sql_pgq` | `cargo test -p gtv-pgq`（14 项）+ `--test pgq_l1_end_to_end`（5 项） |
+| 认知水位线 / 缺失三态（G8/G9） | `gtv-core/src/receipt.rs`、`gtv-storage/src/store.rs::freshness`、`context.rs::set_freshness*` | `cargo test -p gtv-core --test receipt_contract`（26 项）、`-p gtv-storage --test p0_freshness`（2 项）、`-p gtv-engine --test p0_freshness`（5 项）、`-p gtv-proto`（13 项） |
 
 ## 仍未裁决（不阻塞本轮代码，阻塞对外承诺）
 

@@ -546,6 +546,207 @@ impl From<TraversalStats> for QueryStats {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Freshness: which knowledge state a result reflects (G8 / G9, plan R1 / R2)
+// ---------------------------------------------------------------------------
+
+/// Which clock a [`Freshness`] watermark was read from.
+///
+/// The two exist because a batch-refreshed graph has two different notions of
+/// "when": the commit time recorded on the ingested row, and the publish time
+/// of the segment that carries it. They coincide on a single flush and diverge
+/// as soon as history is backfilled, so a watermark is meaningless without
+/// saying which one it is.
+///
+/// Core deliberately has **no default preference**: the store reports
+/// [`KnowledgeClock::SegmentSystemTs`] because that is what it physically
+/// knows, and a refresh pipeline that carries `recorded_at` from the ingestion
+/// table stamps [`KnowledgeClock::RecordedAt`] instead. Picking one here would
+/// silently decide an open question (v3 plan Q22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeClock {
+    /// Commit/knowledge time of the ingestion row (`recorded_at`).
+    RecordedAt,
+    /// Publish time of the newest flushed segment (`manifest.system_ts`).
+    SegmentSystemTs,
+}
+
+impl KnowledgeClock {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecordedAt => "recorded_at",
+            Self::SegmentSystemTs => "segment_system_ts",
+        }
+    }
+}
+
+impl fmt::Display for KnowledgeClock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a result can know, and what it cannot (plan R1 / R2).
+///
+/// Two independent limits travel with a result:
+///
+/// * `as_known_at` — the newest knowledge time this result includes. A report
+///   built at 15:00 from a graph refreshed at 14:45 must not present the
+///   14:30–15:00 gap as "no such transaction".
+/// * `history_floor` — the oldest knowledge time still answerable. Below it,
+///   delayed GC has reclaimed the files, and `AS KNOWN AT` becomes a hard error
+///   in the store rather than a smaller answer.
+///
+/// Both are read from store state, never from a wall clock, so a receipt stays
+/// byte-identical across replays of the same snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Freshness {
+    /// Newest knowledge time included in this result.
+    pub as_known_at: i64,
+    /// Clock `as_known_at` was read from.
+    pub clock: KnowledgeClock,
+    /// Oldest knowledge time still answerable; `None` = full history retained.
+    pub history_floor: Option<i64>,
+    /// Newest business time present in the data, when the caller knows it.
+    pub business_max: Option<i64>,
+}
+
+impl Freshness {
+    pub const fn new(as_known_at: i64, clock: KnowledgeClock) -> Self {
+        Self {
+            as_known_at,
+            clock,
+            history_floor: None,
+            business_max: None,
+        }
+    }
+
+    pub const fn with_history_floor(mut self, floor: i64) -> Self {
+        self.history_floor = Some(floor);
+        self
+    }
+
+    pub const fn with_business_max(mut self, business_max: i64) -> Self {
+        self.business_max = Some(business_max);
+        self
+    }
+
+    /// `true` when history at business time `t` is still retained.
+    ///
+    /// A query below the floor is not "empty" — it is unanswerable, and the
+    /// difference matters to anyone reading an absence as evidence.
+    pub fn retains_business_time(&self, t: i64) -> bool {
+        self.history_floor.map_or(true, |floor| t >= floor)
+    }
+
+    /// How far behind `requested` this watermark is, or `None` when current.
+    pub fn lag(&self, requested: i64) -> Option<i64> {
+        (self.as_known_at < requested).then(|| requested - self.as_known_at)
+    }
+
+    /// Compare against the knowledge time the caller believes it is reading.
+    pub fn verdict(&self, requested: i64) -> FreshnessVerdict {
+        match self.lag(requested) {
+            None => FreshnessVerdict::Current,
+            Some(behind_by) => FreshnessVerdict::Stale { behind_by },
+        }
+    }
+
+    /// Reject a watermark that cannot come from a consistent store state.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(floor) = self.history_floor {
+            if floor > self.as_known_at {
+                return Err(GtvError::InvalidArgument(format!(
+                    "freshness is inconsistent: history floor {floor} is later than \
+                     the watermark {}",
+                    self.as_known_at
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Freshness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "as known at {} ({})",
+            self.as_known_at,
+            self.clock.as_str()
+        )
+    }
+}
+
+/// Outcome of comparing a receipt's watermark with a requested knowledge time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "behind_by")]
+pub enum FreshnessVerdict {
+    /// The watermark reaches the requested knowledge time.
+    Current,
+    /// The graph has not been refreshed that far yet.
+    Stale { behind_by: i64 },
+}
+
+impl FreshnessVerdict {
+    pub const fn is_current(self) -> bool {
+        matches!(self, Self::Current)
+    }
+}
+
+impl fmt::Display for FreshnessVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Current => f.write_str("current"),
+            Self::Stale { behind_by } => write!(f, "stale by {behind_by}"),
+        }
+    }
+}
+
+/// Why a `NoMatch` is, or is not, a proof of absence (plan R1 / R3).
+///
+/// The engine's R2 rule says an empty result never proves absence on its own.
+/// This enum names the three ways that happens, because they need different
+/// answers: refresh the graph, widen the retention window, or accept the
+/// answer. Collapsing them into a bare `false` reproduces exactly the failure
+/// a regulator asks about ("why is the 14:30 transaction missing from the 15:00
+/// report?").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum Absence {
+    /// No rows, complete search, watermark covers the requested time.
+    Proven,
+    /// No rows, but the graph was refreshed before the requested knowledge
+    /// time: the row may not have arrived yet.
+    NotYetRefreshed { behind_by: i64 },
+    /// No rows, but history at the queried business time was reclaimed.
+    HistoryCollected { floor: i64 },
+    /// The question does not apply: rows came back, or the search was capped.
+    NotApplicable,
+}
+
+impl Absence {
+    pub const fn proves_absence(self) -> bool {
+        matches!(self, Self::Proven)
+    }
+}
+
+impl fmt::Display for Absence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Proven => f.write_str("absence proven"),
+            Self::NotYetRefreshed { behind_by } => {
+                write!(f, "not yet refreshed (behind by {behind_by})")
+            }
+            Self::HistoryCollected { floor } => {
+                write!(f, "history collected below {floor}")
+            }
+            Self::NotApplicable => f.write_str("absence not the question"),
+        }
+    }
+}
+
 /// What a query did, in a form that can be re-checked later.
 ///
 /// Build with [`QueryReceipt::new`] then chain the `with_*` setters; call
@@ -565,6 +766,10 @@ pub struct QueryReceipt {
     /// Version of the caller's context that shaped this result (e.g. rule set).
     /// Opaque to core: core only guarantees it is carried and compared.
     pub context_version: Option<String>,
+    /// Knowledge watermark this result was computed from, when the caller could
+    /// supply one. Absent means "unknown", which callers must not read as
+    /// "fresh": an unproven watermark is not a zero lag.
+    pub freshness: Option<Freshness>,
 }
 
 impl QueryReceipt {
@@ -580,6 +785,7 @@ impl QueryReceipt {
             incomplete: None,
             stats: QueryStats::default(),
             context_version: None,
+            freshness: None,
         }
     }
 
@@ -626,6 +832,56 @@ impl QueryReceipt {
         self
     }
 
+    /// Stamp the knowledge watermark the result was computed from.
+    ///
+    /// Callers pass what the store reported (`SegmentStore::freshness()`), or a
+    /// `recorded_at` high-water mark when the refresh pipeline carries one.
+    pub fn with_freshness(mut self, freshness: Freshness) -> Self {
+        self.freshness = Some(freshness);
+        self
+    }
+
+    /// Compare this result's watermark with the knowledge time the caller
+    /// believes it is reading. `None` when the receipt carries no watermark.
+    pub fn freshness_verdict(&self, requested: i64) -> Option<FreshnessVerdict> {
+        self.freshness.map(|f| f.verdict(requested))
+    }
+
+    /// Classify a `NoMatch`: proven, merely not refreshed yet, or unanswerable
+    /// because the history was reclaimed.
+    ///
+    /// `requested_k` is the knowledge time the caller is asking from (its own
+    /// "now", or the `AS KNOWN AT` it requested); `business_t` is the business
+    /// time the query was framed at, when it has one — it decides whether the
+    /// retention floor already invalidates the answer.
+    ///
+    /// Answers [`Absence::NotApplicable`] when there are rows or the search was
+    /// capped, so callers can use this unconditionally instead of guarding it.
+    pub fn absence_at(&self, requested_k: i64, business_t: Option<i64>) -> Absence {
+        if self.tri_state != TriState::NoMatch || !self.is_complete() {
+            return Absence::NotApplicable;
+        }
+        let Some(freshness) = self.freshness else {
+            // No watermark: an empty result is not evidence of anything.
+            return Absence::NotApplicable;
+        };
+        if let (Some(t), Some(floor)) = (business_t, freshness.history_floor) {
+            if t < floor {
+                return Absence::HistoryCollected { floor };
+            }
+        }
+        match freshness.verdict(requested_k) {
+            FreshnessVerdict::Current => Absence::Proven,
+            FreshnessVerdict::Stale { behind_by } => Absence::NotYetRefreshed { behind_by },
+        }
+    }
+
+    /// [`Self::absence_at`] folded to a boolean: safe only when absence is
+    /// positively proven.
+    pub fn proves_absence_at(&self, requested_k: i64, business_t: Option<i64>) -> bool {
+        self.absence_at(requested_k, business_t).proves_absence()
+    }
+
     /// Attach truncation from an operator result, switching the tri-state to
     /// `Incomplete` when a cap tripped.
     pub fn with_truncation(mut self, truncation: Option<&Truncation>) -> Self {
@@ -666,14 +922,35 @@ impl QueryReceipt {
             ));
         }
         match (self.tri_state, &self.incomplete) {
-            (TriState::Incomplete, None) => Err(GtvError::InvalidArgument(
-                "Incomplete result must carry a reason".into(),
-            )),
-            (TriState::Found | TriState::NoMatch, Some(_)) => Err(GtvError::InvalidArgument(
-                "conclusive result must not carry an incomplete reason".into(),
-            )),
-            _ => Ok(()),
+            (TriState::Incomplete, None) => {
+                return Err(GtvError::InvalidArgument(
+                    "Incomplete result must carry a reason".into(),
+                ))
+            }
+            (TriState::Found | TriState::NoMatch, Some(_)) => {
+                return Err(GtvError::InvalidArgument(
+                    "conclusive result must not carry an incomplete reason".into(),
+                ))
+            }
+            _ => {}
         }
+        if let Some(freshness) = &self.freshness {
+            freshness.validate()?;
+            // A `NoMatch` below the retention floor is not an answer: the files
+            // that would have contained the rows were reclaimed, so reporting
+            // it as a conclusive empty result is the misleading case R3 exists
+            // to prevent.
+            if self.tri_state == TriState::NoMatch {
+                if let (Some(as_of), Some(floor)) = (self.as_of, freshness.history_floor) {
+                    if as_of < floor {
+                        return Err(GtvError::InvalidArgument(format!(
+                            "NoMatch at as_of {as_of} is below the GC floor {floor};                              absence there is unanswerable, not proven"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn to_json(&self) -> String {
@@ -720,6 +997,19 @@ impl QueryReceipt {
                 format!("{RECEIPT_METADATA_PREFIX}incomplete_reason"),
                 reason.reason.as_str().to_string(),
             );
+        }
+        if let Some(freshness) = &self.freshness {
+            meta.insert(
+                format!("{RECEIPT_METADATA_PREFIX}as_known_at"),
+                freshness.as_known_at.to_string(),
+            );
+            meta.insert(
+                format!("{RECEIPT_METADATA_PREFIX}knowledge_clock"),
+                freshness.clock.as_str().to_string(),
+            );
+            if let Some(floor) = freshness.history_floor {
+                meta.insert(format!("{RECEIPT_METADATA_PREFIX}history_floor"), floor.to_string());
+            }
         }
         meta
     }

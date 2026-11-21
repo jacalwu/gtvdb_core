@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use gtv_core::{Incomplete, IncompleteReason, QueryReceipt, QueryStats, TriState};
+use gtv_core::{
+    Freshness, Incomplete, IncompleteReason, KnowledgeClock, QueryReceipt, QueryStats, TriState,
+};
 use gtv_proto::{
     accept_version, bind, decode_response, encode_response, error_code_from_i32, query_remote_full,
     query_remote_with, receipt_from_ipc, tri_state_from_wire, ErrorCode, QueryRequest,
@@ -236,4 +238,28 @@ async fn empty_result_is_no_match_not_found() {
     assert!(outcome.is_conclusive());
     assert_eq!(outcome.receipt.unwrap().tri_state, TriState::NoMatch);
     handle.abort();
+}
+
+#[test]
+fn freshness_survives_the_wire_and_the_arrow_payload() {
+    // The watermark must reach a client that only reads Arrow, and a client
+    // that reads `receipt_json`. Both paths are asserted here because the plan
+    // (R1) requires either one to answer "as of when".
+    let receipt = QueryReceipt::no_match("req-fresh")
+        .with_as_of(95)
+        .with_freshness(
+            Freshness::new(90, KnowledgeClock::RecordedAt).with_history_floor(10),
+        );
+    let wire = encode_response(Ok((vec![batch(&[1, 2])], receipt.clone())));
+
+    let outcome = decode_response(wire).unwrap();
+    assert_eq!(outcome.rows(), 2);
+    let back = outcome.receipt.expect("receipt travels");
+    assert_eq!(back, receipt);
+    assert_eq!(back.freshness.expect("watermark").as_known_at, 90);
+
+    // Arrow-only reader: the envelope fields plus schema metadata.
+    let ipc = gtv_proto::encode_response(Ok((vec![batch(&[1, 2])], receipt.clone()))).arrow_ipc;
+    let from_arrow = receipt_from_ipc(&ipc).expect("readable").expect("present");
+    assert_eq!(from_arrow, receipt);
 }

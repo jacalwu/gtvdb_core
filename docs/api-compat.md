@@ -37,6 +37,8 @@
 - 性能优化、内部重构、日志与错误文案调整；
 - 新增 `gtv-pgq` 支持的 SQL/PGQ 特性（conformance 表增行，属能力扩展）。
 
+一处需要说清的边界：`QueryReceipt` 的字段是 `pub` 的，给带 `Option` 的新字段加默认值，对**序列化**是兼容的（旧 JSON 缺该键即 `None`），但对**结构体字面量**构造是编译错误。因此 `QueryReceipt` 只保证「经由 `new()` + `with_*` 构造」这一条路径的兼容性；外部直接写字面量不在承诺内（等价于 `#[non_exhaustive]` 的效果，但不必真的加该属性）。`QueryReceipt` 的构造路径本身就是「先 new 再链式设置」，这也是本文档推荐写法。
+
 ## 4. 版本与废弃
 
 - 采用语义化版本；`0.x` 期间次版本号提升可含破坏性改动，但必须在本文件「变更日志」留一行。
@@ -58,7 +60,8 @@
 
 | gtvdb_core | 协议 | Arrow | DataFusion | Rust MSRV | 备注 |
 |:--|:--|:--|:--|:--|:--|
-| 0.1.x | v1 | 59 | 55 | 1.82 | 当前 |
+| 0.1.x | v1 | 59 | 55 | 1.82 | 当前（回执无 `freshness`） |
+| 下一版（未发布） | v1 | 59 | 55 | 1.82 | 回执含 `freshness`；协议仍 v1，0.1 对端忽略新键即可 |
 | 0.0.x | v0 | 59 | 55 | 1.82 | `Execute` only |
 
 扩展仓升级路径：改 `Cargo.toml` 里的 git rev → `cargo test` → 若编译失败，先看本文件 §3 是否命中破坏性改动，再决定是否同步改扩展代码。CI 的 `core-boundary` 继续阻止 core 依赖领域 crate。
@@ -79,3 +82,4 @@
 | 版本 | 日期 | 变更 |
 |:--|:--|:--|
 | 0.1.0 | 2026-11-20 | 首次定义：回执/证据契约、协议 v1、SQL/PGQ L1；M8/M9 反转为在范围 |
+| 未发布 | 2026-11-21 | 回执新增 `freshness`（业务时间/认知时间分离，见 `docs/freshness-contract.md`）；新增 `Freshness` / `KnowledgeClock` / `FreshnessVerdict` / `Absence`；`SegmentStore::freshness()`；`GtvContext::{set_freshness,set_freshness_from_store,clear_freshness,freshness}`。JSON 与 Arrow metadata 各新增可选键（`as_known_at` / `knowledge_clock` / `history_floor`），**协议版本仍为 v1** |

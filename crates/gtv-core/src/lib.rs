@@ -47,9 +47,10 @@ pub use quantum_state::{
 };
 pub use receipt::{
     allows_partial_rows, is_supported_version, negotiate_version, plan_hash, topk_dedup,
-    topk_dedup_by_score, tri_state_str, DedupKey, EdgeRef, Incomplete, IncompleteReason,
-    PathEvidence, QueryReceipt, QueryStats, ENGINE_VERSION, MIN_SUPPORTED_PROTOCOL,
-    PROTOCOL_VERSION, RECEIPT_METADATA_JSON, RECEIPT_METADATA_PREFIX,
+    topk_dedup_by_score, tri_state_str, Absence, DedupKey, EdgeRef, Freshness, FreshnessVerdict,
+    Incomplete, IncompleteReason, KnowledgeClock, PathEvidence, QueryReceipt, QueryStats,
+    ENGINE_VERSION, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION, RECEIPT_METADATA_JSON,
+    RECEIPT_METADATA_PREFIX,
 };
 pub use selection::{Sel, SelIter, SelRepr, UNBOUND_SNAPSHOT};
 pub use table::{EdgeTable, NodeTable};
