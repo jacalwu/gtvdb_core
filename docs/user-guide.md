@@ -731,7 +731,7 @@ cargo run -p gtv-engine --example serve_demo          # 监听 127.0.0.1:50051
 GTV_ADDR=0.0.0.0:50051 cargo run -p gtv-engine --example serve_demo
 ```
 
-生产部署用 `gtvdb_ext` 的 `gtv-server`（带鉴权、TLS、真实表），但它现在钉在旧的 core rev 上，只实现 `Execute`：**有 as_of 就发不出去、也没有 `receipt_json`**。要拿到 tri-state 与 freshness，得先把那个 pin 升到含协议 v1 的 core 提交（驱动会自动降级到 v0，不会报错）。
+生产部署用 `gtvdb_ext` 的 `gtv-server`（带鉴权、TLS、真实表）：它的 core pin 已升到协议 v1，`ExecuteQuery` / `Negotiate` / `Execute`（v0 兼容）三个 RPC 都在，`as_of` 会一路传到引擎，回执同时出现在 `receipt_json` 与 Arrow schema metadata 里。超时字段也被真正实现——`timeout_ms` 到点返回 `DEADLINE_EXCEEDED`，而不是悄悄截断。
 
 **② 连上去查**——和 PostgreSQL 一样的三行：
 

@@ -69,14 +69,13 @@ minutes, and none of them are fixed by a metadata field:
    serve_demo`, which requires a Rust toolchain and a git clone. A "Getting
    started" that ends in `cargo build` is a real drop-off; shipping a container
    image (or publishing the engine binary) is the missing half of the story.
-2. **`gtvdb_ext`'s `gtv-server` still answers protocol v0 only.** It is pinned
-   to a core revision from before v1, so against the server most users would
-   deploy, `as_of` is never sent and `receipt_json` never returns. The driver
-   falls back gracefully (it ignores the fake tri-state and reports
-   `is_conclusive == False`), but publishing a driver whose headline feature
-   needs a server nobody has is a mismatch. Bump the pin before announcing.
-3. **`gtvdb` is still an unclaimed name.** It was free at the time of writing,
+2. **`gtvdb` is still an unclaimed name.** It was free at the time of writing,
    but names are first-come. `check_release.py` re-checks it on every run.
+
+(`gtvdb_ext`'s `gtv-server` used to answer protocol v0 only, which made a v1
+driver pointless against the production server. Its core pin now carries v1 —
+`ExecuteQuery`, `Negotiate`, and `Execute` for compatibility — so that gap is
+closed; what remains is the engine not being distributable, above.)
 
 ## Every release
 
