@@ -74,6 +74,7 @@
 - [ ] `cargo test -p gtv-engine --test p0_motif_bounded --test pgq_l1_end_to_end` 全绿；
 - [ ] `docs/sql-pgq-conformance.md` 与 `gtv-pgq` 测试一致（新增特性先加表行）；
 - [ ] 本文件 §5 的协议版本与 `gtv-proto` 常量一致；
+- [ ] 改了 `gtvquery.proto` 就跑 `python examples/python/gen_stubs.py`（CI 用 `--check` 比对，防止 Python stub 与线协议漂移）；
 - [ ] 变更日志已写；破坏性改动已按 §4 走废弃；
 - [ ] 未在 core 引入领域名词或 quantum 依赖（`core-boundary` 与文档扫描）。
 
@@ -83,3 +84,4 @@
 |:--|:--|:--|
 | 0.1.0 | 2026-11-20 | 首次定义：回执/证据契约、协议 v1、SQL/PGQ L1；M8/M9 反转为在范围 |
 | 未发布 | 2026-11-21 | 回执新增 `freshness`（业务时间/认知时间分离，见 `docs/freshness-contract.md`）；新增 `Freshness` / `KnowledgeClock` / `FreshnessVerdict` / `Absence`；`SegmentStore::freshness()`；`GtvContext::{set_freshness,set_freshness_from_store,clear_freshness,freshness}`。JSON 与 Arrow metadata 各新增可选键（`as_known_at` / `knowledge_clock` / `history_floor`），**协议版本仍为 v1** |
+| 未发布 | 2026-11-21 | 新增 Python 客户端 `examples/python/gtv_client.py`（协议 v1 + v0 回退）与 CI 可用的 stub 一致性检查；`gtv-engine` 仅新增 dev-dependency `gtv-proto`（供 `examples/serve_demo.rs`） |

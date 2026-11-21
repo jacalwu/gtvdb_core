@@ -28,6 +28,10 @@ tokio.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# Only for `examples/serve_demo.rs`: the wire server for client development.
+# The library itself stays free of the protocol crate (no cycle: gtv-proto
+# depends on gtv-core, never on gtv-engine).
+gtv-proto = { path = "../gtv-proto" }
 
 [features]
 default = []

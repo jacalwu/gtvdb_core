@@ -1,11 +1,16 @@
 """Drive the gtv REPL from Python — a thin client, not a binding.
 
-gtvdb_core ships no PyO3 module (see ROADMAP: M8/M9 are shelved), so Python
-talks to it the only way that works today: as a subprocess speaking the REPL
-protocol on stdin/stdout. That is enough to run every SQL statement and dot
-command the REPL itself can run, and nothing more — graph traversal
-(`neighbors` / `khop` / `motif`) needs a `TemporalCSR` registered from Rust, so
-it is out of reach here exactly as it is out of reach in the REPL.
+gtvdb_core ships no PyO3 module (see ROADMAP: M8/M9 are shelved), so there are
+two supported ways to reach the engine from Python: this file, which drives a
+local `gtv` subprocess over the REPL's stdin/stdout, and `gtv_client.py`, which
+speaks protocol v1 over gRPC to a running server (as-of pinning, receipts,
+remote host). Use this one for local files and REPL dot-commands; use
+`gtv_client.py` when the engine is already running somewhere else.
+
+The subprocess route runs every SQL statement and dot command the REPL itself
+can run, and nothing more — graph traversal (`neighbors` / `khop` / `motif`)
+needs a `TemporalCSR` registered from Rust, so it is out of reach here exactly
+as it is out of reach in the REPL.
 
 How a reply is delimited: the REPL has no prompt when stdin is a pipe, and no
 end-of-result marker, so after each statement we append

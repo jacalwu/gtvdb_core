@@ -608,12 +608,13 @@ gtv> SELECT step, gate, prefix_probability
 
 ## 12. 用 Python 跑同一套查询
 
-**能，但不是 `pip install gtvdb`。** 本仓没有任何 PyO3 / maturin 代码（`grep -rn pyo3 --include=Cargo.toml .` 为空），ROADMAP §4 把 M9（pyo3）判为 🗑 下架。所以今天只有一条可用的路：**Python 当客户端，驱动 `gtv` 子进程**。
+**能，但不是 `pip install gtvdb`。** 本仓没有任何 PyO3 / maturin 代码（`grep -rn pyo3 --include=Cargo.toml .` 为空），ROADMAP §4 把 M9（pyo3）判为 🗑 下架。今天有两条可用的路：**Python 当客户端驱动 `gtv` 子进程**（本地、零依赖），或**走 gRPC 协议 v1 连一个跑着的服务**（跨机器、带回执）。两条路都不需要编译 Python 扩展。
 
 | 方式 | 今天能用 | 能力 | 代价 |
 |:--|:--|:--|:--|
-| **A. 客户端驱动 REPL**（本节） | ✅ | REPL 的全部能力（SQL + 12 条 `.` 指令） | 继承 REPL 的边界（§12.5）；每进程 335 ms 启动 |
-| B. 原生绑定（pyo3 / cdylib） | ❌ 需立项 | 可绕开 REPL 边界（图遍历、建索引） | 新 crate + 跨平台 wheel + 错误模型映射；M9 已下架 |
+| **A. 客户端驱动 REPL**（§12.1–12.5） | ✅ | REPL 的全部能力（SQL + 12 条 `.` 指令） | 继承 REPL 的边界（§12.5）；每进程 335 ms 启动 |
+| **B. gRPC 协议 v1**（§12.6） | ✅ | 远程 SQL、`as_of` / `snapshot_id` 固定、`QueryReceipt`（含 tri-state 与 freshness） | 需先起服务；服务端目前只注册演示表；无流式、无会话级事务 |
+| C. 原生绑定（pyo3 / cdylib） | ❌ 需立项 | 可绕开 REPL 边界（图遍历、建索引） | 新 crate + 跨平台 wheel + 错误模型映射；M9 已下架 |
 
 ### 12.1 三十秒上手
 
@@ -704,6 +705,70 @@ Python 走 REPL，就等于站在手册 §1 的轨道 A 上，**不能**做的�
 
 一句话：**Python 是"操作已配置好的引擎"，不是"配置引擎"。**
 
+### 12.6 远程会话：gRPC 协议 v1
+
+跨机器、或想让答案带"证据"时，走 gRPC，不走子进程。协议定义在 `crates/gtv-proto/proto/gtvquery.proto`，Python 侧的客户端是 `examples/python/gtv_client.py`（约 400 行，含 v0 回退）。
+
+**① 起一个服务**。开发/联调用内核自带的示例服务（协议 v1 全套，只有两张演示表）：
+
+```bash
+cargo run -p gtv-engine --example serve_demo          # 监听 127.0.0.1:50051
+GTV_ADDR=0.0.0.0:50051 cargo run -p gtv-engine --example serve_demo
+```
+
+生产部署用 `gtvdb_ext` 的 `gtv-server`（带鉴权、TLS、真实表），但它现在钉在旧的 core rev 上，只实现 `Execute`：**有 as_of 就发不出去、也没有 `receipt_json`**。要拿到 tri-state 与 freshness，得先把那个 pin 升到含协议 v1 的 core 提交。
+
+**② 装依赖、连上去**：
+
+```bash
+pip install grpcio pyarrow
+python examples/python/hello_grpc.py        # 端到端示例
+```
+
+```python
+import sys; sys.path.insert(0, "examples/python")
+from gtv_client import connect
+
+with connect("127.0.0.1:50051") as session:      # 建 channel + 版本握手
+    result = session.query("SELECT * FROM numbers WHERE n <= 3")
+    print(result.table.to_pydict())              # {'n': [1, 2, 3], 'square': [1.0, 4.0, 9.0]}
+    print(result.tri_state)                      # 'found'
+    print(result.freshness)                      # {'as_known_at': 1700000000000000000, ...}
+```
+
+**③ "开一个会话"在这里是什么意思**。服务端是无状态的：没有 `CREATE SESSION`、没有事务句柄、也没有需要 `close` 的游标。会话 = 客户端把**必须固定下来的东西**打成一个包：
+
+| 固定什么 | 为什么 |
+|:--|:--|
+| channel（一条 TCP 连接） | 每条查询复用，别一次一连接 |
+| 协商出的协议版本 | v1 有 as_of 与回执；v0 只有 SQL 进出 |
+| bearer token | 每次调用带 `authorization: Bearer <token>` |
+| `as_of`（业务时间） | 不固定的话，连着的两条查询可能看到两个快照 |
+| `snapshot_id` | 客户端认为自己在读的快照；不一致时服务端**报错**而不是换个快照糊过去 |
+
+```python
+pinned = session.at(as_of=1_700_000_000_000_000_000)   # 子会话，共享 channel
+a = pinned.query("SELECT count(*) FROM prices")        # 两条查询同业务时间
+b = pinned.query("SELECT * FROM numbers")
+```
+
+**④ 结果里比行更重要的是回执**。`Result.receipt` 就是 `QueryReceipt` 的 dict：
+
+```text
+空结果 + tri_state="no_match"     → 证否：确实没有
+空结果 + tri_state="incomplete"   → 什么也没证明（预算/超时打断了）
+```
+
+`Result.is_conclusive` 只在前者（或 `found`）为 `True`。`result.receipt["snapshot_id"]`、`["as_of"]`、`["freshness"]["as_known_at"]` 让"这批数据有多新"变成可传递的事实，而不是一句口头承诺。
+
+**⑤ 三个自己写客户端会踩的点**：
+
+1. **v0 的 `tri_state` 是假的**。旧服务端不算 tri-state，字段到线上一律是 proto3 默认值 `FOUND`；照读就会把"不知道"读成"有结果"。客户端对 v0 一律忽略该字段，只信回执。
+2. **回执在 Arrow 里也有一份**（`gtv.receipt.json` 这个 schema metadata）。所以 v1 服务端写给 v0 客户端的数据仍然带着出处，落盘成 `.arrow` 文件后回执也还在。
+3. **stub 不要手改**。`examples/python/gtvproto/` 是 `gen_stubs.py` 的产物；改完 `.proto` 跑 `python examples/python/gen_stubs.py`，CI 用 `--check` 保证不漂移。
+
+`examples/python/test_gtv_client.py` 用纯 Python 假服务端测了 v0 回退（4 个用例，`python examples/python/test_gtv_client.py`），不需要起 Rust 进程。
+
 ---
 
 ## 13. 下一步
@@ -715,4 +780,4 @@ Python 走 REPL，就等于站在手册 §1 的轨道 A 上，**不能**做的�
 | 看段格式 | [`storage-mmap-design.md`](storage-mmap-design.md) |
 | 看 GPU 边界 | [`acceleration.md`](acceleration.md) |
 | 看性能基线怎么量 | `crates/gtv-engine/examples/bench_m6_gate.rs` 等基准（`--release`） |
-| 用 Python 调 | 本节 §12 与 `examples/python/gtv_repl.py` |
+| 用 Python 调 | 本节 §12：本地 `examples/python/gtv_repl.py`，远程 `examples/python/gtv_client.py`（§12.6） |
