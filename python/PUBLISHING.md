@@ -3,33 +3,101 @@
 The driver is pure Python, so a release is: bump one string, run one gate, upload
 two files. There is no wheel matrix and no platform build.
 
-## One-time setup
+## First release, in order
 
-1. **Claim the name.** Register on <https://pypi.org> and add a verified email.
-   `gtvdb` was unclaimed when this document was written; `check_release.py`
-   re-checks it on every run.
-2. **Pick an auth method.**
-   - *Trusted publishing (preferred, no secret in the repo or on disk).* On PyPI →
-     *Your projects* → *Publishing* → add a pending publisher with:
-     workflow `publish-python.yml`, environment `pypi`. Then do the same for
-     TestPyPI with environment `testpypi`. Only works once the project exists, so
-     the very first release has to be uploaded with a token — or create a
-     *pending* publisher before the first upload, which is the cleaner path.
-   - *API token.* PyPI → *Account settings* → *API tokens* → scope it to the
-     `gtvdb` project once it exists. Keep it in `~/.pypirc` or an environment
-     variable; never in this repository.
+Nothing here is code, and none of it can be done by a script — it is account
+setup on two websites plus one tag push. Do it once; afterwards a release is
+the three-step loop below.
+
+### 1. Accounts (once)
+
+- [ ] Register at <https://pypi.org> **and** <https://test.pypi.org>. They are
+      separate account databases; a token from one does not work on the other.
+- [ ] Enable two-factor auth on PyPI. Uploading without 2FA is refused, and the
+      error message ("invalid or non-existent authentication information") does
+      not say so.
+- [ ] Verify the email address. An unverified account cannot upload.
+
+### 2. Trusted publishing (once, recommended)
+
+No token is stored anywhere; GitHub mints a short-lived credential per run.
+
+- [ ] PyPI → *Your account* → *Publishing* → *Add a pending publisher*:
+      | field | value |
+      |:--|:--|
+      | PyPI project name | `gtvdb` |
+      | Owner | `jacalwu` |
+      | Repository | `gtvdb_core` |
+      | Workflow name | `publish-python.yml` |
+      | Environment | `pypi` |
+- [ ] Repeat on TestPyPI with environment `testpypi`.
+- [ ] GitHub → *Settings* → *Environments* → create `pypi` (and `testpypi`).
+      Add yourself as a required reviewer on `pypi`: a mis-tagged commit then
+      needs a human click before it can burn a version number.
+
+A *pending* publisher works for the very first upload — the project does not
+have to exist yet. That is why no API token is needed even for `0.1.0`. Use a
+token only if you would rather not put OIDC in the path:
+
+- [ ] PyPI → *Account settings* → *API tokens* → *Add token*. The first release
+      needs an account-scoped token; afterwards re-scope it to the `gtvdb`
+      project.
+
+### 3. Rehearse on TestPyPI (once per new packaging change)
+
+- [ ] GitHub → *Actions* → *Publish Python driver* → *Run workflow*,
+      `target: testpypi`.
+- [ ] `pip install --index-url https://test.pypi.org/simple/
+      --extra-index-url https://pypi.org/simple gtvdb` — the extra index is
+      required because `grpcio` / `pyarrow` are not on TestPyPI.
+- [ ] `python -c "import gtvdb; print(gtvdb.__version__, gtvdb.paramstyle)"`.
+
+### 4. Ship
+
+- [ ] `git tag py-v0.1.0 && git push origin py-v0.1.0` — the tag must equal
+      `gtvdb/_version.py` or the workflow stops at the version check.
+- [ ] Confirm <https://pypi.org/project/gtvdb/> renders the README, the licence,
+      and the Python 3.9–3.13 classifiers.
+
+## What the repository still has to change before `0.1.0` means something
+
+The packaging is done; these are the gaps a first user will hit within ten
+minutes, and none of them are fixed by a metadata field:
+
+1. **There is no engine on PyPI.** `pip install gtvdb` installs a client. Its
+   README says to start `gtv-server` or `cargo run -p gtv-engine --example
+   serve_demo`, which requires a Rust toolchain and a git clone. A "Getting
+   started" that ends in `cargo build` is a real drop-off; shipping a container
+   image (or publishing the engine binary) is the missing half of the story.
+2. **`gtvdb_ext`'s `gtv-server` still answers protocol v0 only.** It is pinned
+   to a core revision from before v1, so against the server most users would
+   deploy, `as_of` is never sent and `receipt_json` never returns. The driver
+   falls back gracefully (it ignores the fake tri-state and reports
+   `is_conclusive == False`), but publishing a driver whose headline feature
+   needs a server nobody has is a mismatch. Bump the pin before announcing.
+3. **`gtvdb` is still an unclaimed name.** It was free at the time of writing,
+   but names are first-come. `check_release.py` re-checks it on every run.
 
 ## Every release
 
+Two equivalent routes. The tag route is the one that ends with a CI-built
+artefact and a GitHub release; the local route is what you use when the
+upload itself is the thing being debugged.
+
 ```bash
 # 1. Bump the version — the only place it is written.
-$EDITOR python/gtvdb/_version.py          # __version__ = "0.1.0"
+$EDITOR python/gtvdb/_version.py          # __version__ = "0.2.0"
 
 # 2. Run the gate. Builds in a temp dir, runs the suite, checks metadata,
 #    and refuses if PyPI already has this version.
 python python/check_release.py
 
-# 3. Dry run on TestPyPI, install from it, and only then go to PyPI.
+# 3a. Tag route: CI builds, verifies the tag against _version.py, publishes
+#     via OIDC, and attaches the artefacts to a GitHub release.
+git commit -am "release python driver 0.2.0"
+git tag py-v0.2.0 && git push origin py-v0.2.0
+
+# 3b. Local route: build, rehearse on TestPyPI, then upload.
 python python/check_release.py --keep-dist
 TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-<testpypi-token> \
   python -m twine upload --repository testpypi python/dist/*
@@ -38,22 +106,11 @@ python -m pip install --index-url https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple gtvdb
 python -c "import gtvdb; print(gtvdb.__version__)"
 
-# 4. The real thing.
-python -m twine upload python/dist/*
+python -m twine upload python/dist/*     # the real thing
 ```
 
 `check_release.py` deliberately cannot upload: a check that runs on a laptop
 should not be able to push a release. Uploading stays an explicit command.
-
-### Or: tag-driven, with no token anywhere
-
-```bash
-git tag py-v0.1.0 && git push origin py-v0.1.0
-```
-
-`.github/workflows/publish-python.yml` then builds, verifies the tag matches
-`gtvdb/_version.py`, publishes to PyPI via OIDC, and attaches the artefacts to a
-GitHub release. Use *Run workflow* with `target: testpypi` to rehearse.
 
 ## Rules PyPI will not let you break
 
