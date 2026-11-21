@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gtvdb"
+version = "0.1.0"
+description = "DB-API 2.0 driver for the gtv temporal-graph engine"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "gtvdb" }]
+keywords = ["database", "temporal", "graph", "arrow", "dbapi", "gtv"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+]
+# Pure Python over gRPC: no build step, no platform wheels, no compiler.
+dependencies = [
+    "grpcio>=1.60",
+    "pyarrow>=14",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0"]
+polars = ["polars>=0.20"]
+
+[project.urls]
+Documentation = "https://github.com/jacalwu/gtvdb_core/blob/main/docs/user-guide.md"
+
+[tool.setuptools]
+# `gtvdb._stubs` is generated from crates/gtv-proto/proto/gtvquery.proto by
+# `python/gen_stubs.py`; it ships with the package so users need no protoc.
+packages = ["gtvdb", "gtvdb._stubs"]
+
+[tool.setuptools.package-data]
+"gtvdb._stubs" = ["*.pyi"]

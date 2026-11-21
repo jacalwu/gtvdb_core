@@ -613,7 +613,7 @@ gtv> SELECT step, gate, prefix_probability
 | 方式 | 今天能用 | 能力 | 代价 |
 |:--|:--|:--|:--|
 | **A. 客户端驱动 REPL**（§12.1–12.5） | ✅ | REPL 的全部能力（SQL + 12 条 `.` 指令） | 继承 REPL 的边界（§12.5）；每进程 335 ms 启动 |
-| **B. gRPC 协议 v1**（§12.6） | ✅ | 远程 SQL、`as_of` / `snapshot_id` 固定、`QueryReceipt`（含 tri-state 与 freshness） | 需先起服务；服务端目前只注册演示表；无流式、无会话级事务 |
+| **B. gRPC 协议 v1**（§12.6） | ✅ | DB-API 2.0（`pip install ./python`），远程 SQL、`as_of` / `snapshot_id` 固定、`QueryReceipt`（含 tri-state 与 freshness） | 需先起服务；服务端目前只注册演示表；只读、无流式、无服务端分页 |
 | C. 原生绑定（pyo3 / cdylib） | ❌ 需立项 | 可绕开 REPL 边界（图遍历、建索引） | 新 crate + 跨平台 wheel + 错误模型映射；M9 已下架 |
 
 ### 12.1 三十秒上手
@@ -707,7 +707,20 @@ Python 走 REPL，就等于站在手册 §1 的轨道 A 上，**不能**做的�
 
 ### 12.6 远程会话：gRPC 协议 v1
 
-跨机器、或想让答案带"证据"时，走 gRPC，不走子进程。协议定义在 `crates/gtv-proto/proto/gtvquery.proto`，Python 侧的客户端是 `examples/python/gtv_client.py`（约 400 行，含 v0 回退）。
+跨机器、或想让答案带"证据"时，走 gRPC，不走子进程。协议定义在 `crates/gtv-proto/proto/gtvquery.proto`；Python 侧是一个**可安装的驱动** `python/`（PyPI 包名 `gtvdb`），对外是 DB-API 2.0，和 `psycopg2` / `pymysql` 一个用法。
+
+```bash
+pip install ./python          # 本地安装；发布后即 pip install gtvdb
+python -c "import gtvdb; print(gtvdb.apilevel, gtvdb.paramstyle)"
+```
+
+纯 Python 实现（只有 `grpcio` + `pyarrow` 两个依赖），没有编译产物、没有平台 wheel、用户机器上不需要 `protoc`。三层结构，按需要往下取：
+
+| 层 | 对象 | 多了什么 |
+|:--|:--|:--|
+| DB-API 2.0 | `Connection` / `Cursor` | `execute` / `fetchall` / `description`，`pandas.read_sql` |
+| 会话 | `Session` / `Result` | `as_of` 固定、`QueryReceipt`、`tri_state` |
+| 线协议 | `gtvdb._stubs` | `gtvquery.QueryService` v1 |
 
 **① 起一个服务**。开发/联调用内核自带的示例服务（协议 v1 全套，只有两张演示表）：
 
@@ -716,27 +729,36 @@ cargo run -p gtv-engine --example serve_demo          # 监听 127.0.0.1:50051
 GTV_ADDR=0.0.0.0:50051 cargo run -p gtv-engine --example serve_demo
 ```
 
-生产部署用 `gtvdb_ext` 的 `gtv-server`（带鉴权、TLS、真实表），但它现在钉在旧的 core rev 上，只实现 `Execute`：**有 as_of 就发不出去、也没有 `receipt_json`**。要拿到 tri-state 与 freshness，得先把那个 pin 升到含协议 v1 的 core 提交。
+生产部署用 `gtvdb_ext` 的 `gtv-server`（带鉴权、TLS、真实表），但它现在钉在旧的 core rev 上，只实现 `Execute`：**有 as_of 就发不出去、也没有 `receipt_json`**。要拿到 tri-state 与 freshness，得先把那个 pin 升到含协议 v1 的 core 提交（驱动会自动降级到 v0，不会报错）。
 
-**② 装依赖、连上去**：
-
-```bash
-pip install grpcio pyarrow
-python examples/python/hello_grpc.py        # 端到端示例
-```
+**② 连上去查**——和 PostgreSQL 一样的三行：
 
 ```python
-import sys; sys.path.insert(0, "examples/python")
-from gtv_client import connect
+import gtvdb
 
-with connect("127.0.0.1:50051") as session:      # 建 channel + 版本握手
-    result = session.query("SELECT * FROM numbers WHERE n <= 3")
-    print(result.table.to_pydict())              # {'n': [1, 2, 3], 'square': [1.0, 4.0, 9.0]}
-    print(result.tri_state)                      # 'found'
-    print(result.freshness)                      # {'as_known_at': 1700000000000000000, ...}
+con = gtvdb.connect("gtv://127.0.0.1:50051")      # 或 host=..., port=...
+cur = con.cursor()
+cur.execute("SELECT * FROM numbers WHERE n <= ?", (3,))
+cur.fetchall()          # [(1, 1.0), (2, 4.0), (3, 9.0)]
+cur.description[0][1]   # gtvdb.INTEGER
+con.close()
 ```
 
-**③ "开一个会话"在这里是什么意思**。服务端是无状态的：没有 `CREATE SESSION`、没有事务句柄、也没有需要 `close` 的游标。会话 = 客户端把**必须固定下来的东西**打成一个包：
+`with gtvdb.connect(...) as con:` 也可以；`con.execute(sql)` 是 `con.cursor().execute(sql)` 的快捷方式。pandas 直接可用：`pd.read_sql("SELECT * FROM numbers", con)`（pandas 会提示"只支持 SQLAlchemy 连接"，这是它的保守告警，实际能跑）。
+
+**③ 需要证据时，往下走一层**（DB-API 没有词汇表达"这个空结果什么也没证明"）：
+
+```python
+from gtvdb import Session
+
+with Session.connect("127.0.0.1:50051") as session:   # 建 channel + 版本握手
+    result = session.query("SELECT * FROM numbers WHERE n <= 3")
+    result.table.to_pydict()                          # {'n': [1, 2, 3], 'square': [1.0, 4.0, 9.0]}
+    result.tri_state                                  # 'found'
+    result.freshness                                  # {'as_known_at': 1700000000000000000, ...}
+```
+
+**④ "开一个会话"在这里是什么意思**。服务端是无状态的：没有 `CREATE SESSION`、没有事务句柄、也没有需要 `close` 的游标。会话 = 客户端把**必须固定下来的东西**打成一个包：
 
 | 固定什么 | 为什么 |
 |:--|:--|
@@ -745,6 +767,13 @@ with connect("127.0.0.1:50051") as session:      # 建 channel + 版本握手
 | bearer token | 每次调用带 `authorization: Bearer <token>` |
 | `as_of`（业务时间） | 不固定的话，连着的两条查询可能看到两个快照 |
 | `snapshot_id` | 客户端认为自己在读的快照；不一致时服务端**报错**而不是换个快照糊过去 |
+
+DB-API 层把 `as_of` 放在**连接**上（等价于"在 T 时刻打开一个会话"），并提供 `pin()` 换时间而不换连接：
+
+```python
+con = gtvdb.connect("gtv://host:50051", as_of=1_700_000_000_000_000_000)
+con.pin(as_of=1_700_000_086_400_000_000)   # 同一条 channel，新时间
+```
 
 ```python
 pinned = session.at(as_of=1_700_000_000_000_000_000)   # 子会话，共享 channel
@@ -761,13 +790,25 @@ b = pinned.query("SELECT * FROM numbers")
 
 `Result.is_conclusive` 只在前者（或 `found`）为 `True`。`result.receipt["snapshot_id"]`、`["as_of"]`、`["freshness"]["as_known_at"]` 让"这批数据有多新"变成可传递的事实，而不是一句口头承诺。
 
-**⑤ 三个自己写客户端会踩的点**：
+**⑤ 四个自己写客户端会踩的点**：
 
-1. **v0 的 `tri_state` 是假的**。旧服务端不算 tri-state，字段到线上一律是 proto3 默认值 `FOUND`；照读就会把"不知道"读成"有结果"。客户端对 v0 一律忽略该字段，只信回执。
+1. **v0 的 `tri_state` 是假的**。旧服务端不算 tri-state，字段到线上一律是 proto3 默认值 `FOUND`；照读就会把"不知道"读成"有结果"。驱动对 v0 一律忽略该字段，只信回执。
 2. **回执在 Arrow 里也有一份**（`gtv.receipt.json` 这个 schema metadata）。所以 v1 服务端写给 v0 客户端的数据仍然带着出处，落盘成 `.arrow` 文件后回执也还在。
-3. **stub 不要手改**。`examples/python/gtvproto/` 是 `gen_stubs.py` 的产物；改完 `.proto` 跑 `python examples/python/gen_stubs.py`，CI 用 `--check` 保证不漂移。
+3. **`?` 是客户端渲染的，不是服务端绑定**。协议 v1 里 SQL 就是一个字符串，没有绑定槽位（`QueryRequest` 没有参数数组）。所以 `_params.py` 在**字符串字面量/标识符/注释之外**逐个替换 `?`，值按类型渲染成 `'O''Brien'`、`TIMESTAMP '...'`、`X'0102'`、`NULL`——强于"`str()` 拼进 SQL"，弱于真正的 bind protocol（参数不能用在只能是字面量的位置，且每次都要重新 plan）。`paramstyle="qmark"` 说的就是这件事。
+4. **stub 不要手改**。`python/gtvdb/_stubs/` 是 `python/gen_stubs.py` 的产物；改完 `.proto` 跑 `python python/gen_stubs.py`，CI 用 `--check` 保证不漂移。
 
-`examples/python/test_gtv_client.py` 用纯 Python 假服务端测了 v0 回退（4 个用例，`python examples/python/test_gtv_client.py`），不需要起 Rust 进程。
+**⑥ 目前的边界**（诚实清单）：
+
+| 想 | 现在 | 为什么 / 出路 |
+|:--|:--|:--|
+| 写数据（INSERT/UPDATE） | ❌ 引擎拒绝 | 写入按既定分工走 RDBMS/Redis，再定时 refresh 进 gtvdb；不会假装支持 |
+| `commit()` / `rollback()` | no-op | 引擎没有事务；留着只是为了满足 PEP 249 和 pandas 的调用习惯 |
+| 服务端绑定参数 | ❌ | 协议 v2 的事；现在是客户端渲染 |
+| 流式拉取 / 游标分页 | ❌ 一次往返拿全量 | 大结果集先 `LIMIT`，或用 `read_table()` 走 Arrow 零拷贝 |
+| SQLAlchemy | ❌ 未提供 dialect | `pd.read_sql` 能跑（会 warn）；正式支持要做 `gtvdb+grpc://` dialect，属下一步 |
+| Oracle/PostgreSQL 那种 `fetchmany(size)` 服务端分页 | ❌ 客户端切片 | 同上，需要服务端 portal |
+
+测试：`python -m unittest discover -s python/tests`（30 个用例，纯 Python 假服务端，不需要 Rust 进程），覆盖 DB-API 契约、参数渲染、v0 回退、`as_of` 上线、错误码映射、pandas。示例脚本 `python examples/python/hello_grpc.py` 打真实服务端。
 
 ---
 
@@ -780,4 +821,4 @@ b = pinned.query("SELECT * FROM numbers")
 | 看段格式 | [`storage-mmap-design.md`](storage-mmap-design.md) |
 | 看 GPU 边界 | [`acceleration.md`](acceleration.md) |
 | 看性能基线怎么量 | `crates/gtv-engine/examples/bench_m6_gate.rs` 等基准（`--release`） |
-| 用 Python 调 | 本节 §12：本地 `examples/python/gtv_repl.py`，远程 `examples/python/gtv_client.py`（§12.6） |
+| 用 Python 调 | 本节 §12：本地子进程 `examples/python/gtv_repl.py`，远程 `pip install ./python` + `gtvdb.connect()`（§12.6） |

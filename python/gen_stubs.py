@@ -1,11 +1,12 @@
-"""Regenerate the gRPC stubs in `gtvproto/` from the core `.proto`.
+"""Regenerate the gRPC stubs in `gtvdb/_stubs/` from the core `.proto`.
 
-    python examples/python/gen_stubs.py            # write
-    python examples/python/gen_stubs.py --check    # fail if out of date (CI)
+    python python/gen_stubs.py            # write
+    python python/gen_stubs.py --check    # fail if out of date (CI)
 
-The stubs are committed so a user can `python examples/python/hello_grpc.py`
-without owning a protobuf toolchain. This script exists so the committed copy
-cannot silently drift from `crates/gtv-proto/proto/gtvquery.proto`.
+The stubs are committed and shipped in the package, so a user can
+`pip install gtvdb` without owning a protobuf toolchain. This script exists so
+the shipped copy cannot silently drift from
+`crates/gtv-proto/proto/gtvquery.proto`.
 
 Only one post-processing step is applied: protoc emits an absolute
 `import gtvquery_pb2`, which breaks when the generated files live in a package.
@@ -19,9 +20,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-PROTO_DIR = Path(__file__).resolve().parents[2] / "crates" / "gtv-proto" / "proto"
+PROTO_DIR = Path(__file__).resolve().parents[1] / "crates" / "gtv-proto" / "proto"
 PROTO = "gtvquery.proto"
-OUT_DIR = Path(__file__).resolve().parent / "gtvproto"
+OUT_DIR = Path(__file__).resolve().parent / "gtvdb" / "_stubs"
 GENERATED = ("gtvquery_pb2.py", "gtvquery_pb2.pyi", "gtvquery_pb2_grpc.py")
 
 

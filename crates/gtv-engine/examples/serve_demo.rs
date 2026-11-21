@@ -22,6 +22,7 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
 
 use gtv_core::{Freshness, KnowledgeClock};
 use gtv_engine::GtvContext;
@@ -59,7 +60,13 @@ async fn main() -> anyhow::Result<()> {
                     .await
                 {
                     Ok(outcome) => Ok((outcome.batches, outcome.receipt)),
-                    Err(e) => Err(WireError::new(ErrorCode::Internal, e.to_string())),
+                    Err(e) => {
+                        // Classify by *type*, not by message text: a plan error is
+                        // the caller's fault (unknown table, bad column) and must
+                        // reach the client as INVALID_ARGUMENT so it can raise a
+                        // `ProgrammingError` instead of an `InternalError`.
+                        Err(WireError::new(classify(&e), e.to_string()))
+                    }
                 }
             })
         })
@@ -109,4 +116,26 @@ fn demo_context() -> anyhow::Result<GtvContext> {
     ctx.register_batches("prices", prices_schema, vec![prices])?;
 
     Ok(ctx)
+}
+
+/// Map a DataFusion error to a wire code, seeing through the wrappers.
+///
+/// DataFusion 55 wraps errors more than once: `Shared(Arc<..>)` so they can be
+/// cloned, `Context(_, inner)` to add a description, and -- for anything the SQL
+/// planner produced -- `Diagnostic(.., Plan(..))`. Matching only the outer
+/// variant classifies every user mistake as `INTERNAL`, which is exactly how a
+/// typo'd table name ends up as an `InternalError` in the Python driver.
+fn classify(err: &DataFusionError) -> ErrorCode {
+    match err {
+        DataFusionError::Plan(_) | DataFusionError::SQL(..) | DataFusionError::SchemaError(..) => {
+            ErrorCode::InvalidArgument
+        }
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            classify(inner)
+        }
+        // Separate arm: `Shared` holds an `Arc`, the others a `Box`.
+        DataFusionError::Shared(inner) => classify(inner),
+        DataFusionError::Collection(errors) => errors.first().map_or(ErrorCode::Internal, classify),
+        _ => ErrorCode::Internal,
+    }
 }
