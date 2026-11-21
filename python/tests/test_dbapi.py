@@ -221,6 +221,31 @@ class Pinning(unittest.TestCase):
             self.assertEqual(self.server.requests[-1].as_of, 1_700_000_000_000_000_000)
             self.assertEqual(cur.receipt["as_of"], 1_700_000_000_000_000_000)
 
+    def test_a_pinned_as_of_is_declared_not_applied(self):
+        # The pin travels, so the request is honoured — but nothing filtered by
+        # it, so the driver must not present the rows as an answer about 123.
+        with gtvdb.connect(self.server.dsn, as_of=123) as con:
+            cur = con.cursor().execute("SELECT * FROM numbers")
+            self.assertEqual(cur.receipt["as_of"], 123)
+            self.assertEqual(cur.receipt["as_of_binding"], "declared")
+            self.assertFalse(cur.as_of_applied)
+            self.assertEqual(cur.tri_state, "incomplete")
+            self.assertEqual(
+                cur.receipt["incomplete"]["reason"], "time_point_not_applied"
+            )
+            self.assertFalse(
+                cur.is_conclusive, "a pin is a request, not a directive"
+            )
+            self.assertEqual(len(cur.fetchall()), 2, "the rows are still returned")
+
+    def test_an_unpinned_query_answers_for_now(self):
+        with gtvdb.connect(self.server.dsn) as con:
+            cur = con.cursor().execute("SELECT * FROM numbers")
+            self.assertEqual(cur.tri_state, "found")
+            self.assertTrue(cur.is_conclusive)
+            self.assertFalse(cur.as_of_applied)
+            self.assertIsNone(cur.receipt["as_of_binding"])
+
     def test_pin_reuses_the_connection(self):
         with gtvdb.connect(self.server.dsn) as con:
             pinned = con.pin(as_of=123, snapshot_id=9)

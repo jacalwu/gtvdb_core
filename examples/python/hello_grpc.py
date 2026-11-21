@@ -33,12 +33,36 @@ def main() -> int:
         print("snapshot:", result.receipt["snapshot_id"], "as_of:", result.receipt["as_of"])
         print("freshness:", result.freshness)
 
-        # 3. "Open a session at T": the business time is pinned once and every
-        #    following query is answered at it. No re-stating `as_of` per query.
+        # 3. Pin a business time. The pin travels on every following query — but
+        #    note what comes back: `as_of_binding = declared`. Nothing in the
+        #    server filtered by that time, so the receipt refuses to claim the
+        #    rows answer for it, and tri_state drops to `incomplete`. A pin only
+        #    becomes evidence when the statement itself enforces the time (or a
+        #    session default reaches every operator).
         pinned = session.at(as_of=1_700_000_000_000_000_000)
         later = pinned.query("SELECT count(*) AS c FROM prices")
         print(f"\npinned at {pinned._as_of} -> {later.table.to_pydict()}")
-        print("receipt echoes as_of:", later.receipt["as_of"])
+        print(
+            "  as_of:", later.receipt["as_of"],
+            "| binding:", later.receipt.get("as_of_binding"),
+            "| tri_state:", later.tri_state,
+            "| reason:", later.receipt["incomplete"].get("reason")
+            if later.receipt.get("incomplete") else None,
+        )
+
+        # 3b. Pin the *snapshot* instead. The demo serves exactly one, and it
+        #     says which, so the receipt can verify the pin rather than echo it.
+        exact = session.at(snapshot_id=1)
+        ok = exact.query("SELECT count(*) AS c FROM prices")
+        print(
+            "  snapshot 1 ->",
+            ok.receipt.get("snapshot_binding"),
+            "| tri_state:", ok.tri_state,
+        )
+        try:
+            session.at(snapshot_id=99).query("SELECT count(*) FROM prices")
+        except GtvError as exc:
+            print("  snapshot 99 ->", exc.code)
 
         # 4. Absence, proven vs. not proven. An empty result is only evidence
         #    when tri_state == "no_match".

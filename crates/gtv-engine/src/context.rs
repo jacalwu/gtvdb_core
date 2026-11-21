@@ -15,7 +15,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use gtv_accelerator::AcceleratorRegistry;
 use gtv_catalog::{ExecutionRecord, IndexRef, ModelRef, TableRef};
-use gtv_core::TemporalCSR;
+use gtv_core::{PointBinding, TemporalCSR};
 use gtv_index::AnyIndex;
 use gtv_params::{CudaMode, GtvParams, QueryMode, ResolvedParams};
 
@@ -144,6 +144,14 @@ pub struct GtvContext {
     /// `SegmentStore::freshness()` for a store-backed load, or a `recorded_at`
     /// high-water mark when the refresh pipeline carries one.
     freshness: Arc<RwLock<Option<gtv_core::Freshness>>>,
+    /// The snapshot this context is currently serving, when the host knows one.
+    ///
+    /// Only the host can answer "which state am I serving": the storage layer
+    /// does not define a snapshot identity today (a `manifest.system_ts` is not
+    /// unique — `flush_at` accepts a repeated timestamp). Until it does, a
+    /// client-supplied `snapshot_id` cannot be verified, and the receipt says
+    /// so (`PointBinding::Declared`) instead of echoing the claim back.
+    head_snapshot: Arc<RwLock<Option<u64>>>,
     /// Multimodal cost-based optimizer state (B3-5).
     cbo: crate::cbo::CboRegistry,
     /// Workload admission / isolation manager (B3-6).
@@ -513,6 +521,7 @@ impl GtvContext {
             invalidation_root,
             aggregate,
             freshness: Arc::new(RwLock::new(None)),
+            head_snapshot: Arc::new(RwLock::new(None)),
             table_sources: Arc::new(RwLock::new(HashMap::new())),
             params: params.clone(),
             resolved,
@@ -990,6 +999,43 @@ impl GtvContext {
         *self.freshness.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Declare the snapshot this context is serving.
+    ///
+    /// Set this only when the host has a real identity for its state (a catalog
+    /// generation, a published manifest id, a replica seqno). It is what makes
+    /// [`Self::verify_snapshot`] able to answer yes or no instead of "unknown".
+    pub fn set_head_snapshot(&self, snapshot_id: u64) {
+        *self.head_snapshot.write().unwrap_or_else(|e| e.into_inner()) = Some(snapshot_id);
+    }
+
+    /// Stop naming a snapshot. Client-supplied ids then stay `Declared`.
+    pub fn clear_head_snapshot(&self) {
+        *self.head_snapshot.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The snapshot this context is serving, when the host declared one.
+    pub fn head_snapshot(&self) -> Option<u64> {
+        *self.head_snapshot.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Check a client's pinned snapshot against what this context serves.
+    ///
+    /// Three outcomes, and the third is the one that matters: with no declared
+    /// head there is nothing to compare against, so the answer is
+    /// [`PointBinding::Declared`] — the request is recorded, not honoured. That
+    /// is strictly better than returning `Applied` because a comparison would
+    /// have been convenient.
+    pub fn verify_snapshot(&self, requested: u64) -> gtv_core::Result<PointBinding> {
+        match self.head_snapshot() {
+            None => Ok(PointBinding::Declared),
+            Some(head) if head == requested => Ok(PointBinding::Applied),
+            Some(head) => Err(gtv_core::GtvError::SnapshotMismatch {
+                expected: requested,
+                got: head,
+            }),
+        }
+    }
+
     /// Run a SQL query and return its rows **and** a receipt for them (A1).
     ///
     /// `summaries` lists the graph tables the statement may read, as
@@ -1000,6 +1046,15 @@ impl GtvContext {
     ///
     /// The receipt is validated before it is returned: a receipt that claims
     /// completeness it cannot prove is a bug here, not at the caller.
+    ///
+    /// **`as_of` here is a request, not a directive.** Most statements have no
+    /// time predicate, and rewriting them is not something this layer may do
+    /// silently, so the result is capped at `Incomplete` and the receipt says
+    /// `as_of_binding = declared`. A handler that genuinely applied the point
+    /// (the statement itself calls `as_of(...)`, or a session default reached
+    /// every operator) must say so through [`Self::sql_with_receipt_binding`],
+    /// otherwise a correct answer is reported as inconclusive — the safe
+    /// direction to be wrong in.
     pub async fn sql_with_receipt(
         &self,
         query_id: impl Into<String>,
@@ -1008,6 +1063,41 @@ impl GtvContext {
         snapshot_id: Option<u64>,
         summaries: &[(String, crate::motif::MotifSummary)],
     ) -> Result<crate::receipt::QueryOutcome> {
+        let binding = crate::receipt::QueryBinding {
+            as_of,
+            snapshot_id,
+            ..crate::receipt::QueryBinding::default()
+        };
+        self.sql_with_receipt_binding(query_id, query, binding, summaries)
+            .await
+    }
+
+    /// [`Self::sql_with_receipt`] with explicit control over what was enforced.
+    ///
+    /// A requested `snapshot_id` is verified here before the statement runs: a
+    /// client that pinned a state must not be handed rows from another one.
+    /// When the host declared no head snapshot, the id stays `Declared` — the
+    /// alternative (assuming it matched) is how a receipt becomes a forgery.
+    pub async fn sql_with_receipt_binding(
+        &self,
+        query_id: impl Into<String>,
+        query: &str,
+        mut binding: crate::receipt::QueryBinding,
+        summaries: &[(String, crate::motif::MotifSummary)],
+    ) -> Result<crate::receipt::QueryOutcome> {
+        if let Some(requested) = binding.snapshot_id {
+            // Pre-check so the work is not spent on a query whose answer cannot
+            // be used, and so embedders get the typed error rather than a
+            // string. A handler that wants the wire `SNAPSHOT_MISMATCH` code
+            // calls `verify_snapshot` first; this is the safety net.
+            match self
+                .verify_snapshot(requested)
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+            {
+                PointBinding::Applied => binding.snapshot_verified = true,
+                PointBinding::Declared => binding.snapshot_verified = false,
+            }
+        }
         let df = self.ctx.sql(query).await?;
         // Hash the *optimized* plan: the receipt should identify what ran, not
         // what the parser first produced.
@@ -1016,8 +1106,7 @@ impl GtvContext {
         let mut receipt = crate::receipt::receipt_for_statement(
             query_id,
             &batches,
-            as_of,
-            snapshot_id,
+            binding,
             &rendered,
             summaries,
         );
@@ -1040,8 +1129,26 @@ impl GtvContext {
         snapshot_id: Option<u64>,
         summaries: &[(String, crate::motif::MotifSummary)],
     ) -> Result<crate::receipt::QueryOutcome> {
+        let binding = crate::receipt::QueryBinding {
+            as_of,
+            snapshot_id,
+            ..crate::receipt::QueryBinding::default()
+        };
+        self.sql_with_attached_receipt_binding(query_id, query, binding, summaries)
+            .await
+    }
+
+    /// [`Self::sql_with_receipt_binding`], with the receipt attached to the
+    /// Arrow schema.
+    pub async fn sql_with_attached_receipt_binding(
+        &self,
+        query_id: impl Into<String>,
+        query: &str,
+        binding: crate::receipt::QueryBinding,
+        summaries: &[(String, crate::motif::MotifSummary)],
+    ) -> Result<crate::receipt::QueryOutcome> {
         let outcome = self
-            .sql_with_receipt(query_id, query, as_of, snapshot_id, summaries)
+            .sql_with_receipt_binding(query_id, query, binding, summaries)
             .await?;
         let batches = crate::receipt::attach_receipt(outcome.batches, &outcome.receipt)?;
         Ok(crate::receipt::QueryOutcome {

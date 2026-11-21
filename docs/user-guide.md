@@ -768,7 +768,11 @@ with Session.connect("127.0.0.1:50051") as session:   # 建 channel + 版本握�
 | 协商出的协议版本 | v1 有 as_of 与回执；v0 只有 SQL 进出 |
 | bearer token | 每次调用带 `authorization: Bearer <token>` |
 | `as_of`（业务时间） | 不固定的话，连着的两条查询可能看到两个快照 |
-| `snapshot_id` | 客户端认为自己在读的快照；不一致时服务端**报错**而不是换个快照糊过去 |
+| `snapshot_id` | 客户端认为自己在读的快照；不一致时服务端回 `SNAPSHOT_MISMATCH`，**不换快照**
+
+**这里有个必须知道的限制**：`as_of` 发出去只是"请求"，不是"指令"。服务端不会替你改写 `SELECT * FROM prices`，所以它的回执会写 `as_of_binding: "declared"`，并且 `tri_state` 降为 `incomplete`——行是真的，但不是关于那个时点的答案（详见 `docs/time-point-contract.md`）。只有语句自己带时间谓词（如 `as_of(...)`、`neighbors(src, t)`）时，才算 `applied`。
+
+`snapshot_id` 则是**可校验**的：服务端知道自己在服务哪个快照时会比对，不符直接报错；不知道时（未声明 head）同样降为 `declared`，而不是默认你说得对。
 
 DB-API 层把 `as_of` 放在**连接**上（等价于"在 T 时刻打开一个会话"），并提供 `pin()` 换时间而不换连接：
 
@@ -779,18 +783,18 @@ con.pin(as_of=1_700_000_086_400_000_000)   # 同一条 channel，新时间
 
 ```python
 pinned = session.at(as_of=1_700_000_000_000_000_000)   # 子会话，共享 channel
-a = pinned.query("SELECT count(*) FROM prices")        # 两条查询同业务时间
-b = pinned.query("SELECT * FROM numbers")
+a = pinned.query("SELECT count(*) FROM prices")        # 同一 as_of，但回执是 declared
+b = pinned.query("SELECT * FROM prices WHERE t <= 1700000000000000000")  # 语句自证 → applied
 ```
 
 **④ 结果里比行更重要的是回执**。`Result.receipt` 就是 `QueryReceipt` 的 dict：
 
 ```text
 空结果 + tri_state="no_match"     → 证否：确实没有
-空结果 + tri_state="incomplete"   → 什么也没证明（预算/超时打断了）
+空结果 + tri_state="incomplete"   → 什么也没证明（预算/超时打断，或时点没被执行）
 ```
 
-`Result.is_conclusive` 只在前者（或 `found`）为 `True`。`result.receipt["snapshot_id"]`、`["as_of"]`、`["freshness"]["as_known_at"]` 让"这批数据有多新"变成可传递的事实，而不是一句口头承诺。
+`Result.is_conclusive` 只在前者（或 `found`）为 `True`。`result.receipt["snapshot_id"]`、`["as_of"]`、`["as_of_binding"]`、`["freshness"]["as_known_at"]` 让"这批数据有多新、这个时点算不算数"变成可传递的事实，而不是一句口头承诺。
 
 **⑤ 四个自己写客户端会踩的点**：
 

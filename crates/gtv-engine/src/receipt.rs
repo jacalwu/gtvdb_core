@@ -20,6 +20,79 @@ use gtv_core::{plan_hash, Incomplete, QueryReceipt, QueryStats, TriState};
 
 use crate::motif::MotifSummary;
 
+/// The time points a statement was requested at, and who enforced them.
+///
+/// This exists because a handler can receive an `as_of` and have no way to make
+/// the statement answer for it: `SELECT * FROM prices` has no time predicate,
+/// and rewriting it is not something a transport layer may do silently. Passing
+/// the request straight into a receipt produces rows stamped with a time
+/// nobody checked — see [`PointBinding`].
+///
+/// `Default` is "nothing requested", and it is the only state a handler gets
+/// for free: both applied-flags must be set deliberately, by code that actually
+/// enforced the point.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryBinding {
+    pub as_of: Option<i64>,
+    /// True only when the engine filtered by `as_of` (or a session default
+    /// reached every operator the statement touched).
+    pub as_of_applied: bool,
+    pub snapshot_id: Option<u64>,
+    /// True only when `snapshot_id` was compared against the store's live
+    /// snapshot before the query ran.
+    pub snapshot_verified: bool,
+}
+
+impl QueryBinding {
+    /// Nothing requested: the receipt will name no time point, which is honest
+    /// and conclusive.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A business time the caller asked for, not (yet) enforced.
+    pub fn at(as_of: i64) -> Self {
+        Self {
+            as_of: Some(as_of),
+            ..Self::default()
+        }
+    }
+
+    /// A snapshot the caller pinned, not (yet) verified.
+    pub fn snapshot(snapshot_id: u64) -> Self {
+        Self {
+            snapshot_id: Some(snapshot_id),
+            ..Self::default()
+        }
+    }
+
+    /// Mark the business time as enforced. Call this only from code that
+    /// actually applied it.
+    pub fn applied(mut self) -> Self {
+        self.as_of_applied = self.as_of.is_some();
+        self
+    }
+
+    /// Pin a snapshot the caller asked for, not (yet) verified.
+    pub fn with_snapshot(mut self, snapshot_id: u64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Mark the snapshot as verified against the store head.
+    pub fn verified(mut self) -> Self {
+        self.snapshot_verified = self.snapshot_id.is_some();
+        self
+    }
+
+    /// True when a point is named that nothing enforced, which caps the
+    /// tri-state at `Incomplete`.
+    pub fn declares_an_unenforced_point(&self) -> bool {
+        (self.as_of.is_some() && !self.as_of_applied)
+            || (self.snapshot_id.is_some() && !self.snapshot_verified)
+    }
+}
+
 /// A statement's rows plus the receipt that explains them.
 #[derive(Debug, Clone)]
 pub struct QueryOutcome {
@@ -92,11 +165,15 @@ pub fn receipt_from_batches(batches: &[RecordBatch]) -> Option<gtv_core::Result<
 /// result has rows. The first (deterministic, by name) truncated dependency
 /// supplies the reason, so re-running the same statement yields the same
 /// receipt.
+///
+/// A time point in `binding` that nothing enforced also caps the result at
+/// `Incomplete`: the rows are real, but they are not an answer about the point
+/// that was named. Truncation keeps the reason when both apply, because it says
+/// something about the data rather than about the question.
 pub fn receipt_for_statement(
     query_id: impl Into<String>,
     batches: &[RecordBatch],
-    as_of: Option<i64>,
-    snapshot_id: Option<u64>,
+    binding: QueryBinding,
     rendered_plan: &str,
     summaries: &[(String, MotifSummary)],
 ) -> QueryReceipt {
@@ -129,11 +206,19 @@ pub fn receipt_for_statement(
     let mut receipt = QueryReceipt::new(query_id, state)
         .with_stats(stats)
         .with_plan_hash(hash_plan(rendered_plan));
-    if let Some(as_of) = as_of {
-        receipt = receipt.with_as_of(as_of);
+    if let Some(as_of) = binding.as_of {
+        receipt = if binding.as_of_applied {
+            receipt.with_as_of_applied(as_of)
+        } else {
+            receipt.with_as_of(as_of)
+        };
     }
-    if let Some(id) = snapshot_id {
-        receipt = receipt.with_snapshot(id);
+    if let Some(id) = binding.snapshot_id {
+        receipt = if binding.snapshot_verified {
+            receipt.with_snapshot_verified(id)
+        } else {
+            receipt.with_snapshot(id)
+        };
     }
     if let Some((name, summary)) = truncated {
         let mut incomplete = summary
@@ -150,6 +235,15 @@ pub fn receipt_for_statement(
         ));
         incomplete.hop = incomplete.hop.max(1);
         receipt.incomplete = Some(incomplete);
+    }
+    // A point nothing enforced cannot leave the answer conclusive: the rows may
+    // come from any state, so `Found`/`NoMatch` would be a claim about a state
+    // nobody read. Truncation keeps the reason when both apply.
+    if receipt.tri_state != TriState::Incomplete && binding.declares_an_unenforced_point() {
+        receipt.tri_state = TriState::Incomplete;
+        receipt.incomplete = Some(Incomplete::new(
+            gtv_core::IncompleteReason::TimePointNotApplied,
+        ));
     }
     receipt
 }
@@ -213,8 +307,7 @@ mod tests {
         let r = receipt_for_statement(
             "q-3",
             &[batch()],
-            Some(100),
-            Some(7),
+            QueryBinding::at(100).with_snapshot(7),
             "Join",
             &[("gtv_motif_matches".to_string(), summary(TriState::Incomplete, 50))],
         );
@@ -225,12 +318,52 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_point_caps_the_tri_state() {
+        // Rows came back, but they were not filtered by `as_of`, so the answer
+        // is not an answer about 100.
+        let declared = receipt_for_statement(
+            "q-6",
+            &[batch()],
+            QueryBinding::at(100),
+            "Scan",
+            &[],
+        );
+        assert_eq!(declared.tri_state, TriState::Incomplete);
+        assert_eq!(
+            declared.incomplete.as_ref().unwrap().reason,
+            IncompleteReason::TimePointNotApplied
+        );
+        assert!(declared.validate().is_ok(), "an honest receipt is a valid one");
+
+        // The same rows, with the point actually enforced, are conclusive.
+        let applied =
+            receipt_for_statement("q-7", &[batch()], QueryBinding::at(100).applied(), "Scan", &[]);
+        assert_eq!(applied.tri_state, TriState::Found);
+        assert!(applied.as_of_applied());
+        assert!(applied.incomplete.is_none());
+    }
+
+    #[test]
+    fn truncation_explains_a_declared_point_better_than_the_binding_can() {
+        let r = receipt_for_statement(
+            "q-8",
+            &[batch()],
+            QueryBinding::at(100),
+            "Join",
+            &[("gtv_motif_matches".to_string(), summary(TriState::Incomplete, 50))],
+        );
+        assert_eq!(r.incomplete.as_ref().unwrap().reason, IncompleteReason::Edges);
+        // The binding still records the unenforced point, so a reader can see
+        // both facts.
+        assert!(!r.as_of_applied());
+    }
+
+    #[test]
     fn conclusive_dependency_leaves_rows_decisive() {
         let r = receipt_for_statement(
             "q-4",
             &[batch()],
-            None,
-            None,
+            QueryBinding::none(),
             "Join",
             &[("gtv_motif_matches".to_string(), summary(TriState::Found, 50))],
         );
@@ -238,7 +371,7 @@ mod tests {
         assert!(r.incomplete.is_none());
         assert_eq!(r.stats.rows, 2);
 
-        let empty = receipt_for_statement("q-5", &[], None, None, "Empty", &[]);
+        let empty = receipt_for_statement("q-5", &[], QueryBinding::none(), "Empty", &[]);
         assert_eq!(empty.tri_state, TriState::NoMatch);
         assert!(empty.validate().is_ok());
     }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray, TimestampNanosecondArray, UInt16Array, UInt64Array};
 use gtv_core::{IncompleteReason, TemporalCSR, TraversalBudget, TriState};
-use gtv_engine::{receipt_from_batches, GtvContext, MotifShape, MotifSpec};
+use gtv_engine::{receipt_from_batches, GtvContext, MotifShape, MotifSpec, QueryBinding};
 
 const T: i64 = 100;
 
@@ -180,11 +180,13 @@ async fn statement_receipt_is_conclusive_when_dependencies_are() {
         .unwrap();
 
     let outcome = ctx
-        .sql_with_receipt(
+        .sql_with_receipt_binding(
             "q-ok-1",
             "SELECT n0, n1 FROM gtv_motif_matches",
-            Some(T),
-            None,
+            // The motif table was materialised at `T`, so this statement really
+            // does answer for that business time — unlike a plain scan, which
+            // would only have been told about it.
+            QueryBinding::at(T).applied(),
             &[("gtv_motif_matches".to_string(), summary)],
         )
         .await

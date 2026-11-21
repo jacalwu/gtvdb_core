@@ -179,6 +179,16 @@ class Cursor:
         """Whether an empty result proves absence. `False` for an old server."""
         return False if self._result is None else self._result.is_conclusive
 
+    @property
+    def as_of_applied(self) -> bool:
+        """Whether these rows really answer for the requested `as_of`."""
+        return False if self._result is None else self._result.as_of_applied
+
+    @property
+    def snapshot_verified(self) -> bool:
+        """Whether the server confirmed it serves the pinned snapshot."""
+        return False if self._result is None else self._result.snapshot_verified
+
     def to_arrow(self) -> pa.Table:
         """The result as an Arrow table — no row conversion, keeps the receipt."""
         self._ensure_result()

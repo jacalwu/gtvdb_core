@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use gtv_core::receipt::{
     is_supported_version, negotiate_version, plan_hash, topk_dedup, topk_dedup_by_score, Absence,
     DedupKey, EdgeRef, Freshness, FreshnessVerdict, Incomplete, IncompleteReason, KnowledgeClock,
-    PathEvidence, QueryReceipt, QueryStats, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
+    PathEvidence, PointBinding, QueryReceipt, QueryStats, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
     RECEIPT_METADATA_JSON, RECEIPT_METADATA_PREFIX,
 };
 use gtv_core::traversal::{TruncReason, Truncation, TriState};
@@ -296,7 +296,7 @@ fn freshness(known_at: i64) -> Freshness {
 #[test]
 fn watermark_roundtrips_through_every_transport() {
     let receipt = QueryReceipt::no_match("q-f1")
-        .with_as_of(100)
+        .with_as_of_applied(100)
         .with_freshness(freshness(90).with_history_floor(10).with_business_max(120));
 
     let json = QueryReceipt::from_json(&receipt.to_json()).expect("json roundtrip");
@@ -323,7 +323,7 @@ fn watermark_roundtrips_through_every_transport() {
 fn stale_watermark_turns_no_match_into_not_yet_refreshed() {
     // Report asked at knowledge time 100; the graph was refreshed at 90.
     let receipt = QueryReceipt::no_match("q-f2")
-        .with_as_of(95)
+        .with_as_of_applied(95)
         .with_freshness(freshness(90));
 
     assert_eq!(
@@ -337,7 +337,7 @@ fn stale_watermark_turns_no_match_into_not_yet_refreshed() {
 
 #[test]
 fn a_missing_watermark_is_never_a_proof_of_absence() {
-    let receipt = QueryReceipt::no_match("q-f3").with_as_of(95);
+    let receipt = QueryReceipt::no_match("q-f3").with_as_of_applied(95);
     assert_eq!(receipt.freshness_verdict(100), None);
     assert_eq!(receipt.absence_at(100, Some(95)), Absence::NotApplicable);
     assert!(!receipt.proves_absence_at(100, Some(95)));
@@ -346,7 +346,7 @@ fn a_missing_watermark_is_never_a_proof_of_absence() {
 #[test]
 fn history_below_the_gc_floor_is_unanswerable_not_empty() {
     let receipt = QueryReceipt::no_match("q-f4")
-        .with_as_of(5)
+        .with_as_of_applied(5)
         .with_freshness(freshness(90).with_history_floor(50));
     assert_eq!(
         receipt.absence_at(90, Some(5)),
@@ -358,7 +358,7 @@ fn history_below_the_gc_floor_is_unanswerable_not_empty() {
 #[test]
 fn rows_or_truncation_make_the_absence_question_moot() {
     let found = QueryReceipt::found("q-f5")
-        .with_as_of(95)
+        .with_as_of_applied(95)
         .with_freshness(freshness(90));
     assert_eq!(found.absence_at(100, Some(95)), Absence::NotApplicable);
 
@@ -366,7 +366,7 @@ fn rows_or_truncation_make_the_absence_question_moot() {
         "q-f6",
         Incomplete::new(IncompleteReason::Edges).at_hop(2),
     )
-    .with_as_of(95)
+    .with_as_of_applied(95)
     .with_freshness(freshness(90));
     // Even at a current watermark, a capped search cannot prove absence.
     assert_eq!(truncated.absence_at(90, Some(95)), Absence::NotApplicable);
@@ -375,7 +375,7 @@ fn rows_or_truncation_make_the_absence_question_moot() {
 #[test]
 fn validate_rejects_absence_below_the_retention_floor() {
     let mut r = QueryReceipt::no_match("q-f7")
-        .with_as_of(5)
+        .with_as_of_applied(5)
         .with_freshness(freshness(90).with_history_floor(50));
     assert!(r.validate().is_err());
 
@@ -394,7 +394,7 @@ fn validate_rejects_a_floor_after_the_watermark() {
 fn freshness_is_deterministic_across_replays() {
     let build = || {
         QueryReceipt::found("q-f9")
-            .with_as_of(95)
+            .with_as_of_applied(95)
             .with_freshness(freshness(90).with_history_floor(10))
     };
     assert_eq!(build().to_json(), build().to_json());
@@ -408,4 +408,131 @@ fn verdict_reports_the_lag() {
     assert_eq!(f.verdict(95), FreshnessVerdict::Stale { behind_by: 5 });
     assert!(f.retains_business_time(5));
     assert!(!f.with_history_floor(50).retains_business_time(5));
+}
+
+// ---------------------------------------------------------------------------
+// Time-point binding: a receipt may name a point, but only a point something
+// enforced may be read as evidence about it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_declared_as_of_cannot_be_conclusive() {
+    // The failure this rule exists to prevent: ask for 14:00, run a statement
+    // with no time predicate, and hand back rows stamped `as_of: 14:00`.
+    let claimed = QueryReceipt::found("q-b1").with_as_of(14_000);
+    let err = claimed.validate().expect_err("a declared as_of proves nothing");
+    assert!(
+        err.to_string().contains("declared as_of"),
+        "the message must name the problem: {err}"
+    );
+
+    // The same query, honestly labelled, is valid.
+    let honest = QueryReceipt::incomplete(
+        "q-b2",
+        Incomplete::new(IncompleteReason::TimePointNotApplied),
+    )
+    .with_as_of(14_000);
+    assert!(honest.validate().is_ok());
+    assert!(!honest.as_of_applied());
+    assert_eq!(honest.incomplete.unwrap().reason.as_str(), "time_point_not_applied");
+}
+
+#[test]
+fn an_enforced_point_may_be_conclusive() {
+    let receipt = QueryReceipt::found("q-b3")
+        .with_as_of_applied(14_000)
+        .with_snapshot_verified(77);
+    assert!(receipt.validate().is_ok());
+    assert!(receipt.as_of_applied());
+    assert!(receipt.snapshot_verified());
+    assert!(!receipt.has_declared_point());
+}
+
+#[test]
+fn naming_a_point_without_a_binding_is_rejected() {
+    // Public fields mean a hand-built receipt can skip the setters; validate is
+    // the only thing standing between that and a forged provenance claim.
+    let mut r = QueryReceipt::no_match("q-b4");
+    r.as_of = Some(5);
+    let err = r.validate().expect_err("as_of without a binding");
+    assert!(err.to_string().contains("without a binding"), "{err}");
+
+    let mut r2 = QueryReceipt::no_match("q-b5");
+    r2.snapshot_id = Some(9);
+    assert!(r2.validate().is_err());
+}
+
+#[test]
+fn a_binding_without_its_point_is_rejected() {
+    let mut r = QueryReceipt::no_match("q-b6");
+    r.as_of_binding = Some(PointBinding::Applied);
+    let err = r.validate().expect_err("binding without a point");
+    assert!(err.to_string().contains("binding is set"), "{err}");
+}
+
+#[test]
+fn a_declared_as_of_never_proves_absence() {
+    // Even if the tri-state says NoMatch and a watermark is present, an
+    // unfiltered empty result says nothing about the requested business time.
+    let receipt = QueryReceipt::no_match("q-b7")
+        .with_as_of(95)
+        .with_freshness(freshness(95));
+    assert_eq!(receipt.absence_at(95, Some(95)), Absence::NotApplicable);
+    assert!(!receipt.proves_absence_at(95, Some(95)));
+
+    // With the same inputs, an enforced point does prove it.
+    let applied = QueryReceipt::no_match("q-b8")
+        .with_as_of_applied(95)
+        .with_freshness(freshness(95));
+    assert_eq!(applied.absence_at(95, Some(95)), Absence::Proven);
+}
+
+#[test]
+fn binding_survives_every_transport() {
+    let receipt = QueryReceipt::incomplete(
+        "q-b9",
+        Incomplete::new(IncompleteReason::TimePointNotApplied),
+    )
+    .with_as_of(14_000)
+    .with_snapshot_verified(77);
+
+    let back = QueryReceipt::from_json(&receipt.to_json()).expect("json");
+    assert_eq!(back, receipt);
+    assert_eq!(back.as_of_binding, Some(PointBinding::Declared));
+    assert_eq!(back.snapshot_binding, Some(PointBinding::Applied));
+
+    let meta = receipt.to_arrow_metadata();
+    assert_eq!(
+        meta.get(&format!("{RECEIPT_METADATA_PREFIX}as_of_binding"))
+            .map(String::as_str),
+        Some("declared")
+    );
+    assert_eq!(
+        meta.get(&format!("{RECEIPT_METADATA_PREFIX}snapshot_binding"))
+            .map(String::as_str),
+        Some("applied")
+    );
+    let back = QueryReceipt::from_arrow_metadata(&meta)
+        .expect("readable")
+        .expect("present");
+    assert_eq!(back, receipt);
+}
+
+#[test]
+fn a_receipt_written_before_bindings_existed_still_parses() {
+    // Receipts are kept for review months later, so adding a field must not
+    // make yesterday's evidence unreadable.
+    let old = QueryReceipt::no_match("q-b10")
+        .with_as_of_applied(7)
+        .with_freshness(freshness(9));
+    let mut value: serde_json::Value = serde_json::from_str(&old.to_json()).unwrap();
+    let obj = value.as_object_mut().unwrap();
+    obj.remove("as_of_binding");
+    obj.remove("snapshot_binding");
+    obj.remove("freshness");
+
+    let parsed = QueryReceipt::from_json(&value.to_string()).expect("old receipt must parse");
+    assert_eq!(parsed.as_of_binding, None);
+    assert_eq!(parsed.snapshot_binding, None);
+    assert!(parsed.freshness.is_none());
 }

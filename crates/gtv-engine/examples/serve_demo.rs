@@ -28,6 +28,9 @@ use gtv_core::{Freshness, KnowledgeClock};
 use gtv_engine::GtvContext;
 use gtv_proto::{bind, ErrorCode, QueryHandler, RemoteQuery, WireError};
 
+/// The single snapshot this demo serves; pin it to see a verified receipt.
+const DEMO_SNAPSHOT_ID: u64 = 1;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let addr = std::env::var("GTV_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
@@ -42,6 +45,11 @@ async fn main() -> anyhow::Result<()> {
         KnowledgeClock::SegmentSystemTs,
     ));
 
+    // The demo serves exactly one immutable state, so it can name it. A real
+    // server derives this from its store (a published manifest id or a replica
+    // seqno); without one, every pinned `snapshot_id` stays merely declared.
+    ctx.set_head_snapshot(DEMO_SNAPSHOT_ID);
+
     let handler: QueryHandler = {
         let ctx = Arc::clone(&ctx);
         Arc::new(move |query: RemoteQuery| {
@@ -52,11 +60,29 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     query.request_id.clone()
                 };
-                // `sql_with_receipt` hashes the optimized plan and stamps
+                // A pinned snapshot is checked *before* the query runs, so a
+                // client that asked for a state this server is not holding gets
+                // `SNAPSHOT_MISMATCH` instead of rows from another one.
+                if let Some(id) = query.snapshot_id {
+                    if let Err(e) = ctx.verify_snapshot(id) {
+                        return Err(WireError::from(e));
+                    }
+                }
+                // `sql_with_receipt_binding` hashes the optimized plan and stamps
                 // tri-state + snapshot + freshness; `encode_response` then
                 // repeats the receipt in the Arrow schema metadata.
+                //
+                // `as_of` stays *declared*: nothing in this handler filters by
+                // it, so the receipt must not claim the rows answer for it. A
+                // real handler that applies the point (or a session default that
+                // reaches every operator) calls `.applied()` instead.
+                let binding = gtv_engine::QueryBinding {
+                    as_of: query.as_of,
+                    snapshot_id: query.snapshot_id,
+                    ..gtv_engine::QueryBinding::default()
+                };
                 match ctx
-                    .sql_with_receipt(query_id, &query.sql, query.as_of, query.snapshot_id, &[])
+                    .sql_with_receipt_binding(query_id, &query.sql, binding, &[])
                     .await
                 {
                     Ok(outcome) => Ok((outcome.batches, outcome.receipt)),
@@ -74,9 +100,10 @@ async fn main() -> anyhow::Result<()> {
 
     let (bound, _server) = bind(addr.parse()?, handler).await?;
     println!("gtv demo server listening on http://{bound} (protocol v1)");
-    println!("  tables: numbers (n, square), prices (t, price)");
-    println!("  try:    SELECT * FROM numbers WHERE n <= 3");
-    println!("  stop:   Ctrl-C");
+    println!("  tables:   numbers (n, square), prices (t, price)");
+    println!("  snapshot: {DEMO_SNAPSHOT_ID} (pin it to get a verified receipt)");
+    println!("  try:      SELECT * FROM numbers WHERE n <= 3");
+    println!("  stop:     Ctrl-C");
 
     // Park forever; Ctrl-C terminates the process. `bind` owns the server task.
     std::future::pending::<()>().await;

@@ -284,7 +284,7 @@ impl MotifOutcome {
     /// Build a receipt for this run. `query_id` is the caller's correlation id.
     pub fn receipt(&self, query_id: impl Into<String>) -> QueryReceipt {
         let mut receipt = QueryReceipt::new(query_id, self.tri_state())
-            .with_as_of(self.valid_at)
+            .with_as_of_applied(self.valid_at)
             .with_stats(self.stats.clone().into());
         if let Some(t) = &self.truncation {
             receipt.incomplete = Some(t.into());
@@ -490,7 +490,7 @@ impl MotifSummary {
     /// Build a receipt. `query_id` is the caller's correlation id.
     pub fn receipt(&self, query_id: impl Into<String>) -> QueryReceipt {
         let mut receipt = QueryReceipt::new(query_id, self.tri_state)
-            .with_as_of(self.valid_at)
+            .with_as_of_applied(self.valid_at)
             .with_stats(self.stats.clone().into());
         receipt.incomplete = self.incomplete.clone();
         receipt

@@ -15,7 +15,8 @@ use std::sync::Arc;
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use gtv_core::{
-    Freshness, Incomplete, IncompleteReason, KnowledgeClock, QueryReceipt, QueryStats, TriState,
+    Freshness, Incomplete, IncompleteReason, KnowledgeClock, PointBinding, QueryReceipt, QueryStats,
+    TriState,
 };
 use gtv_proto::{
     accept_version, bind, decode_response, encode_response, error_code_from_i32, query_remote_full,
@@ -163,7 +164,9 @@ async fn start_server() -> (String, tokio::task::JoinHandle<()>) {
                 ..Default::default()
             });
             if let Some(as_of) = q.as_of {
-                receipt = receipt.with_as_of(as_of);
+                // Declared would cap the tri-state at `Incomplete`; this fake
+                // handler answers for the point, so it says so.
+                receipt = receipt.with_as_of_applied(as_of);
             }
             Ok((vec![batch(&[1, 2])], receipt))
         })
@@ -337,4 +340,46 @@ fn freshness_survives_the_wire_and_the_arrow_payload() {
     let ipc = gtv_proto::encode_response(Ok((vec![batch(&[1, 2])], receipt.clone()))).arrow_ipc;
     let from_arrow = receipt_from_ipc(&ipc).expect("readable").expect("present");
     assert_eq!(from_arrow, receipt);
+}
+
+#[tokio::test]
+async fn a_declared_time_point_crosses_the_wire_as_a_caveat() {
+    // The caveat is only worth anything if it survives the trip: a client must
+    // not receive rows stamped `as_of` and read that as an answer about that
+    // time just because the server stayed silent about enforcement.
+    let (addr, handle) = bind(
+        "127.0.0.1:0".parse().unwrap(),
+        gtv_proto::QueryServiceImpl::from_fn(|q| async move {
+            let mut receipt = QueryReceipt::incomplete(
+                q.request_id.clone(),
+                Incomplete::new(IncompleteReason::TimePointNotApplied),
+            );
+            if let Some(as_of) = q.as_of {
+                receipt = receipt.with_as_of(as_of);
+            }
+            Ok((vec![batch(&[1, 2])], receipt))
+        })
+        .into_handler(),
+    )
+    .await
+    .unwrap();
+
+    let outcome = query_remote_full(
+        &addr.to_string(),
+        &RemoteQuery::new("SELECT n", "req-live-2").with_as_of(1234),
+        None,
+        None,
+    )
+    .await
+    .expect("query succeeds");
+
+    assert_eq!(outcome.rows(), 2, "the rows still arrive");
+    assert_eq!(outcome.tri_state, Some(TriState::Incomplete));
+    let receipt = outcome.receipt.expect("receipt");
+    assert_eq!(receipt.as_of, Some(1234));
+    assert_eq!(receipt.as_of_binding, Some(PointBinding::Declared));
+    assert_eq!(receipt.tri_state, TriState::Incomplete);
+    assert!(!receipt.as_of_applied());
+
+    handle.abort();
 }

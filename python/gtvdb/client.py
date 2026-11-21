@@ -122,6 +122,21 @@ class Result:
         incomplete = (self.receipt or {}).get("incomplete")
         return None if incomplete is None else incomplete.get("reason")
 
+    @property
+    def as_of_applied(self) -> bool:
+        """Whether the rows really answer for the `as_of` that was requested.
+
+        `False` covers both "no as_of requested" and "requested but nothing
+        enforced it" — the latter is what `incomplete_reason ==
+        'time_point_not_applied'` marks. A pin is a request, not a directive.
+        """
+        return (self.receipt or {}).get("as_of_binding") == "applied"
+
+    @property
+    def snapshot_verified(self) -> bool:
+        """Whether the server confirmed it serves the snapshot that was pinned."""
+        return (self.receipt or {}).get("snapshot_binding") == "applied"
+
     def __len__(self) -> int:
         return self.rows
 

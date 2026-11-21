@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use gtv_core::{Absence, Freshness, KnowledgeClock};
-use gtv_engine::{receipt_from_batches, GtvContext};
+use gtv_engine::{receipt_from_batches, GtvContext, QueryBinding};
 
 fn seed(ctx: &GtvContext) {
     let schema = Arc::new(Schema::new(vec![
@@ -79,12 +79,14 @@ async fn empty_result_behind_the_watermark_is_not_a_proof() {
     // The graph was refreshed at 90; the report is being asked from 150.
     ctx.set_freshness(freshness(90));
 
+    // `.applied()` because this test is about the watermark, not about whether
+    // anybody enforced the business time: a declared point would cap the result
+    // at `Incomplete` and there would be no absence to classify.
     let outcome = ctx
-        .sql_with_receipt(
+        .sql_with_receipt_binding(
             "q-2",
             "SELECT * FROM transfers WHERE account_id = 999",
-            Some(150),
-            None,
+            QueryBinding::at(150).applied(),
             &[],
         )
         .await
@@ -141,11 +143,10 @@ async fn absence_below_the_retention_floor_fails_instead_of_shipping() {
     // files that might have held the rows are gone — so the statement fails
     // rather than returning an empty result that reads as "no such transfer".
     let err = ctx
-        .sql_with_receipt(
+        .sql_with_receipt_binding(
             "q-5",
             "SELECT * FROM transfers WHERE account_id = 999",
-            Some(50),
-            None,
+            QueryBinding::at(50).applied(),
             &[],
         )
         .await

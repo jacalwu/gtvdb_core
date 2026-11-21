@@ -37,8 +37,9 @@ pub enum GtvError {
         observed: u64,
     },
 
-    /// A candidate set built for one snapshot was handed to another.
-    #[error("snapshot mismatch: selection was built for {expected}, operand is {got}")]
+    /// A candidate set built for one snapshot was handed to another — or a
+    /// client pinned a snapshot this context is not serving.
+    #[error("snapshot mismatch: expected {expected}, got {got}")]
     SnapshotMismatch { expected: u64, got: u64 },
 
     /// A candidate set/index covers a different number of rows than expected.

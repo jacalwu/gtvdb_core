@@ -8,7 +8,9 @@
 //! *crosses a process boundary* and survives a review six months later:
 //!
 //! * what was asked (`query_id`, `plan_hash`),
-//! * against which state (`snapshot_id`, `as_of`),
+//! * against which state (`snapshot_id`, `as_of`) — and who enforced that state
+//!   ([`PointBinding`]), because a request the engine never applied is not
+//!   evidence about the time point it names,
 //! * what came back (`rows`, `tri_state`),
 //! * why it is partial (`incomplete`),
 //! * and which physical rows back each edge (`EdgeRef`).
@@ -23,9 +25,10 @@
 //!   receipt can ride along with the result instead of in an out-of-band
 //!   channel that clients forget to read;
 //! * **honest** — [`QueryReceipt::validate`] rejects a receipt that claims
-//!   `Found`/`NoMatch` while carrying an incomplete reason, and rejects
-//!   `Incomplete` without one. Absence of rows must never be reported as proof
-//!   of absence (the engine's R2 rule).
+//!   `Found`/`NoMatch` while carrying an incomplete reason, rejects
+//!   `Incomplete` without one, and rejects a conclusive result at a time point
+//!   that was only declared and never enforced. Absence of rows must never be
+//!   reported as proof of absence (the engine's R2 rule).
 //!
 //! # Evidence, not explanations
 //!
@@ -421,6 +424,10 @@ pub enum IncompleteReason {
     Deadline,
     Cancelled,
     Limit,
+    /// A time point was requested but nothing enforced it, so the rows cannot
+    /// be read as an answer about that point. Distinct from `Limit`: the search
+    /// finished, the *question* was not the one that ran.
+    TimePointNotApplied,
 }
 
 impl IncompleteReason {
@@ -435,6 +442,7 @@ impl IncompleteReason {
             IncompleteReason::Deadline => "deadline",
             IncompleteReason::Cancelled => "cancelled",
             IncompleteReason::Limit => "limit",
+            IncompleteReason::TimePointNotApplied => "time_point_not_applied",
         }
     }
 }
@@ -747,6 +755,53 @@ impl fmt::Display for Absence {
     }
 }
 
+/// Whether a requested time point was actually honoured, or only recorded.
+///
+/// A receipt names the state it was computed against (`as_of`, `snapshot_id`).
+/// That claim has two very different provenances, and conflating them is how a
+/// receipt becomes misleading:
+///
+/// * [`PointBinding::Applied`] — something enforced the point. The engine
+///   filtered by it, or the requested snapshot was verified to be the one the
+///   store is serving. The answer below *is* about that point.
+/// * [`PointBinding::Declared`] — the caller asked for the point and the
+///   receipt kept the request, but nothing made the query answer for it. The
+///   rows may come from anywhere (`head`), so the receipt must not be read as
+///   evidence about that point.
+///
+/// `Declared` therefore cannot coexist with a conclusive tri-state (see
+/// [`QueryReceipt::validate`]). Without this distinction a client could ask for
+/// 14:00, run a statement with no time predicate, and receive rows stamped
+/// `as_of: 14:00` — a receipt that testifies to something nobody checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointBinding {
+    /// The point was enforced before the query ran.
+    Applied,
+    /// The point was recorded because it was requested; nothing enforced it.
+    Declared,
+}
+
+impl PointBinding {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Declared => "declared",
+        }
+    }
+
+    /// True when the receipt may be treated as evidence about the point.
+    pub const fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+impl fmt::Display for PointBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What a query did, in a form that can be re-checked later.
 ///
 /// Build with [`QueryReceipt::new`] then chain the `with_*` setters; call
@@ -759,6 +814,15 @@ pub struct QueryReceipt {
     pub query_id: String,
     pub snapshot_id: Option<u64>,
     pub as_of: Option<i64>,
+    /// Provenance of `snapshot_id`. `Some` exactly when `snapshot_id` is, and
+    /// required by [`Self::validate`] once a snapshot is named.
+    #[serde(default)]
+    pub snapshot_binding: Option<PointBinding>,
+    /// Provenance of `as_of`. `Some` exactly when `as_of` is, for the same
+    /// reason: naming a time point without saying who enforced it is the hole
+    /// this field closes.
+    #[serde(default)]
+    pub as_of_binding: Option<PointBinding>,
     pub plan_hash: Option<String>,
     pub tri_state: TriState,
     pub incomplete: Option<Incomplete>,
@@ -769,6 +833,7 @@ pub struct QueryReceipt {
     /// Knowledge watermark this result was computed from, when the caller could
     /// supply one. Absent means "unknown", which callers must not read as
     /// "fresh": an unproven watermark is not a zero lag.
+    #[serde(default)]
     pub freshness: Option<Freshness>,
 }
 
@@ -780,6 +845,8 @@ impl QueryReceipt {
             query_id: query_id.into(),
             snapshot_id: None,
             as_of: None,
+            snapshot_binding: None,
+            as_of_binding: None,
             plan_hash: None,
             tri_state,
             incomplete: None,
@@ -807,14 +874,53 @@ impl QueryReceipt {
         receipt
     }
 
+    /// Record a snapshot the caller asked for, **without** claiming it was
+    /// checked. Sets the binding to [`PointBinding::Declared`], which makes a
+    /// conclusive tri-state invalid: use [`Self::with_snapshot_verified`] once
+    /// the id has been compared against the store's live snapshot.
     pub fn with_snapshot(mut self, snapshot_id: u64) -> Self {
         self.snapshot_id = Some(snapshot_id);
+        self.snapshot_binding = Some(PointBinding::Declared);
         self
     }
 
+    /// Record a snapshot that was verified against what the store is serving.
+    pub fn with_snapshot_verified(mut self, snapshot_id: u64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self.snapshot_binding = Some(PointBinding::Applied);
+        self
+    }
+
+    /// Record a business time the caller asked for, **without** claiming the
+    /// query answered for it. See [`Self::with_snapshot`] for why that must not
+    /// be assumed: most statements have no time predicate at all.
     pub fn with_as_of(mut self, as_of: i64) -> Self {
         self.as_of = Some(as_of);
+        self.as_of_binding = Some(PointBinding::Declared);
         self
+    }
+
+    /// Record a business time the engine actually enforced.
+    pub fn with_as_of_applied(mut self, as_of: i64) -> Self {
+        self.as_of = Some(as_of);
+        self.as_of_binding = Some(PointBinding::Applied);
+        self
+    }
+
+    /// Whether the result may be read as evidence about `as_of`.
+    pub fn as_of_applied(&self) -> bool {
+        matches!(self.as_of_binding, Some(PointBinding::Applied))
+    }
+
+    /// Whether the result may be read as evidence about `snapshot_id`.
+    pub fn snapshot_verified(&self) -> bool {
+        matches!(self.snapshot_binding, Some(PointBinding::Applied))
+    }
+
+    /// True when a time point was named but nothing enforced it.
+    pub fn has_declared_point(&self) -> bool {
+        matches!(self.as_of_binding, Some(PointBinding::Declared))
+            || matches!(self.snapshot_binding, Some(PointBinding::Declared))
     }
 
     pub fn with_plan_hash(mut self, plan_hash: impl Into<String>) -> Self {
@@ -859,6 +965,11 @@ impl QueryReceipt {
     /// capped, so callers can use this unconditionally instead of guarding it.
     pub fn absence_at(&self, requested_k: i64, business_t: Option<i64>) -> Absence {
         if self.tri_state != TriState::NoMatch || !self.is_complete() {
+            return Absence::NotApplicable;
+        }
+        // An empty result under a declared `as_of` says nothing about that
+        // time: the rows it would have matched were never filtered by it.
+        if matches!(self.as_of_binding, Some(PointBinding::Declared)) {
             return Absence::NotApplicable;
         }
         let Some(freshness) = self.freshness else {
@@ -906,9 +1017,10 @@ impl QueryReceipt {
 
     /// Check the invariants a receipt must satisfy before it leaves the process.
     ///
-    /// Rejects the two failure modes that would make the receipt misleading:
-    /// a partial result presented as conclusive, and an inconclusive result
-    /// with no explanation.
+    /// Rejects the three failure modes that would make the receipt misleading:
+    /// a partial result presented as conclusive, an inconclusive result with no
+    /// explanation, and a named time point that nothing enforced presented as
+    /// if it had been.
     pub fn validate(&self) -> Result<()> {
         if !is_supported_version(self.protocol_version) {
             return Err(GtvError::InvalidArgument(format!(
@@ -934,6 +1046,15 @@ impl QueryReceipt {
             }
             _ => {}
         }
+        // Naming a time point is a claim about provenance, so it has to say who
+        // enforced it. These two checks are what stop "the client asked for
+        // 14:00" from being filed as "we answered for 14:00".
+        self.check_binding("as_of", self.as_of.is_some(), self.as_of_binding)?;
+        self.check_binding(
+            "snapshot_id",
+            self.snapshot_id.is_some(),
+            self.snapshot_binding,
+        )?;
         if let Some(freshness) = &self.freshness {
             freshness.validate()?;
             // A `NoMatch` below the retention floor is not an answer: the files
@@ -944,13 +1065,41 @@ impl QueryReceipt {
                 if let (Some(as_of), Some(floor)) = (self.as_of, freshness.history_floor) {
                     if as_of < floor {
                         return Err(GtvError::InvalidArgument(format!(
-                            "NoMatch at as_of {as_of} is below the GC floor {floor};                              absence there is unanswerable, not proven"
+                            "NoMatch at as_of {as_of} is below the GC floor {floor}; \
+                             absence there is unanswerable, not proven"
                         )));
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// A time point may be named only together with its binding, and a merely
+    /// declared one may not accompany a conclusive result.
+    fn check_binding(
+        &self,
+        name: &str,
+        present: bool,
+        binding: Option<PointBinding>,
+    ) -> Result<()> {
+        match (present, binding) {
+            (false, None) => Ok(()),
+            (true, None) => Err(GtvError::InvalidArgument(format!(
+                "{name} is recorded without a binding; say whether it was applied"
+            ))),
+            (false, Some(_)) => Err(GtvError::InvalidArgument(format!(
+                "{name} binding is set but {name} is absent"
+            ))),
+            (true, Some(PointBinding::Declared)) if self.tri_state != TriState::Incomplete => {
+                Err(GtvError::InvalidArgument(format!(
+                    "conclusive result at a merely declared {name}; \
+                     a time point nothing enforced cannot be answered conclusively"
+                )))
+            }
+            (true, Some(PointBinding::Applied)) => Ok(()),
+            (true, Some(PointBinding::Declared)) => Ok(()),
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -989,8 +1138,20 @@ impl QueryReceipt {
         if let Some(id) = self.snapshot_id {
             meta.insert(format!("{RECEIPT_METADATA_PREFIX}snapshot_id"), id.to_string());
         }
+        if let Some(binding) = self.snapshot_binding {
+            meta.insert(
+                format!("{RECEIPT_METADATA_PREFIX}snapshot_binding"),
+                binding.as_str().to_string(),
+            );
+        }
         if let Some(as_of) = self.as_of {
             meta.insert(format!("{RECEIPT_METADATA_PREFIX}as_of"), as_of.to_string());
+        }
+        if let Some(binding) = self.as_of_binding {
+            meta.insert(
+                format!("{RECEIPT_METADATA_PREFIX}as_of_binding"),
+                binding.as_str().to_string(),
+            );
         }
         if let Some(reason) = &self.incomplete {
             meta.insert(

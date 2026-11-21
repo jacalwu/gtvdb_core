@@ -46,17 +46,36 @@ def _optional(request: QueryRequest, field: str) -> Optional[int]:
     return getattr(request, field) if request.HasField(field) else None
 
 
-def _receipt(request: QueryRequest, tri_state: str) -> dict:
+def _receipt(request: QueryRequest, rows: int) -> dict:
+    """A receipt shaped like the engine's, including the time-point binding.
+
+    The real engine caps the tri-state at `incomplete` when an `as_of` or
+    `snapshot_id` was requested but not enforced. Mirroring that here is the
+    point of the fake: a driver tested only against conclusive receipts would
+    pass while mis-reporting every pinned query.
+    """
+    as_of = _optional(request, "as_of")
+    snapshot_id = _optional(request, "snapshot_id")
+    declared = as_of is not None or snapshot_id is not None
+
+    tri_state = "no_match" if rows == 0 else "found"
+    incomplete = None
+    if declared:
+        tri_state = "incomplete"
+        incomplete = {"reason": "time_point_not_applied"}
+
     return {
         "protocol_version": 1,
         "engine_version": "fake",
         "query_id": request.request_id or "anon",
-        "snapshot_id": _optional(request, "snapshot_id"),
-        "as_of": _optional(request, "as_of"),
+        "snapshot_id": snapshot_id,
+        "as_of": as_of,
+        "snapshot_binding": "declared" if snapshot_id is not None else None,
+        "as_of_binding": "declared" if as_of is not None else None,
         "plan_hash": "0" * 16,
         "tri_state": tri_state,
-        "incomplete": None,
-        "stats": {"rows": 2},
+        "incomplete": incomplete,
+        "stats": {"rows": rows},
         "freshness": {
             "as_known_at": 1_700_000_000_000_000_000,
             "clock": "segment_system_ts",
@@ -121,8 +140,7 @@ class V1Server(_Base):
                 receipt_json="",
             )
         table = self._table(request.sql)
-        empty = table.num_rows == 0
-        receipt = _receipt(request, "no_match" if empty else "found")
+        receipt = _receipt(request, table.num_rows)
         table = table.replace_schema_metadata(
             {b"gtv.receipt.json": json.dumps(receipt).encode()}
         )
@@ -131,7 +149,10 @@ class V1Server(_Base):
             error="",
             protocol_version=1,
             code=ErrorCode.OK,
-            tri_state=TriState.NO_MATCH if empty else TriState.FOUND,
+            tri_state={
+                "found": TriState.FOUND,
+                "no_match": TriState.NO_MATCH,
+            }.get(receipt["tri_state"], TriState.INCOMPLETE),
             receipt_json=json.dumps(receipt),
         )
 

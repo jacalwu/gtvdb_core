@@ -70,6 +70,7 @@ pub use motif::{
     MotifOutcome,
 };
 pub use receipt::{
-    attach_receipt, count_rows, receipt_for_statement, receipt_from_batches, QueryOutcome,
+    attach_receipt, count_rows, receipt_for_statement, receipt_from_batches, QueryBinding,
+    QueryOutcome,
 };
 pub use registry::{AsofResource, HftRegistry, PitResource, ResourceRegistry};
