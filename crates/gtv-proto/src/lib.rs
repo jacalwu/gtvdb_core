@@ -480,7 +480,17 @@ impl QueryService for QueryServiceImpl {
         request: tonic::Request<QueryRequest>,
     ) -> Result<tonic::Response<QueryResponse>, tonic::Status> {
         let req = request.into_inner();
-        let query = RemoteQuery::new(req.sql, req.request_id);
+        // v0 has no `request_id` slot, but a receipt without an id cannot be
+        // traced — `QueryReceipt::validate` refuses it, and a handler backed by
+        // the real engine therefore rejects every v0 call. Derive a stable id
+        // from the statement instead, so a replay of the same SQL still compares
+        // equal and the client is not required to upgrade to get an answer.
+        let request_id = if req.request_id.is_empty() {
+            legacy_query_id(&req.sql)
+        } else {
+            req.request_id
+        };
+        let query = RemoteQuery::new(req.sql, request_id);
         match (self.handler)(query).await {
             Ok((batches, receipt)) => {
                 // v0 has no receipt field. The receipt is still stamped into
@@ -568,6 +578,21 @@ pub async fn bind(
             .await;
     });
     Ok((local, handle))
+}
+
+/// A stable id for a v0 request, which carries no `request_id` of its own.
+///
+/// FNV-1a rather than a real hash: this only has to be deterministic and stable
+/// across processes — it names a query in a receipt, it does not defend against
+/// anything. Adding `blake3` here would put a cryptographic dependency in the
+/// wire crate for a label.
+fn legacy_query_id(sql: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in sql.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("v0-{hash:016x}")
 }
 
 /// Minimal stderr trace so the crate does not depend on a logging facade.

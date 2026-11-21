@@ -209,6 +209,81 @@ async fn v0_client_still_works_against_a_v1_server() {
     handle.abort();
 }
 
+/// The v0 wire has no `request_id`, and a receipt without one is invalid — so a
+/// handler that validates (the real engine does) would reject every v0 call.
+/// The service must derive an id rather than pass the empty string through.
+#[tokio::test]
+async fn a_v0_request_without_an_id_still_gets_a_traceable_receipt() {
+    let (addr, handle) = bind(
+        "127.0.0.1:0".parse().unwrap(),
+        gtv_proto::QueryServiceImpl::from_fn(|q| async move {
+            assert!(
+                !q.request_id.is_empty(),
+                "the service must derive an id for a v0 request"
+            );
+            let receipt = QueryReceipt::found(q.request_id.clone());
+            receipt.validate().expect("derived id must validate");
+            Ok((vec![batch(&[1])], receipt))
+        })
+        .into_handler(),
+    )
+    .await
+    .unwrap();
+    let addr = addr.to_string();
+
+    // `to_legacy_request` deliberately drops everything but `sql`.
+    let mut client = QueryServiceClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let resp = client
+        .execute(RemoteQuery::new("SELECT n", "").to_legacy_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.error, "", "v0 must not fail for lack of a request id");
+
+    let outcome = decode_response(resp).expect("decode");
+    let receipt = outcome.receipt.expect("receipt travels in Arrow metadata");
+    assert!(
+        receipt.query_id.starts_with("v0-"),
+        "derived ids are recognisable: {}",
+        receipt.query_id
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_derived_v0_id_is_stable_across_calls() {
+    let ids = [
+        gtv_proto::QueryServiceImpl::from_fn(|q| async move {
+            Ok::<_, WireError>((vec![batch(&[1])], QueryReceipt::found(q.request_id)))
+        }),
+        gtv_proto::QueryServiceImpl::from_fn(|q| async move {
+            Ok::<_, WireError>((vec![batch(&[1])], QueryReceipt::found(q.request_id)))
+        }),
+    ];
+    // Same SQL through two independent services must yield the same id, so a
+    // replay comparison is not fooled by a random suffix.
+    let mut seen = Vec::new();
+    for svc in ids {
+        let (addr, handle) = bind("127.0.0.1:0".parse().unwrap(), svc.into_handler())
+            .await
+            .unwrap();
+        let mut client = QueryServiceClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let resp = client
+            .execute(RemoteQuery::new("SELECT n", "").to_legacy_request())
+            .await
+            .unwrap()
+            .into_inner();
+        let outcome = decode_response(resp).unwrap();
+        seen.push(outcome.receipt.unwrap().query_id);
+        handle.abort();
+    }
+    assert_eq!(seen[0], seen[1]);
+}
+
 #[tokio::test]
 async fn execute_query_refuses_a_legacy_version() {
     let (addr, handle) = start_server().await;
