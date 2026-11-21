@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from . import _version
 from .client import DEFAULT_ADDR, GtvError, Result, Session
 from .connection import Connection
 from .cursor import (
@@ -56,7 +57,9 @@ from .errors import (
     Warning,
 )
 
-__version__ = "0.1.0"
+#: Single-sourced from `_version.py` so `pyproject.toml` and the runtime can
+#: never disagree about what was published.
+__version__ = _version.__version__
 
 # --- PEP 249 module attributes ---------------------------------------------
 apilevel = "2.0"

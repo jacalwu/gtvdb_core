@@ -75,6 +75,7 @@
 - [ ] `docs/sql-pgq-conformance.md` 与 `gtv-pgq` 测试一致（新增特性先加表行）；
 - [ ] 本文件 §5 的协议版本与 `gtv-proto` 常量一致；
 - [ ] 改了 `gtvquery.proto` 就跑 `python python/gen_stubs.py`（CI 用 `--check` 比对，防止 Python stub 与线协议漂移）；
+- [ ] 发 Python 包前跑 `python python/check_release.py`（许可证副本、stub 新鲜度、单测、`twine check`、产物内容、PyPI 上版本是否已存在）；
 - [ ] 变更日志已写；破坏性改动已按 §4 走废弃；
 - [ ] 未在 core 引入领域名词或 quantum 依赖（`core-boundary` 与文档扫描）。
 
@@ -85,3 +86,4 @@
 | 0.1.0 | 2026-11-20 | 首次定义：回执/证据契约、协议 v1、SQL/PGQ L1；M8/M9 反转为在范围 |
 | 未发布 | 2026-11-21 | 回执新增 `freshness`（业务时间/认知时间分离，见 `docs/freshness-contract.md`）；新增 `Freshness` / `KnowledgeClock` / `FreshnessVerdict` / `Absence`；`SegmentStore::freshness()`；`GtvContext::{set_freshness,set_freshness_from_store,clear_freshness,freshness}`。JSON 与 Arrow metadata 各新增可选键（`as_known_at` / `knowledge_clock` / `history_floor`），**协议版本仍为 v1** |
 | 未发布 | 2026-11-21 | 新增可安装的 Python 驱动 `python/`（包名 `gtvdb`，DB-API 2.0 + 协议 v1 + v0 回退）与 CI 可用的 stub 一致性检查；`gtv-engine` 仅新增 dev-dependency `gtv-proto`（供 `examples/serve_demo.rs`）；`serve_demo` 按 DataFusion 错误变体映射 `INVALID_ARGUMENT`（见 §8 注） |
+| 未发布 | 2026-11-21 | Python 驱动进入可发布状态：版本单一来源（`gtvdb/_version.py`，`pyproject.toml` 用 `dynamic`/`attr` 读回）；许可证改为 SPDX 表达式 `Apache-2.0` + PEP 639 `license-files`（`python/LICENSE.md` 为仓库根文件的逐字节副本，PEP 639 不允许 `..`）；新增 `py.typed`、`MANIFEST.in`、`check_release.py` 预检；`.github/workflows/publish-python.yml` 以 `py-v*` 标签 + OIDC 发布。**驱动版本与 crate 版本解耦**：协议兼容性靠 `Negotiate` 协商，不靠版本号推断 |

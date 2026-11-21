@@ -1,22 +1,46 @@
 [build-system]
-requires = ["setuptools>=68"]
+# PEP 639 (`license = "<SPDX>"` + `license-files`) needs setuptools >= 77.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gtvdb"
-version = "0.1.0"
+dynamic = ["version"]
 description = "DB-API 2.0 driver for the gtv temporal-graph engine"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
+# Must live inside the project root: PEP 639 forbids `..` in these globs, so
+# `python/LICENSE.md` is a byte-for-byte copy of the repository's `LICENSE.md`.
+# `python/check_release.py` fails the build if the two ever diverge.
+license-files = ["LICENSE.md"]
 authors = [{ name = "gtvdb" }]
-keywords = ["database", "temporal", "graph", "arrow", "dbapi", "gtv"]
+keywords = [
+    "database",
+    "dbapi",
+    "driver",
+    "temporal",
+    "bitemporal",
+    "graph",
+    "arrow",
+    "grpc",
+    "gtv",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
     "Topic :: Database",
     "Topic :: Database :: Front-Ends",
+    "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 # Pure Python over gRPC: no build step, no platform wheels, no compiler.
 dependencies = [
@@ -29,12 +53,22 @@ pandas = ["pandas>=2.0"]
 polars = ["polars>=0.20"]
 
 [project.urls]
+Homepage = "https://github.com/jacalwu/gtvdb_core"
 Documentation = "https://github.com/jacalwu/gtvdb_core/blob/main/docs/user-guide.md"
+Changelog = "https://github.com/jacalwu/gtvdb_core/blob/main/docs/api-compat.md"
+Source = "https://github.com/jacalwu/gtvdb_core/tree/main/python"
+Issues = "https://github.com/jacalwu/gtvdb_core/issues"
 
 [tool.setuptools]
-# `gtvdb._stubs` is generated from crates/gtv-proto/proto/gtvquery.proto by
+# `gtvdb._stubs` is generated from `crates/gtv-proto/proto/gtvquery.proto` by
 # `python/gen_stubs.py`; it ships with the package so users need no protoc.
 packages = ["gtvdb", "gtvdb._stubs"]
 
+[tool.setuptools.dynamic]
+# `attr` is resolved by parsing the module, not importing it — so building the
+# package does not require grpcio. Keep `gtvdb/_version.py` import-free.
+version = { attr = "gtvdb._version.__version__" }
+
 [tool.setuptools.package-data]
+"gtvdb" = ["py.typed"]
 "gtvdb._stubs" = ["*.pyi"]

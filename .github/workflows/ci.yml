@@ -143,3 +143,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: All tests including doctests
         run: cargo test --workspace --no-fail-fast
+
+  # The `gtvdb` driver in python/ is a shipping artefact: users `pip install` it.
+  # Its two failure modes are a stub that drifted from the .proto and a wheel
+  # that cannot be installed — both are cheap to catch here.
+  python-driver:
+    name: Python driver (py ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the ceiling of the declared `requires-python`.
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install runtime and test deps
+        run: python -m pip install --upgrade pip "grpcio>=1.60" "pyarrow>=14" pandas
+      - name: Stubs match crates/gtv-proto/proto/gtvquery.proto
+        run: python python/gen_stubs.py --check
+      - name: PEP 249 contract and wire round-trip
+        run: python -m unittest discover -s python/tests -t python/tests
+
+  python-package:
+    name: Python packaging gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tooling and runtime deps
+        run: |
+          python -m pip install --upgrade pip build twine \
+            "grpcio>=1.60" "pyarrow>=14" pandas
+      # --offline: a pull request must not depend on pypi.org being reachable,
+      # and must not query whether a version exists (it may already, by design).
+      - name: Release pre-flight (build, twine check, artefact contents)
+        run: python python/check_release.py --offline
+

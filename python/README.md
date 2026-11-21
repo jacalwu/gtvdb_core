@@ -7,6 +7,10 @@ nothing to compile, no platform wheel, no `protoc` on the user's machine.
 pip install gtvdb            # or: pip install gtvdb[pandas]
 ```
 
+Requires Python 3.9+ and a reachable engine (`gtv-server`, or
+`cargo run -p gtv-engine --example serve_demo` from the core repo). The driver
+is a client only: it does not embed the engine, and it cannot create one.
+
 ```python
 import gtvdb
 
@@ -71,3 +75,18 @@ python python/gen_stubs.py              # regenerate gtvdb/_stubs from the .prot
 python python/gen_stubs.py --check      # CI: fail if stubs drift
 python -m pytest python/tests           # unit tests, no server needed
 ```
+
+## Releasing
+
+The version lives in exactly one place, `gtvdb/_version.py`; `pyproject.toml`
+reads it back rather than repeating it. Before an upload:
+
+```bash
+python python/check_release.py          # licence copy, stub freshness, tests,
+                                        # metadata, artefact contents, name on PyPI
+```
+
+Pushing a `py-v*` tag publishes through GitHub Actions with PyPI trusted
+publishing, so no token is stored anywhere. The full procedure — including the
+first-release bootstrap, TestPyPI rehearsal, and why a version number can never
+be reused — is in [PUBLISHING.md](PUBLISHING.md).

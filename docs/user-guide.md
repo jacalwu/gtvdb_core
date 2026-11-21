@@ -12,7 +12,7 @@
 |:--|:--|
 | 5 分钟内跑出第一条查询 | §2 |
 | 知道该用 REPL 还是写 Rust | §1 |
-| 用 Python 跑（没有 `pip install`，但有客户端） | §12 |
+| 用 Python 跑（`pip install gtvdb` 装的是驱动，不含引擎） | §12 |
 | 按时间点查「这个节点当时连到谁」 | §3 |
 | 找环 / 找 pattern（AML 洗钱环、担保链） | §3 |
 | 做向量检索、按标签过滤 | §4 |
@@ -608,12 +608,12 @@ gtv> SELECT step, gate, prefix_probability
 
 ## 12. 用 Python 跑同一套查询
 
-**能，但不是 `pip install gtvdb`。** 本仓没有任何 PyO3 / maturin 代码（`grep -rn pyo3 --include=Cargo.toml .` 为空），ROADMAP §4 把 M9（pyo3）判为 🗑 下架。今天有两条可用的路：**Python 当客户端驱动 `gtv` 子进程**（本地、零依赖），或**走 gRPC 协议 v1 连一个跑着的服务**（跨机器、带回执）。两条路都不需要编译 Python 扩展。
+**能，而且能 `pip install gtvdb`——但装的是驱动，不是引擎。** 本仓没有任何 PyO3 / maturin 代码（`grep -rn pyo3 --include=Cargo.toml .` 为空），ROADMAP §4 把 M9（pyo3）判为 🗑 下架，所以 Python 侧永远不编译扩展：`gtvdb` 是纯 Python 的 DB-API 2.0 客户端，引擎仍在别处跑。今天有两条可用的路：**Python 当客户端驱动 `gtv` 子进程**（本地、零依赖），或**走 gRPC 协议 v1 连一个跑着的服务**（跨机器、带回执）。
 
 | 方式 | 今天能用 | 能力 | 代价 |
 |:--|:--|:--|:--|
 | **A. 客户端驱动 REPL**（§12.1–12.5） | ✅ | REPL 的全部能力（SQL + 12 条 `.` 指令） | 继承 REPL 的边界（§12.5）；每进程 335 ms 启动 |
-| **B. gRPC 协议 v1**（§12.6） | ✅ | DB-API 2.0（`pip install ./python`），远程 SQL、`as_of` / `snapshot_id` 固定、`QueryReceipt`（含 tri-state 与 freshness） | 需先起服务；服务端目前只注册演示表；只读、无流式、无服务端分页 |
+| **B. gRPC 协议 v1**（§12.6） | ✅ | DB-API 2.0（`pip install gtvdb`），远程 SQL、`as_of` / `snapshot_id` 固定、`QueryReceipt`（含 tri-state 与 freshness） | 需先起服务；服务端目前只注册演示表；只读、无流式、无服务端分页 |
 | C. 原生绑定（pyo3 / cdylib） | ❌ 需立项 | 可绕开 REPL 边界（图遍历、建索引） | 新 crate + 跨平台 wheel + 错误模型映射；M9 已下架 |
 
 ### 12.1 三十秒上手
@@ -710,9 +710,11 @@ Python 走 REPL，就等于站在手册 §1 的轨道 A 上，**不能**做的�
 跨机器、或想让答案带"证据"时，走 gRPC，不走子进程。协议定义在 `crates/gtv-proto/proto/gtvquery.proto`；Python 侧是一个**可安装的驱动** `python/`（PyPI 包名 `gtvdb`），对外是 DB-API 2.0，和 `psycopg2` / `pymysql` 一个用法。
 
 ```bash
-pip install ./python          # 本地安装；发布后即 pip install gtvdb
+pip install gtvdb             # 尚未发布时：pip install ./python（在 gtvdb_core 根下）
 python -c "import gtvdb; print(gtvdb.apilevel, gtvdb.paramstyle)"
 ```
+
+注意装的是**驱动**：`import gtvdb` 不会带起引擎，`connect()` 指向一个已在跑的服务。发版流程（TestPyPI 预演、trusted publishing、版本号不可重用）见 `python/PUBLISHING.md`。
 
 纯 Python 实现（只有 `grpcio` + `pyarrow` 两个依赖），没有编译产物、没有平台 wheel、用户机器上不需要 `protoc`。三层结构，按需要往下取：
 
@@ -821,4 +823,4 @@ b = pinned.query("SELECT * FROM numbers")
 | 看段格式 | [`storage-mmap-design.md`](storage-mmap-design.md) |
 | 看 GPU 边界 | [`acceleration.md`](acceleration.md) |
 | 看性能基线怎么量 | `crates/gtv-engine/examples/bench_m6_gate.rs` 等基准（`--release`） |
-| 用 Python 调 | 本节 §12：本地子进程 `examples/python/gtv_repl.py`，远程 `pip install ./python` + `gtvdb.connect()`（§12.6） |
+| 用 Python 调 | 本节 §12：本地子进程 `examples/python/gtv_repl.py`，远程 `pip install gtvdb` + `gtvdb.connect()`（§12.6） |

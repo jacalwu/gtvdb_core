@@ -1,0 +1,6 @@
+# setuptools' default sdist heuristics pick up `tests/test*.py` but skip
+# `tests/_fake_server.py`, which the tests import — so the sdist's suite would
+# error on collection. Name the files explicitly instead of relying on globs.
+include README.md
+recursive-include tests *.py
+prune tests/__pycache__
