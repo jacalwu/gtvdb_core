@@ -116,6 +116,35 @@ A platform missing from a release is worse than a failed release: pip there
 silently resolves an **older, remote-only** version instead of reporting that
 the new one has no wheel for it.
 
+## The install check is part of the release
+
+`check_release.py` validates the *build*; `check_wheel.py` validates the
+*installation*. Both must pass, because they catch different classes of bug:
+
+```bash
+python python/check_wheel.py --fresh-venv
+```
+
+The flag matters. Without it the wheel is installed with `--no-deps` beside
+this interpreter's site-packages, so anything already installed locally masks a
+missing `Requires-Dist`. That is exactly how `protobuf` escaped: the committed
+gRPC stubs import `google.protobuf`, grpcio does not depend on it, and every
+machine that built the wheel happened to have it — while a clean install of
+`pygtvdb 0.1.x` fails on `import gtvdb`. Use `--fresh-venv` before an upload: it
+creates a virtualenv, installs the wheel with its declared dependencies, and
+queries through that interpreter.
+
+Two related constraints on metadata:
+
+* `protobuf>=7.35.1,<8` is not optional. The lower bound is the version stamped
+  into the committed stubs' `ValidateProtobufRuntimeVersion` call; an older
+  runtime refuses to import them. The upper bound stops a new major arriving
+  unreviewed.
+* A wheel without the compiled engine is a legitimate *remote-only* build and
+  can pass the metadata gate with `--allow-missing-engine`, but it must never be
+  published under the two-mode description. Only the three-platform matrix
+  produces releasable artefacts.
+
 ## Every release
 
 Two equivalent routes. The tag route is the one that ends with a CI-built
