@@ -189,7 +189,8 @@ jobs:
         # output byte-for-byte against the committed files, so a newer protoc
         # would fail the job for a reason that has nothing to do with the .proto.
         run: |
-          python -m pip install --upgrade pip "grpcio>=1.60" "pyarrow>=14" pandas
+          python -m pip install --upgrade pip wheel \
+            "grpcio>=1.60" "pyarrow>=14" pandas
           python -m pip install "grpcio-tools==1.85.3"
       - name: Stubs match crates/gtv-proto/proto/gtvquery.proto
         run: python python/gen_stubs.py --check
@@ -206,7 +207,7 @@ jobs:
           python-version: "3.12"
       - name: Install build tooling and runtime deps
         run: |
-          python -m pip install --upgrade pip build twine \
+          python -m pip install --upgrade pip build twine wheel \
             "grpcio>=1.60" "pyarrow>=14" pandas
       # --offline: a pull request must not depend on pypi.org being reachable,
       # and must not query whether a version exists (it may already, by design).

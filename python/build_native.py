@@ -29,6 +29,7 @@ block. Setting ``PATH``/``INCLUDE``/``LIB`` is all that batch file does anyway.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -268,6 +269,27 @@ def build(*, clean: bool) -> int:
 
 def build_wheel() -> int:
     """Build the platform wheel for the current interpreter."""
+    # The Linux branch invokes setup.py directly (see below), so it runs in this
+    # interpreter's environment rather than in a build-isolated one. setup.py
+    # subclasses `bdist_wheel`, which needs either setuptools >= 70.1 or the
+    # `wheel` package — and on a bare runner neither is guaranteed. Checking up
+    # front turns a traceback into an install instruction.
+    missing = []
+    if importlib.util.find_spec("wheel") is None:
+        try:
+            from setuptools.command.bdist_wheel import (  # noqa: F401
+                bdist_wheel as _probe,
+            )
+        except ImportError:
+            missing.append("wheel")
+    if missing:
+        print(
+            f"error: the wheel step needs {', '.join(missing)} installed in this "
+            "interpreter; run `python -m pip install wheel` and try again",
+            file=sys.stderr,
+        )
+        return 2
+
     if sys.platform.startswith("linux"):
         # PyPI rejects `linux_x86_64`; the tag must name the glibc floor the
         # wheel was built against. `python -m build` cannot pass this through.
