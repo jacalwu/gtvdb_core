@@ -58,11 +58,23 @@
 
 ## 6. 兼容矩阵
 
-| gtvdb_core | 协议 | Arrow | DataFusion | Rust MSRV | 备注 |
+Rust MSRV 不是单一数字：它由每个 crate 的依赖闭包决定，**并且必须与实际锁定的依赖版本一致**，而不是与编写代码时用的版本一致。下表是 `cargo metadata --format-version 1` 对 `Cargo.lock` 逐个 crate 求依赖闭包上界的结果（2026-11-23 核实）；每个 crate 的 `Cargo.toml` 现已写入对应 `rust-version`，`rust-toolchain.toml` 把开发环境钉在完整 workspace 的下界。
+
+| crate（组） | 真实 MSRV | 决定它的依赖 |
+|:--|:--|:--|
+| `gtv-core` / `gtv-array` / `gtv-index` / `gtv-delta` / `gtv-pattern` / `gtv-accelerator` / `gtv-params` / `gtv-pgq` | 1.85（workspace 基线） | `arrow 59.2`（MSRV 1.85）；`gtv-pgq` 自身更低，随基线 |
+| `gtv-storage` / `gtv-catalog` / `gtv-index-store` / `gtv-ingest` / `gtv-cli` | 1.85 声明 / 1.94 实编 | 声明继承基线；`gtv-cli` 经 `gtv-engine → datafusion 55` 实需 1.94 |
+| `gtv-proto` | 1.88 | `tonic 0.14`（MSRV 1.88） |
+| `gtv-engine` | 1.94 | `datafusion 55`（MSRV 1.94） |
+| `gtv-udf` | **1.95** | `wasmtime 48`（MSRV 1.95）—— **这是完整 workspace 的真实下界** |
+
+> **重要更正（2026-11-23）**：本表此前写「0.1.x = 1.82、下一版 = 1.89」。两个数字都不成立——1.82 是 `edition = 2021` 的默认值而非本项目测得的下界；1.89 只描述了 `std::fs::File::try_lock` 这一个 API，却被当成了整个 workspace 的 MSRV。实际上 1.93 连编译 `Cargo.lock` 都会被拒（`datafusion 55` 要 1.94、`wasmtime 48` 要 1.95），而 CI 用 `@stable` 永远拿最新版，所以从未暴露这个矛盾。现已用 `rust-toolchain.toml` 钉死 1.95，CI 显式校验。数据目录 `try_lock` 的 1.89 事实仍成立，但它只是下界之一，不是上界。
+
+| gtvdb_core | 协议 | Arrow | DataFusion | 完整 workspace MSRV | 备注 |
 |:--|:--|:--|:--|:--|:--|
-| 0.1.x | v1 | 59 | 55 | 1.82 | 当前（回执无 `freshness`） |
-| 下一版（未发布） | v1 | 59 | 55 | **1.89** | 回执含 `freshness`；协议仍 v1，0.1 对端忽略新键即可。MSRV 由 `std::fs::File::{try_lock,try_lock_shared}`（1.89 稳定）决定，见 `docs/data-directory.md` |
-| 0.0.x | v0 | 59 | 55 | 1.82 | `Execute` only |
+| 0.1.x | v1 | 59 | 55 | **1.95** | 当前（回执无 `freshness`）；由 `gtv-udf → wasmtime 48` 决定 |
+| 下一版（未发布） | v1 | 59 | 55 | **1.95** | 回执含 `freshness`；协议仍 v1，0.1 对端忽略新键即可。1.89 的 `try_lock` 只是下界，不构成上界 |
+| 0.0.x | v0 | 59 | 55 | **1.95** | `Execute` only |
 
 扩展仓升级路径：改 `Cargo.toml` 里的 git rev → `cargo test` → 若编译失败，先看本文件 §3 是否命中破坏性改动，再决定是否同步改扩展代码。CI 的 `core-boundary` 继续阻止 core 依赖领域 crate。
 
@@ -70,6 +82,7 @@
 
 发布前逐项确认：
 
+- [ ] `rustc --version` 与 `rust-toolchain.toml` 的 `channel` 一致（当前 1.95.0），`Cargo.lock` 的依赖 MSRV 不超过它；
 - [ ] `cargo test -p gtv-core -p gtv-proto -p gtv-pgq` 全绿；
 - [ ] `cargo test -p gtv-engine --test p0_motif_bounded --test pgq_l1_end_to_end` 全绿；
 - [ ] `docs/sql-pgq-conformance.md` 与 `gtv-pgq` 测试一致（新增特性先加表行）；
@@ -83,6 +96,7 @@
 
 | 版本 | 日期 | 变更 |
 |:--|:--|:--|
+| 未发布 | 2026-11-23 | **MSRV 诚实化**：修正此前 §6 表中「0.1.x = 1.82 / 下一版 = 1.89」两处不成立声明。按 `cargo metadata` 对 `Cargo.lock` 求依赖闭包上界，逐 crate 写入 `rust-version`（基线 1.85 / `gtv-proto` 1.88 / `gtv-engine` 1.94 / `gtv-udf` 1.95）；新增 `rust-toolchain.toml` 钉 1.95.0（完整 workspace 下界，由 `wasmtime 48` 决定）；CI 从 `dtolnay/rust-toolchain@stable` 改为显式校验锁定版本。此前 1.93 下 `cargo test --workspace` 直接拒编，而 CI 的 `@stable` 掩盖了它。 |
 | 0.1.0 | 2026-11-20 | 首次定义：回执/证据契约、协议 v1、SQL/PGQ L1；M8/M9 反转为在范围 |
 | 未发布 | 2026-11-21 | 回执新增 `freshness`（业务时间/认知时间分离，见 `docs/freshness-contract.md`）；新增 `Freshness` / `KnowledgeClock` / `FreshnessVerdict` / `Absence`；`SegmentStore::freshness()`；`GtvContext::{set_freshness,set_freshness_from_store,clear_freshness,freshness}`。JSON 与 Arrow metadata 各新增可选键（`as_known_at` / `knowledge_clock` / `history_floor`），**协议版本仍为 v1** |
 | 未发布 | 2026-11-21 | 新增可安装的 Python 驱动 `python/`（包名 `gtvdb`，DB-API 2.0 + 协议 v1 + v0 回退）与 CI 可用的 stub 一致性检查；`gtv-engine` 仅新增 dev-dependency `gtv-proto`（供 `examples/serve_demo.rs`）；`serve_demo` 按 DataFusion 错误变体映射 `INVALID_ARGUMENT`（见 §8 注） |

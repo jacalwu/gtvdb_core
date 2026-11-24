@@ -3,6 +3,7 @@ name = "gtv-ingest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 # B3-1 streaming ingestion contract: event envelope, source adapters, offset
 # store, dedup, watermark / late policy, DLQ and a micro-batch pipeline.

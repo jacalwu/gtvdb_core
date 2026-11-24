@@ -10,6 +10,12 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+# Effective MSRV of the core crates on a Linux build, bounded by arrow 59 (1.85).
+# The FULL workspace needs 1.95 because gtv-udf -> wasmtime 48; that higher floor
+# is pinned in rust-toolchain.toml and documented per-crate in docs/api-compat.md.
+# Crates with a higher floor override this locally (gtv-proto 1.88, gtv-engine
+# 1.94, gtv-udf 1.95).
+rust-version = "1.85"
 
 [workspace.dependencies]
 arrow = { version = "59", features = ["prettyprint", "csv", "ipc"] }

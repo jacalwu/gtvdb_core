@@ -1,0 +1,12 @@
+# Single source of truth for the Rust toolchain used to build and test this
+# workspace. Without this file a fresh clone followed by `cargo test --workspace`
+# fails on any toolchain older than 1.95: Cargo.lock pins DataFusion 55 (MSRV
+# 1.94) and wasmtime 48 (MSRV 1.95, pulled in by gtv-udf).
+#
+# CI no longer uses `@stable`: a moving toolchain was the reason the documented
+# MSRV (1.82/1.89) could drift from reality without any job going red.
+# See docs/api-compat.md §6 for the per-crate MSRV breakdown.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
