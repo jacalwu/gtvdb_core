@@ -8,9 +8,19 @@ jobs that never build the extension.
 
 from __future__ import annotations
 
+import sys
 import unittest
+from pathlib import Path
 
-import gtvdb
+# The tests live one level below the package root and must run without an
+# editable install — which is exactly the CI case: the suite is run from a
+# checkout, and the wheel is not installed into the interpreter. Without this,
+# `import gtvdb` fails and the whole run dies before a single assertion.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import gtvdb  # noqa: E402
 
 
 class LocalDsnRecognition(unittest.TestCase):

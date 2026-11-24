@@ -221,7 +221,9 @@ python python/build_native.py --wheel    # engine + platform wheel
 python python/check_wheel.py             # install that wheel and query through it
 
 python python/gen_stubs.py --check       # fail if the gRPC stubs drifted
-python -m unittest discover -s python/tests -t python/tests
+
+# The suite runs from this directory, not from an installed package.
+cd python && python -m unittest discover -s tests -t tests
 ```
 
 `build_native.py` exists because the three ways this build fails are all

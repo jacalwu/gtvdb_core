@@ -194,7 +194,8 @@ jobs:
       - name: Stubs match crates/gtv-proto/proto/gtvquery.proto
         run: python python/gen_stubs.py --check
       - name: PEP 249 contract and wire round-trip
-        run: python -m unittest discover -s python/tests -t python/tests
+        working-directory: python
+        run: python -m unittest discover -s tests -t tests
 
   python-package:
     name: Python packaging gate
@@ -252,7 +253,8 @@ jobs:
       - name: Build the extension and the wheel
         run: python python/build_native.py --wheel
       - name: Full suite (remote, in-process, dispatch)
-        run: python -m unittest discover -s python/tests -t python/tests
+        working-directory: python
+        run: python -m unittest discover -s tests -t tests
       # A wheel that builds is not a wheel that works: this installs it into a
       # temp dir and queries through it from outside the source tree.
       - name: The wheel installs and answers a local query

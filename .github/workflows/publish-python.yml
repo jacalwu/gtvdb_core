@@ -80,8 +80,12 @@ jobs:
         run: python python/build_native.py --wheel
 
       # Never tag a release that has not passed the suite where it is shipped.
+      # `working-directory: python` is what makes `import gtvdb` resolve: the
+      # suite runs from a checkout, not from an installed distribution, and this
+      # is the same invocation `check_release.py` uses.
       - name: Full suite (remote, in-process, dispatch)
-        run: python -m unittest discover -s python/tests -t python/tests
+        working-directory: python
+        run: python -m unittest discover -s tests -t tests
 
       - name: The wheel installs and answers a local query
         run: python python/check_wheel.py
