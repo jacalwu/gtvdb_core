@@ -243,7 +243,12 @@ jobs:
           # with the lockfile or CI would silently reuse stale objects.
           workspaces: ". -> target"
       - name: Install test dependencies
-        run: python -m pip install --upgrade pip "pyarrow>=14"
+        # The suite is one file set: the in-process tests need pyarrow, the
+        # remote ones need grpcio (their fake server is Python), and the pandas
+        # interop test needs pandas. Installing only pyarrow makes the job fail
+        # in `test_dbapi` for a reason that looks unrelated to this job's name.
+        run: |
+          python -m pip install --upgrade pip "grpcio>=1.60" "pyarrow>=14" pandas
       # Same entry point a human runs locally: normalises the lld/sccache/MSVC
       # environment traps, builds, and drops the artefact into gtvdb/_local/.
       - name: Build the extension and the wheel
