@@ -251,7 +251,21 @@ jobs:
       # Same entry point a human runs locally: normalises the lld/sccache/MSVC
       # environment traps, builds, and drops the artefact into gtvdb/_local/.
       - name: Build the extension and the wheel
-        run: python python/build_native.py --wheel
+        shell: bash
+        run: |
+          set -o pipefail
+          python python/build_native.py --wheel 2>&1 | tee build.log
+
+      # Annotations are readable without the job log, which is what you need
+      # when a platform you cannot reproduce fails.
+      - name: Surface the first build errors
+        if: failure()
+        shell: bash
+        run: |
+          grep -nE "^(error|error\[)|error: |undefined symbol|ld: |clang: error|LINK : fatal|cannot find|No such file" \
+            build.log 2>/dev/null | head -12 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
       - name: Full suite (remote, in-process, dispatch)
         working-directory: python
         run: python -m unittest discover -s tests -t tests

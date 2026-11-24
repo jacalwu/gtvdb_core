@@ -76,8 +76,25 @@ jobs:
 
       # The same script a contributor runs, so a green release proves the
       # documented local command works on this platform.
+      # `tee` keeps the full log (the build takes minutes and the interesting
+      # line is usually the first error, not the last), and the step below turns
+      # those lines into annotations — which are readable without the job log.
       - name: Build the extension and the wheel
-        run: python python/build_native.py --wheel
+        shell: bash
+        run: |
+          set -o pipefail
+          python python/build_native.py --wheel 2>&1 | tee build.log
+
+      - name: Surface the first build errors
+        if: failure()
+        shell: bash
+        run: |
+          file=build.log
+          [ -f "$file" ] || file="$RUNNER_TEMP/build.log"
+          grep -nE "^(error|error\[)|error: |undefined symbol|ld: |clang: error|LINK : fatal|cannot find|No such file" \
+            "$file" 2>/dev/null | head -12 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
 
       # Never tag a release that has not passed the suite where it is shipped.
       # `working-directory: python` is what makes `import gtvdb` resolve: the
