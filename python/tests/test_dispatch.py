@@ -79,5 +79,53 @@ class LocalModeRejectsRemoteOptions(unittest.TestCase):
             gtvdb.connect(local_store="C:/data", token="t")
 
 
+class TheTwoModesShareOneSurface(unittest.TestCase):
+    """Both cursors must be interchangeable, except where a server is required.
+
+    Documented as "one PEP 249 surface, two modes" in the README, so the
+    difference is pinned here rather than discovered by a user whose code works
+    in local mode and fails in remote (or the reverse).
+    """
+
+    @staticmethod
+    def _public(cls: type) -> set[str]:
+        return {name for name in dir(cls) if not name.startswith("_")}
+
+    def test_cursor_difference_is_only_the_evidence_chain(self):
+        from gtvdb._local.cursor import Cursor as LocalCursor
+        from gtvdb.cursor import Cursor as RemoteCursor
+
+        remote = self._public(RemoteCursor)
+        local = self._public(LocalCursor)
+        self.assertEqual(
+            remote - local,
+            {
+                "receipt",
+                "tri_state",
+                "is_conclusive",
+                "as_of_applied",
+                "snapshot_verified",
+            },
+            "remote-only cursor attributes must be exactly the evidence chain",
+        )
+        # `arrow_table` is the retired `pygtvdb-local` spelling of `to_arrow`.
+        self.assertEqual(local - remote, {"arrow_table"})
+
+    def test_connection_difference_is_storage_vs_server(self):
+        from gtvdb._local.connection import Connection as LocalConnection
+        from gtvdb.connection import Connection as RemoteConnection
+
+        remote = self._public(RemoteConnection)
+        local = self._public(LocalConnection)
+        self.assertEqual(
+            remote - local,
+            {"session", "protocol_version", "handshake", "pin", "as_of", "snapshot_id"},
+        )
+        self.assertEqual(
+            local - remote,
+            {"register_parquet", "attach_catalog", "sync_catalog"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

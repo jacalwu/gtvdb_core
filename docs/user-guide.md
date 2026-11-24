@@ -12,7 +12,7 @@
 |:--|:--|
 | 5 分钟内跑出第一条查询 | §2 |
 | 知道该用 REPL 还是写 Rust | §1 |
-| 用 Python 跑（`pip install pygtvdb` 装的是驱动，不含引擎） | §12 |
+| 用 Python 跑（`pip install pygtvdb`：远程连服务，或本地进程内引擎） | §12 |
 | 按时间点查「这个节点当时连到谁」 | §3 |
 | 找环 / 找 pattern（AML 洗钱环、担保链） | §3 |
 | 做向量检索、按标签过滤 | §4 |
@@ -608,29 +608,29 @@ gtv> SELECT step, gate, prefix_probability
 
 ## 12. 用 Python 跑同一套查询
 
-**能，而且有三种方式——区别只在引擎跑在哪。** `pygtvdb` 是纯 Python 的 DB-API 2.0 客户端（`import gtvdb`），引擎在别处跑；`pygtvdb-local` 把**同一个 `gtv-engine`** 编译进 Python 进程（pyo3 + abi3，`import pygtvdb_local`），不需要服务端也不需要 Docker。两者 PEP 249 表面一致，切换成本是一次 import 改名。
+**能，而且有两种用法——区别只在引擎跑在哪，包只有一个。** `pip install pygtvdb`（`import gtvdb`）同时支持远程和进程内：`gtvdb.connect("gtv://host:port")` 走 gRPC 连一个跑着的服务；`gtvdb.connect("gtv://local")` 把**同一个 `gtv-engine`** 编译进 Python 进程（pyo3 + abi3），不需要服务端也不需要 Docker。两种用法共用同一套 PEP 249 接口、同一套类型码与异常，切换成本是改一个 DSN。
 
 | 方式 | 今天能用 | 能力 | 代价 |
 |:--|:--|:--|:--|
 | **A. 客户端驱动 REPL**（§12.1–12.5） | ✅ | REPL 的全部能力（SQL + 12 条 `.` 指令） | 继承 REPL 的边界（§12.5）；每进程 335 ms 启动 |
-| **B. gRPC 协议 v1**（§12.6） | ✅ | DB-API 2.0（`pip install pygtvdb`），远程 SQL、`as_of` / `snapshot_id` 固定、`QueryReceipt`（含 tri-state 与 freshness） | 需先起服务；服务端目前只注册演示表；只读、无流式、无服务端分页 |
-| **C. 进程内引擎**（`pip install pygtvdb-local`） | ✅ | 与 server 同一引擎：SQL 全量、`as_of`、`knn`、图表函数、`gtv_segments()`；无服务端、无 Docker、无 Rust 工具链 | 每个平台一个 abi3 wheel（约 27 MB）；Python 层**不提供** `tri_state` / `receipt` 证据链——需要「空结果必须能证明」时走 B |
+| **B. gRPC 协议 v1**（§12.6，`gtv://host:port`） | ✅ | 远程 SQL、`as_of` / `snapshot_id` 固定、`QueryReceipt`（含 tri-state 与 freshness） | 需先起服务；服务端目前只注册演示表；只读、无流式、无服务端分页 |
+| **C. 进程内引擎**（`gtv://local`） | ✅ | 与 server 同一引擎：SQL 全量、`knn`、图表函数、`gtv_segments()`、本地 Parquet / catalog；无服务端、无 Docker、无 Rust 工具链 | 每个平台一个 abi3 wheel（约 27 MB，远程用户也要下）；Python 层**不提供** `tri_state` / `receipt` 证据链——需要「空结果必须能证明」时走 B |
 
-进程内模式就是去掉连接串：
-
-```bash
-pip install pygtvdb-local
-```
+进程内模式只是换一个 DSN：
 
 ```python
-import pygtvdb_local as gtv
+import gtvdb
 
-con = gtv.connect()                                  # 引擎就在这个进程里
+con = gtvdb.connect("gtv://local")                        # 引擎就在这个进程里
+con = gtvdb.connect("gtv://local", local_store="C:/data/gtv")   # 带本地数据目录
+
 print(con.cursor().execute("SELECT n, n*n AS sq FROM range(1,4) t(n)").fetchall())
-con.register_parquet("prices.parquet", "prices")     # 本地文件直接当表查
+con.register_parquet("prices.parquet", "prices")          # 本地文件直接当表查
+cur = con.cursor().execute("SELECT * FROM prices")
+print(cur.to_arrow(), cur.to_pandas())                    # 两种模式取 Arrow 的方式一致
 ```
 
-两个包可以并存（import 名不同），本仓从源码构建与发布见 [`python_local/README.md`](../python_local/README.md) 与 [`python_local/PUBLISHING.md`](../python_local/PUBLISHING.md)。
+从源码构建与发布见 [`python/README.md`](../python/README.md) 与 [`python/PUBLISHING.md`](../python/PUBLISHING.md)。
 
 ### 12.1 三十秒上手
 
@@ -723,16 +723,16 @@ Python 走 REPL，就等于站在手册 §1 的轨道 A 上，**不能**做的�
 
 ### 12.6 远程会话：gRPC 协议 v1
 
-跨机器、或想让答案带"证据"时，走 gRPC，不走子进程。协议定义在 `crates/gtv-proto/proto/gtvquery.proto`；Python 侧是一个**可安装的驱动** `python/`（PyPI 包名 `gtvdb`），对外是 DB-API 2.0，和 `psycopg2` / `pymysql` 一个用法。
+跨机器、或想让答案带"证据"时，走 gRPC，不走子进程。协议定义在 `crates/gtv-proto/proto/gtvquery.proto`；Python 侧是一个**可安装的驱动** `python/`（PyPI 包名 `pygtvdb`，导入名 `gtvdb`），对外是 DB-API 2.0，和 `psycopg2` / `pymysql` 一个用法。
 
 ```bash
-pip install pygtvdb             # 尚未发布时：pip install ./python（在 gtvdb_core 根下）
+pip install pygtvdb             # 已发布；从源码装：pip install ./python（在 gtvdb_core 根下）
 python -c "import gtvdb; print(gtvdb.apilevel, gtvdb.paramstyle)"
 ```
 
-注意装的是**驱动**：`import gtvdb` 不会带起引擎，`connect()` 指向一个已在跑的服务。发版流程（TestPyPI 预演、trusted publishing、版本号不可重用）见 `python/PUBLISHING.md`。
+`connect("gtv://host:port")` 连一个已在跑的服务；不写地址就落到默认的 `127.0.0.1:50051`。发版流程（TestPyPI 预演、trusted publishing、版本号不可重用）见 `python/PUBLISHING.md`。
 
-纯 Python 实现（只有 `grpcio` + `pyarrow` 两个依赖），没有编译产物、没有平台 wheel、用户机器上不需要 `protoc`。三层结构，按需要往下取：
+wheel 里带了编译好的引擎，所以同一个包也能用 `connect("gtv://local")` 在**本进程**跑引擎——那是本地模式，见上表 C。远程模式本身不额外需要什么：`grpcio` + `pyarrow` 两个依赖，用户机器上不需要 `protoc`。三层结构，按需要往下取：
 
 | 层 | 对象 | 多了什么 |
 |:--|:--|:--|
@@ -830,7 +830,7 @@ b = pinned.query("SELECT * FROM prices WHERE t <= 1700000000000000000")  # 语�
 | SQLAlchemy | ❌ 未提供 dialect | `pd.read_sql` 能跑（会 warn）；正式支持要做 `gtvdb+grpc://` dialect，属下一步 |
 | Oracle/PostgreSQL 那种 `fetchmany(size)` 服务端分页 | ❌ 客户端切片 | 同上，需要服务端 portal |
 
-测试：`python -m unittest discover -s python/tests`（30 个用例，纯 Python 假服务端，不需要 Rust 进程），覆盖 DB-API 契约、参数渲染、v0 回退、`as_of` 上线、错误码映射、pandas。示例脚本 `python examples/python/hello_grpc.py` 打真实服务端。
+测试：`python -m unittest discover -s python/tests -t python/tests`（73 个用例：远程用纯 Python 假服务端，本地直连嵌入式引擎——后者在没有编译产物时整模块 skip），覆盖 DB-API 契约、参数渲染、v0 回退、`as_of` 上线、错误码映射、pandas、双模式分派与两种模式共用的接口面。示例脚本 `python examples/python/hello_grpc.py` 打真实服务端。
 
 ---
 

@@ -28,6 +28,11 @@ def _native_connection() -> Any:
 class Connection:
     """An open, in-process gtv engine. Create with `gtvdb.connect("gtv://local")`."""
 
+    #: PEP 249 extension: the engine is read-only, so every statement is already
+    #: committed. Declared here so code that checks `con.autocommit` behaves the
+    #: same in both modes.
+    autocommit = True
+
     def __init__(self, native: Any, catalog: Optional[str] = None) -> None:
         self._native = native
         self._cursors: List[Cursor] = []
@@ -50,6 +55,20 @@ class Connection:
         cur = Cursor(self)
         self._cursors.append(cur)
         return cur
+
+    def execute(self, operation: str, parameters: Any = None) -> Cursor:
+        """Shorthand for `cursor().execute(...)`, as on the remote connection."""
+        return self.cursor().execute(operation, parameters)
+
+    def read_table(self, operation: str, parameters: Any = None) -> Any:
+        """Skip the row conversion: the result as an Arrow table.
+
+        Mirrors the remote method so a pipeline can read Arrow in either mode;
+        local mode has no receipt to carry alongside it.
+        """
+        cur = self.cursor()
+        cur.execute(operation, parameters)
+        return cur.to_arrow()
 
     # -- engine-specific: local persistence -------------------------------
 

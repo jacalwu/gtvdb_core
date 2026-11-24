@@ -1,82 +1,65 @@
-# gtvdb (Python)
+# gtvdb — Python driver for the gtv engine
 
-DB-API 2.0 driver for the gtv temporal-graph engine — **two modes behind one
-`connect()`**:
+One package, one `connect()`, two ways to run the engine:
 
-| mode | DSN | engine runs | needs |
+| mode | DSN | engine runs in | needs |
 |:--|:--|:--|:--|
-| remote | `gtv://host:port` | in `gtv-server`, over gRPC | a reachable server |
-| local | `gtv://local` | **inside this process** | nothing else |
-
-```bash
-pip install pygtvdb            # or: pip install pygtvdb[pandas]
-```
-
-The wheel for your platform carries the compiled engine, so **local mode needs
-no Rust toolchain, no Docker and no separate server**. (A wheel built without
-the engine still serves remote mode, and says so at `connect()` rather than
-failing somewhere deeper.)
-
-> The PyPI distribution is named **`pygtvdb`**, but you **`import gtvdb`** —
-> distribution name and import name are deliberately decoupled.
-
-## Remote mode
-
-Needs a running engine. The quickest one is the published container image (no
-Rust toolchain, no git clone):
-
-```bash
-docker run --rm -p 50051:50051 -e GTV_ADDR=0.0.0.0:50051 \
-  ghcr.io/jacalwu/gtvdb-core:0.1.0 gtv-demo-server
-# in another shell: pip install pygtvdb && python your_client.py
-```
+| **remote** | `gtv://host:50051` | a `gtv-server` process, spoken to over gRPC | a reachable server |
+| **local** | `gtv://local` | **this Python process** (compiled extension) | nothing else |
 
 ```python
 import gtvdb
 
-con = gtvdb.connect("gtv://127.0.0.1:50051")
-cur = con.cursor()
-cur.execute("SELECT * FROM numbers WHERE n <= ?", (3,))
-print(cur.fetchall())          # [(1, 1.0), (2, 4.0), (3, 9.0)]
-print(cur.description[0][0])   # 'n'
-print(cur.tri_state)           # remote only: 'found' / 'no_match' / 'incomplete'
-con.close()
+con = gtvdb.connect("gtv://127.0.0.1:50051")                   # remote
+con = gtvdb.connect("gtv://local")                             # local, in memory
+con = gtvdb.connect("gtv://local", local_store="C:/data/gtv")  # local, on disk
 ```
 
-The image also ships `gtv`, the zero-extension SQL REPL
-(`docker run --rm -it ghcr.io/jacalwu/gtvdb-core:0.1.0`). Linux binaries are on
-the GitHub release tagged `v*`. `gtv-demo-server` serves one immutable snapshot
-for protocol development; the production store-backed engine (`gtv-server`)
-lives in the companion `gtvdb_ext` repository. From a source checkout,
-`cargo run -p gtv-engine --example serve_demo` works too.
+Both return the same PEP 249 connection: same cursor, same `description` type
+codes, same exception hierarchy, same `?` parameters. What changes is *where*
+the engine runs — and therefore whether you get the evidence chain
+(`tri_state` / `receipt`), which only a wire protocol can carry.
 
-Works with pandas out of the box:
+## Install
 
-```python
-import pandas as pd
-pd.read_sql("SELECT * FROM prices ORDER BY t", con)
+```bash
+pip install pygtvdb              # ~27 MB: the wheel carries the compiled engine
+pip install "pygtvdb[pandas]"    # + DataFrame helpers
+pip install "pygtvdb[polars]"    # + to_polars()
 ```
 
-## Local mode
+> The distribution is named **`pygtvdb`**; you **`import gtvdb`**. The names are
+> deliberately decoupled.
 
-The same engine, compiled into the Python process. No server, no port, no
-Docker — which is what makes notebooks and single-machine analysis practical:
+The wheel is platform-specific (`cp39-abi3`, so one wheel per OS covers Python
+3.9–3.13) because the engine is inside it. That is what makes local mode work
+without a Rust toolchain or a container. A wheel built without the engine still
+serves remote mode and says so at `connect("gtv://local")` instead of failing
+somewhere deeper.
+
+## Local mode — nothing to start
 
 ```python
 import gtvdb
 
-con = gtvdb.connect("gtv://local")                              # in-memory
-con = gtvdb.connect("gtv://local", local_store="C:/data/gtv")   # on disk
-
+con = gtvdb.connect("gtv://local")
 cur = con.cursor()
-cur.execute("SELECT n, n*n AS sq FROM range(1, 4) t(n)")
-print(cur.fetchall())          # [(1, 1), (2, 4), (3, 9)]
-print([d[1].__name__ for d in cur.description])   # ['int', 'int']
+cur.execute("SELECT n, n * n AS sq FROM range(1, 4) t(n)")
+print(cur.fetchall())                              # [(1, 1), (2, 4), (3, 9)]
+print([d[1].__name__ for d in cur.description])    # ['int', 'int']
 ```
 
-`local_store` is a directory; it may also be passed in the DSN
-(`gtv://local?local_store=C:/data/gtv`). Opening a store publishes its committed
-tables immediately, so existing data is queryable without a second call.
+`local_store` is a directory, and it may also ride in the DSN
+(`gtv://local?local_store=C:/data/gtv`). Opening an existing store publishes its
+committed tables immediately, so "open my database" means the data is queryable
+without a second call:
+
+```python
+con = gtvdb.connect("gtv://local", local_store="C:/data/gtv")
+con.sync_catalog()          # publish any tables committed since the last open
+```
+
+Files can be queried in place, without ingesting them:
 
 ```python
 import pyarrow as pa, pyarrow.parquet as pq
@@ -84,97 +67,184 @@ import pyarrow as pa, pyarrow.parquet as pq
 pq.write_table(pa.table({"n": [1, 2, 3]}), "nums.parquet")
 
 con = gtvdb.connect("gtv://local")
-con.register_parquet("nums.parquet", "nums")          # a local file as a table
-con.cursor().execute("SELECT sum(n) FROM nums").fetchall()   # [(6,)]
+con.register_parquet("nums.parquet", "nums")                 # local file as a table
+print(con.cursor().execute("SELECT sum(n) FROM nums").fetchall())   # [(6,)]
 ```
 
-Local mode has no wire protocol, so it does not produce `tri_state` or
-`receipt` — there is no evidence chain without a server. A detection workload
-("an empty result must be *proved* empty") belongs on remote mode.
+Use it for notebooks, single-machine analysis, tests and CI: there is no port to
+bind, no container to start, and each `Connection` owns a private engine, so two
+connections cannot see each other's registered tables.
 
-Options that only mean something for a server — `as_of`, `snapshot_id`, `token`,
-`ca_cert`, `timeout_ms` — raise `TypeError` in local mode rather than being
-silently ignored.
+## Remote mode — one server, many clients
 
-## Pinning business time
+```bash
+# The engine, zero dependencies. `gtv-demo-server` serves one immutable snapshot
+# for protocol work; a store-backed server is what you run in production.
+docker run --rm -p 50051:50051 -e GTV_ADDR=0.0.0.0:50051 \
+  ghcr.io/jacalwu/gtvdb-core:0.1.0 gtv-demo-server
+```
 
-`as_of` is the engine's "answer as of T", and it belongs to the connection, not
-to each query — the equivalent of opening a kdb+ session at a timestamp. Remote
-mode only:
+```python
+import gtvdb
+
+con = gtvdb.connect("gtv://127.0.0.1:50051")
+cur = con.cursor()
+cur.execute("SELECT n, square FROM numbers WHERE n <= ?", (3,))
+print(cur.fetchall())      # [(1, 1.0), (2, 4.0), (3, 9.0)]
+print(cur.tri_state)       # 'found'
+con.close()
+```
+
+Remote mode is what you want when several processes or machines read one store,
+and it is the only mode with a receipt. The same image also ships `gtv`, the
+zero-extension SQL REPL (`docker run --rm -it ghcr.io/jacalwu/gtvdb-core:0.1.0`).
+
+Connection options, all remote-only:
+
+```python
+gtvdb.connect(
+    "gtv://engine.internal:50061?as_of=1700000000000000000&timeout_ms=5000",
+    token="bearer-token",     # authentication
+    ca_cert="/etc/gtv/ca.pem",  # passing this switches the channel to TLS
+)
+```
+
+`as_of` is `ns` since the epoch and belongs to the *connection*, not to a query —
+the equivalent of opening a kdb+ session at T:
 
 ```python
 con = gtvdb.connect("gtv://host:50051", as_of=1_700_000_000_000_000_000)
 con.cursor().execute("SELECT count(*) FROM positions").fetchall()
 
-at_open = con.pin(as_of=1_700_000_000_000_000_000)   # same channel, new pin
+same_channel = con.pin(as_of=1_700_000_000_000_000_000)
 ```
 
-## Evidence, for workloads that need it
+Passing a remote-only option in local mode raises `TypeError` rather than
+silently ignoring it — a pin that quietly does nothing is worse than a failure.
+
+## Which mode
+
+| | local | remote |
+|:--|:--|:--|
+| start-up | process-local, no server | needs a reachable `gtv-server` |
+| data sharing | this process only | many clients, one store |
+| `tri_state` / `receipt` | **absent** | present |
+| `as_of` / `snapshot_id` pinning | **absent** | present |
+| persistence | `local_store=` directory | the server's store |
+| best for | notebooks, CI, one-machine analysis | production, shared data, detection |
+
+Local mode has no wire protocol, so it produces no evidence chain. A workload
+where "an empty result must be *proved* empty" (fraud, risk, anti-detection)
+belongs on remote mode; reporting workloads can ignore the difference.
+
+## Results without row objects
+
+`fetchall()` converts every row to Python tuples. For anything large, take the
+Arrow table instead — either mode supports both spellings:
+
+```python
+cur.to_arrow()                    # pyarrow.Table, types preserved
+cur.to_pandas()                   # DataFrame
+cur.to_polars()                   # polars DataFrame
+con.read_table("SELECT * FROM big")   # Arrow, skipping the cursor entirely
+```
+
+`pandas.read_sql("SELECT ...", con)` works too.
+
+## Parameters and type codes
+
+`paramstyle` is `qmark`; named parameters also work:
+
+```python
+cur.execute("SELECT * FROM t WHERE n = ?", (3,))
+cur.execute("SELECT * FROM t WHERE n = :n", {"n": 3})
+```
+
+Scalars accepted: `None` → `NULL`, `bool`, `int`, `float`, `Decimal`, `str`,
+`bytes` → `X'..'`, `datetime`/`date`/`time` → `TIMESTAMP '..'`.
+Non-finite floats raise `DataError`.
+
+`cursor.description[i][1]` is a real type object, so `is` comparisons work:
+
+```python
+cur.description[0][1] is gtvdb.INTEGER    # not NUMBER — ints stay ints
+```
+
+`STRING`, `BINARY`, `NUMBER`, `INTEGER`, `BOOLEAN`, `ROWID`, `DATETIME`, `DATE`,
+`TIME`. `INTEGER` and `BOOLEAN` are extensions: DBAPI20 folds every number into
+`NUMBER`, which reports an `int` column as `float` and silently corrupts anyone
+building an INSERT or a JSON payload from `description`.
+
+## The evidence chain (remote only)
 
 DB-API cannot express "this empty result proves nothing", so the remote cursor
-keeps the engine's answer alongside the rows:
+keeps the engine's own answer next to the rows:
 
 ```python
 cur.execute("SELECT * FROM edges WHERE src = ?", (99,))
 cur.fetchall()        # []
-cur.tri_state         # 'no_match'  -> absence is proven
-cur.receipt           # full QueryReceipt: snapshot, as_of, freshness
+cur.tri_state         # 'no_match'  -> absence was proven
+cur.receipt           # snapshot, as_of, freshness, stats
 ```
 
-`tri_state == "incomplete"` (budget or deadline hit) means the empty result
-proves nothing. `cur.is_conclusive` is `False` for an old server that cannot
-compute a tri-state at all.
+| `tri_state` | meaning |
+|:--|:--|
+| `found` | rows matched |
+| `no_match` | nothing matched, **and that is proven** |
+| `incomplete` | budget or deadline hit — the empty result proves nothing |
+
+`cur.is_conclusive` is `False` against a server too old to compute a tri-state at
+all. `as_of_applied` and `snapshot_verified` report the same way: whether the
+answer really is for the time point you asked for.
 
 ## What it is not
 
-* **Read-only.** `commit()` / `rollback()` are no-ops; DML is refused by the
-  engine, not faked by the driver. Writes belong to an RDBMS or Redis that
-  refreshes into the store.
-* **Not a wire format of its own.** Remote mode speaks `gtvquery.QueryService`
-  v1 (`crates/gtv-proto/proto/gtvquery.proto`), the same contract the Rust
-  client uses. `?` parameters are rendered client-side into typed literals,
-  because protocol v1 has no bind slots.
+* **Read-only.** `commit()` / `rollback()` are no-ops, and `autocommit` is
+  `True`. DML is refused by the engine, not faked by the driver: writes belong to
+  an RDBMS or Redis that refreshes into the store.
+* **Not its own wire format.** Remote mode speaks `gtvquery.QueryService` v1
+  (`crates/gtv-proto/proto/gtvquery.proto`), the same contract the Rust client
+  uses. Protocol v1 has no bind slots, so `?` parameters are rendered
+  client-side into typed literals — safe against injection, but the engine
+  re-plans on every call, and a parameter cannot stand where a table or column
+  name is expected.
+* **Not thread-local.** `threadsafety` is 2: the module and connections may be
+  shared across threads; cursors may not (each owns its own result).
 
 ## Development
 
 ```bash
-pip install -e ./python                 # from the gtvdb_core repo root
+pip install -e ./python                  # from the repository root
 
-# Build the in-process engine into the package, then the platform wheel.
-python python/build_native.py --check   # report toolchain, build nothing
-python python/build_native.py --wheel   # extension + wheel
-python python/check_wheel.py            # install the wheel and query through it
+python python/build_native.py --check    # report the toolchain, build nothing
+python python/build_native.py --wheel    # engine + platform wheel
+python python/check_wheel.py             # install that wheel and query through it
 
-python python/gen_stubs.py --check      # CI: fail if stubs drift
+python python/gen_stubs.py --check       # fail if the gRPC stubs drifted
 python -m unittest discover -s python/tests -t python/tests
 ```
 
 `build_native.py` exists because the three ways this build fails are all
 environmental and all reported badly: Git Bash's `link.exe` shadowing MSVC's, a
-global `RUSTFLAGS=-C linker=lld` without `lld` installed, and `sccache`
-rejecting an exported `CARGO_INCREMENTAL`. It normalises all three, builds via
-cargo, and drops the artefact in `gtvdb/_local/`.
-
-Run it from **PowerShell on Windows**, not from a restricted shell: a sandbox
+global `RUSTFLAGS=-C linker=lld` with no `lld` installed, and `sccache` refusing
+an exported `CARGO_INCREMENTAL`. It normalises all three, then drops the artefact
+into `gtvdb/_local/`. Run it from **PowerShell on Windows** — a sandboxed shell
 that blocks `reg.exe` makes `link.exe` hang for tens of minutes with no output.
 
 ## Releasing
 
 The version lives in exactly one place, `gtvdb/_version.py`; `pyproject.toml`
-reads it back rather than repeating it. Before an upload:
+reads it back instead of repeating it.
 
 ```bash
-python python/check_release.py --keep-dist   # licence copy, stub freshness,
-                                             # tests, metadata, wheel contents,
-                                             # engine presence, name on PyPI
+python python/check_release.py --keep-dist
+# licence copy, stub freshness, tests, metadata, wheel contents, engine
+# presence, and whether the name is still free on PyPI
 ```
 
-The distribution is a **platform wheel** (`cp39-abi3`), because it carries the
-engine. One artefact per platform covers Python 3.9–3.13.
-
-Pushing a `py-v*` tag builds all three platforms and publishes through GitHub
+Pushing a `py-v*` tag builds all three platforms and uploads through GitHub
 Actions with PyPI trusted publishing, so no token is stored anywhere. No sdist
-is uploaded: one without the engine would make pip try to compile Rust on a
+is published: one without the engine would make pip try to compile Rust on a
 machine that has none. The full procedure — first-release bootstrap, TestPyPI
 rehearsal, the platform matrix, and why a version number can never be reused —
 is in [PUBLISHING.md](https://github.com/jacalwu/gtvdb_core/blob/main/python/PUBLISHING.md).

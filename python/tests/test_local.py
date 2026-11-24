@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 
 # The tests sit one level below the package root and must import without an
-# editable install, so put `python_local/` on the path explicitly.
+# editable install, so put `python/` on the path explicitly.
 _ROOT = Path(__file__).resolve().parents[1]
 import sys  # noqa: E402
 

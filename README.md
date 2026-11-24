@@ -11,10 +11,10 @@
 
 | 仓库 | 内容 | 依赖方向 |
 |:--|:--|:--|
-| **`jacalwu/gtvdb_core`**（本仓） | 12 个内核 lib crate + 精简 `gtv` REPL + 核心文档/测试 | 不依赖任何扩展 |
+| **`jacalwu/gtvdb_core`**（本仓） | 15 个内核 lib crate + 精简 `gtv` REPL + `gtvpy-local`（进程内引擎的 Python 绑定）+ 核心文档/测试 | 不依赖任何扩展 |
 | [`jacalwu/gtvdb_ext`](https://github.com/jacalwu/gtvdb_ext) | 13 个领域扩展 crate、full-pack CLI、gRPC server、领域文档 | 以**固定 commit 的 git dependency** 单向依赖本仓，经 `GtvExtension` 接入 |
 
-本仓是从完整 workspace **拆分出来的独立仓库**，拥有干净的 git 历史：不含扩展代码、不含领域脚本、不含任何被提交的数据集（CSV / Parquet / Segment / PDF）。扩展仓把 12 个内核 crate 钉在同一个本仓 commit SHA 上，因此「内核不依赖扩展」由 Cargo 依赖源保证，而不再只是目录约定。原 monorepo `jacalwu/gtvdb` 保留完整历史、监管脚本与历史数据，不再参与两仓构建。
+本仓是从完整 workspace **拆分出来的独立仓库**，拥有干净的 git 历史：不含扩展代码、不含领域脚本、不含任何被提交的数据集（CSV / Parquet / Segment / PDF）。扩展仓把 15 个内核 crate 钉在同一个本仓 commit SHA 上，因此「内核不依赖扩展」由 Cargo 依赖源保证，而不再只是目录约定。原 monorepo `jacalwu/gtvdb` 保留完整历史、监管脚本与历史数据，不再参与两仓构建。
 
 ---
 
@@ -22,19 +22,38 @@
 
 最短路径不需要 Rust 工具链，也不需要 clone 本仓。
 
-**作为客户端（Python）：**
+**作为客户端（Python）：一个包，两种运行方式**
 
 ```bash
-pip install pygtvdb
+pip install pygtvdb        # 发行名 pygtvdb，导入名 gtvdb
 ```
 
 ```python
 import gtvdb
+
+# 远程：连一个跑着的 gtv-server（gRPC 协议 v1）
 con = gtvdb.connect("gtv://127.0.0.1:50051")
-cur = con.cursor()
-cur.execute("SELECT * FROM numbers WHERE n <= ?", (3,))
-print(cur.fetchall(), cur.tri_state)   # 结果 + 可证明的「无匹配/无结论」三态
+print(con.cursor().execute("SELECT * FROM numbers WHERE n <= ?", (3,)).fetchall())
+print(con.cursor().tri_state)      # 远程才有：结果 + 可证明的「无匹配/无结论」三态
+
+# 本地：引擎编译进 Python 进程，不需要服务端、不需要 docker
+con = gtvdb.connect("gtv://local")
+con = gtvdb.connect("gtv://local", local_store="C:/data/gtv")   # 带本地数据目录
+print(con.cursor().execute("SELECT n, n*n AS sq FROM range(1,4) t(n)").fetchall())
 ```
+
+两种方式共用同一套 PEP 249 接口、同一套类型码与异常，区别只在引擎在哪跑：
+
+| | 本地 `gtv://local` | 远程 `gtv://host:port` |
+|:--|:--|:--|
+| 引擎位置 | 本进程（wheel 内含编译产物） | 独立 `gtv-server` 进程 |
+| 需要 docker / 服务端 | 否 | 是 |
+| `tri_state` / `receipt` / `as_of` | 无（没有 wire protocol） | 有 |
+| 适合 | notebook、CI、单机分析 | 生产、多客户端共享、风控判定 |
+
+本地模式的 wheel 是平台包（`cp39-abi3`，一个平台一个包覆盖 3.9–3.13）。
+完整用法见 [python/README.md](python/README.md)，发布流程见
+[python/PUBLISHING.md](python/PUBLISHING.md)。
 
 **作为引擎（容器 / 二进制）：**
 
@@ -42,14 +61,13 @@ print(cur.fetchall(), cur.tri_state)   # 结果 + 可证明的「无匹配/无�
 # 容器：零依赖，同时提供 REPL 与协议 v1 的 gRPC 服务
 docker run --rm -it ghcr.io/jacalwu/gtvdb-core:0.1.0                       # REPL
 docker run --rm -p 50051:50051 -e GTV_ADDR=0.0.0.0:50051 \
-  ghcr.io/jacalwu/gtvdb-core:0.1.0 gtv-demo-server                        # 供 Python 驱动连接
+  ghcr.io/jacalwu/gtvdb-core:0.1.0 gtv-demo-server                        # 供 Python 驱动以远程方式连接
 ```
 
 Linux x86_64 静态产物见 GitHub Release 的 `v*` tag（`gtv` REPL + `gtv-demo-server`，
 带 SHA256）。镜像里的 `gtv-demo-server` 服务一个不可变快照用于协议开发；带真实存储的
 生产服务 `gtv-server` 在扩展仓 [`gtvdb_ext`](https://github.com/jacalwu/gtvdb_ext)。
-`pip install pygtvdb` 装的是客户端，不内嵌引擎。完整说明见 [python/README.md](python/README.md)
-与 [python/PUBLISHING.md](python/PUBLISHING.md)。
+
 
 ### 从源码开发（需要 Rust 1.95+，见 [rust-toolchain.toml](rust-toolchain.toml)）
 
@@ -183,7 +201,7 @@ let ctx = GtvContext::with_extensions(
 | [ROADMAP.md](ROADMAP.md) | 核心主线里程碑 |
 | [docs/api-compat.md](docs/api-compat.md) | 公开 API / 协议兼容、逐 crate MSRV、发布基线检查清单 |
 | [Dockerfile](Dockerfile) / [publish-engine.yml](.github/workflows/publish-engine.yml) | 引擎镜像与 `v*` tag 二进制发行 |
-| [python/PUBLISHING.md](python/PUBLISHING.md) | Python 驱动的 PyPI 发布流程（与引擎发行分离） |
+| [python/PUBLISHING.md](python/PUBLISHING.md) | Python 包的 PyPI 发布流程（平台 wheel 矩阵 + trusted publishing） |
 
 ## License
 

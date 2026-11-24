@@ -111,9 +111,36 @@ class Cursor:
         """The Arrow schema of the last result."""
         return None if self._table is None else self._table.schema
 
-    def arrow_table(self) -> Optional[pa.Table]:
-        """The full last result as a ``pyarrow.Table`` (engine-native)."""
+    def to_arrow(self) -> pa.Table:
+        """The result as an Arrow table — no row conversion.
+
+        Same name and shape as the remote cursor's, so a result can be handed to
+        `pandas`/`polars` without the caller knowing which mode produced it.
+        """
+        self._ensure_result()
+        assert self._table is not None  # narrowed by _ensure_result
         return self._table
+
+    def to_pandas(self):
+        """Result as a DataFrame (requires `pip install pygtvdb[pandas]`)."""
+        return self.to_arrow().to_pandas()
+
+    def to_polars(self):
+        """Result as a polars DataFrame (requires `pip install polars`)."""
+        import polars as pl  # local import: polars is optional
+
+        return pl.from_arrow(self.to_arrow())
+
+    def arrow_table(self) -> Optional[pa.Table]:
+        """Deprecated alias for `to_arrow`; kept for the retired `pygtvdb-local`."""
+        return self._table
+
+    # DB-API optional no-ops: there are no buffers to size.
+    def setinputsizes(self, sizes: Any) -> None:
+        pass
+
+    def setoutputsize(self, size: Any, column: Any = None) -> None:
+        pass
 
     # -- lifecycle ---------------------------------------------------------
 

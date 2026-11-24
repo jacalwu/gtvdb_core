@@ -49,7 +49,7 @@ token only if you would rather not put OIDC in the path:
 - [ ] GitHub → *Actions* → *Publish Python driver* → *Run workflow*,
       `target: testpypi`.
 - [ ] `pip install --index-url https://test.pypi.org/simple/
-      --extra-index-url https://pypi.org/simple gtvdb` — the extra index is
+      --extra-index-url https://pypi.org/simple pygtvdb` — the extra index is
       required because `grpcio` / `pyarrow` are not on TestPyPI.
 - [ ] `python -c "import gtvdb; print(gtvdb.__version__, gtvdb.paramstyle)"`.
 
@@ -60,30 +60,36 @@ token only if you would rather not put OIDC in the path:
 - [ ] Confirm <https://pypi.org/project/pygtvdb/> renders the README, the licence,
       and the Python 3.9–3.13 classifiers.
 
-## What the repository still has to change before `0.1.0` means something
+## Where the engine comes from
 
-The packaging is done. Two things a first user used to hit within ten minutes:
+`pygtvdb` used to be a pure-Python client, which left a first user with a driver
+and nothing to talk to: the server half needed a Rust toolchain and a git clone.
+Both halves are solved, and they are now independent:
 
-1. **Engine distribution — now solved.** `pip install pygtvdb` is still a client
-   only (it cannot embed the engine), but the server half no longer requires a
-   Rust toolchain and a git clone. The `v*` tag workflow (`.github/workflows/
-   publish-engine.yml`) publishes Linux binaries to the GitHub release and a
-   container image to GHCR; the root `Dockerfile` builds the same image locally:
+1. **Local mode ships inside the wheel.** `gtvdb/_local/_gtv_native` is the
+   compiled engine, so `pip install pygtvdb` alone is enough for
+   `gtvdb.connect("gtv://local")` — no server, no Docker, no compiler. That is
+   why the wheel is 27 MB and platform-specific, and why a release must cover
+   every platform in the matrix.
+2. **Remote mode still needs a server, but not a toolchain.** The `v*` tag
+   workflow (`.github/workflows/publish-engine.yml`) publishes Linux binaries to
+   the GitHub release and a container image to GHCR; the root `Dockerfile`
+   builds the same image locally:
 
        docker run --rm -p 50051:50051 -e GTV_ADDR=0.0.0.0:50051 \
          ghcr.io/jacalwu/gtvdb-core:0.1.0 gtv-demo-server
-       # then: python -c "import gtvdb; ...connect('gtv://127.0.0.1:50051')"
+       # then: python -c "import gtvdb; gtvdb.connect('gtv://127.0.0.1:50051')"
 
    The image's `gtv-demo-server` serves one immutable snapshot for protocol
    development; the production store-backed server remains in `gtvdb_ext`.
-   Practise the image tag against TestPyPI's client before announcing either.
-2. **`gtvdb` is still an unclaimed name.** It was free at the time of writing,
-   but names are first-come. `check_release.py` re-checks it on every run.
+3. **The name is taken, by us.** `pygtvdb` is published, so
+   `check_release.py` now treats "the name is free" as informational rather than
+   a gate — it fails on "this *version* already exists", which is the thing that
+   actually blocks an upload.
 
 (`gtvdb_ext`'s `gtv-server` used to answer protocol v0 only, which made a v1
 driver pointless against the production server. Its core pin now carries v1 —
-`ExecuteQuery`, `Negotiate`, and `Execute` for compatibility — so that gap is
-closed; what remains is the engine not being distributable, above.)
+`ExecuteQuery`, `Negotiate`, and `Execute` for compatibility.)
 
 ## The platform matrix
 
@@ -135,7 +141,7 @@ TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-<testpypi-token> \
   python -m twine upload --repository testpypi python/dist/*
 
 python -m pip install --index-url https://test.pypi.org/simple/ \
-    --extra-index-url https://pypi.org/simple gtvdb
+    --extra-index-url https://pypi.org/simple pygtvdb
 python -c "import gtvdb; print(gtvdb.__version__)"
 
 python -m twine upload python/dist/*     # the real thing
