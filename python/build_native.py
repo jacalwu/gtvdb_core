@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,31 @@ HOST = "Hostx64"  # the interpreter's own architecture; x64 is the only wheel we
 
 def _is_windows() -> bool:
     return sys.platform == "win32"
+
+
+def _linux_platform_tag() -> str:
+    """PEP 600 tag matching the glibc the extension was actually built against.
+
+    PyPI rejects plain ``linux_x86_64``. Claiming ``manylinux_2_34`` on a newer
+    runner is worse than rejecting the upload: the wheel installs and then
+    fails at import with ``GLIBC_2.43 not found``. Deriving the tag from the
+    builder keeps the metadata honest; a broadly compatible wheel still needs
+    a manylinux container, which is a CI image decision, not a packaging lie.
+    """
+    try:
+        _libc, version = os.confstr("CS_GNU_LIBC_VERSION").split()
+        major, minor = version.split(".")[:2]
+        int(major), int(minor)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "cannot determine the build machine's glibc version; refusing to "
+            "invent a manylinux tag. Build inside a manylinux container."
+        ) from exc
+    machine = platform.machine().lower()
+    arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64"}.get(machine)
+    if arch is None:
+        raise RuntimeError(f"no manylinux architecture mapping for {machine!r}")
+    return f"manylinux_{major}_{minor}_{arch}"
 
 
 def _artefact_name() -> str:
@@ -293,12 +319,14 @@ def build_wheel() -> int:
     if sys.platform.startswith("linux"):
         # PyPI rejects `linux_x86_64`; the tag must name the glibc floor the
         # wheel was built against. `python -m build` cannot pass this through.
+        plat = _linux_platform_tag()
+        print(f"linux wheel tag: {plat}")
         command = [
             sys.executable,
             "setup.py",
             "bdist_wheel",
             "--plat-name",
-            "manylinux_2_34_x86_64",
+            plat,
         ]
     else:
         command = [sys.executable, "-m", "build", "--wheel"]

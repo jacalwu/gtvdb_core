@@ -113,8 +113,11 @@ jobs:
       # The release must also pass the same metadata gate a maintainer runs.
       # --offline: a tag push must not depend on PyPI being reachable to ask
       # whether this version exists; the index answer is the same either way.
+      # NOT --keep-dist: that builds into python/dist and would overwrite the
+      # manylinux-tagged wheel with a generic `linux_x86_64` one, which PyPI
+      # rejects. build_native.py's wheel is the one upload-artifact must ship.
       - name: Release pre-flight (metadata, artefact contents)
-        run: python python/check_release.py --offline --keep-dist
+        run: python python/check_release.py --offline
 
       - uses: actions/upload-artifact@v4
         with:

@@ -116,6 +116,18 @@ def check_contents(wheel: Path) -> None:
             file=sys.stderr,
         )
 
+    # A `linux_x86_64` wheel installs fine on Linux and PyPI still refuses it.
+    # This is not hypothetical: `check_release.py --keep-dist` used to rebuild
+    # into python/dist and silently replace the manylinux wheel with one tagged
+    # `linux_x86_64`, so the artifact looked fine until the upload step.
+    if sys.platform.startswith("linux") and "manylinux_" not in wheel.name:
+        raise SystemExit(
+            f"error: {wheel.name} has no manylinux platform tag; PyPI rejects "
+            "plain linux_x86_64 wheels. Check that nothing rebuilt the wheel "
+            "after `build_native.py --wheel` (a release gate must not pass "
+            "--keep-dist)."
+        )
+
     print(f"contents ok: {extension[0]} present, {len(names)} files")
 
 

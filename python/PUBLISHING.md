@@ -145,6 +145,22 @@ Two related constraints on metadata:
   published under the two-mode description. Only the three-platform matrix
   produces releasable artefacts.
 
+The release workflow deliberately does **not** pass `--keep-dist`. That flag
+builds into `python/dist`, and `python -m build` produces a `linux_x86_64` tag —
+replacing `build_native.py`'s PEP 600 wheel with one PyPI refuses. Use
+`--keep-dist` only for a local, single-platform upload where you have already
+checked the tag; `check_wheel.py` now fails on Linux if the manylinux tag is
+missing.
+
+On Linux the tag is derived from `os.confstr("CS_GNU_LIBC_VERSION")` at build
+time, because claiming a lower glibc than the extension actually references
+turns an install failure into an import failure (`GLIBC_2.43 not found`). The
+current GitHub runner emitted references up to GLIBC 2.43, so its honest tag is
+`manylinux_2_43_x86_64`, not `manylinux_2_34_x86_64`. That is valid on PyPI but
+restricts installation to very new distributions. Broad Linux support requires
+building in a `quay.io/pypa/manylinux_2_28_x86_64` container; no packaging flag
+can lower glibc symbols after the fact.
+
 ## Every release
 
 Two equivalent routes. The tag route is the one that ends with a CI-built
