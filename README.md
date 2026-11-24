@@ -52,8 +52,8 @@ print(con.cursor().execute("SELECT n, n*n AS sq FROM range(1,4) t(n)").fetchall(
 | 适合 | notebook、CI、单机分析 | 生产、多客户端共享、风控判定 |
 
 本地模式的 wheel 是平台包（`cp39-abi3`，一个平台一个包覆盖 3.9–3.13）。
-完整用法见 [python/README.md](python/README.md)，发布流程见
-[python/PUBLISHING.md](python/PUBLISHING.md)。
+完整用法见 [python/README.zh-CN.md](python/README.zh-CN.md)（中文，两种用法并排）与
+[python/README.md](python/README.md)，发布流程见 [python/PUBLISHING.md](python/PUBLISHING.md)。
 
 **作为引擎（容器 / 二进制）：**
 

@@ -1,5 +1,7 @@
 # gtvdb — Python driver for the gtv engine
 
+> 中文说明（本地与远程两种用法）：[README.zh-CN.md](README.zh-CN.md)
+
 One package, one `connect()`, two ways to run the engine:
 
 | mode | DSN | engine runs in | needs |
