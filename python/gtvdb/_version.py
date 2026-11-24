@@ -6,4 +6,4 @@ it, so the build does not need `grpcio` installed. Keep this module free of
 imports and of anything but a plain string assignment.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
