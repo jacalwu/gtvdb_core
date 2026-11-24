@@ -973,6 +973,25 @@ impl GtvContext {
         df.collect().await
     }
 
+    /// Run a SQL query, returning the planned schema even when no batch arrives.
+    ///
+    /// [`Self::sql`] infers the schema from the first batch, so a zero-row
+    /// result loses its column names entirely — a caller then cannot build a
+    /// cursor `description`, and "no rows" becomes indistinguishable from "no
+    /// columns". DataFusion knows the schema before execution, so hand it back
+    /// explicitly instead of re-planning to recover it.
+    pub async fn sql_with_schema(
+        &self,
+        query: &str,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        let df = self.ctx.sql(query).await?;
+        // DataFusion hands back its own `DFSchema` wrapper; the Arrow schema
+        // underneath is what both IPC encoding and callers need.
+        let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        let batches = df.collect().await?;
+        Ok((schema, batches))
+    }
+
     /// Declare the knowledge state this context's results reflect.
     ///
     /// Stamped onto every receipt produced by [`Self::sql_with_receipt`] and

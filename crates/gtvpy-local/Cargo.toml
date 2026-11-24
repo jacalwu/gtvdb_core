@@ -1,0 +1,19 @@
+[package]
+name = "gtvpy-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.94" # bounded by datafusion 55 via gtv-engine; no wasmtime here
+description = "In-process Python binding for the gtv temporal-graph engine (pygtvdb-local)"
+
+[lib]
+name = "_gtv_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
+# Inherit workspace arrow (59, `ipc` enabled). Results cross as Arrow IPC bytes
+# and are decoded to pyarrow on the Python side — no new dependency needed.
+arrow.workspace = true
+tokio = { workspace = true }
+gtv-engine = { path = "../gtv-engine" }

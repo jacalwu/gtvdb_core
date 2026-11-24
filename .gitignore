@@ -61,3 +61,14 @@ tools/cuda-probe/*.pdb
 # Only the deterministic generators + SHA256SUMS are committed.
 *.parquet
 *.pdf
+
+# pygtvdb-local native build artifacts
+python_local/build/
+python_local/dist/
+python_local/*.egg-info/
+python_local/pygtvdb_local/*.so
+python_local/pygtvdb_local/*.pyd
+
+t.tar.gz
+r.tar.gz
+*.tar.gz

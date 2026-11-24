@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pygtvdb-local"
+version = "0.1.0"
+description = "In-process (DuckDB-style) Python driver for the gtv temporal-graph engine"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "jacalwu" }]
+dependencies = ["pyarrow>=14"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Database",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=1.5"]
+
+[tool.setuptools]
+packages = ["pygtvdb_local"]
+
+[tool.setuptools.package-data]
+# The compiled extension produced by `cargo build -p gtvpy-local --release`
+# is copied in as pygtvdb_local/_gtv_native.abi3.so before `pip wheel`/build.
+pygtvdb_local = ["*.so", "*.pyd", "py.typed"]
