@@ -14,66 +14,23 @@ not.
 
 from __future__ import annotations
 
-import datetime as _dt
 from typing import Any, Iterator, Optional, Sequence
 
 import pyarrow as pa
 
 from . import errors
 from ._params import render
+from ._types import (  # noqa: F401 - re-exported for `from .cursor import STRING`
+    BINARY,
+    BOOLEAN,
+    DATETIME,
+    INTEGER,
+    NUMBER,
+    ROWID,
+    STRING,
+    type_code,
+)
 from .client import GtvError, Result, Session
-
-# PEP 249 requires these type objects so callers can compare
-# `cursor.description[i][1] is gtvdb.STRING`. They are deliberately plain
-# builtins, which is what sqlite3 and psycopg2 do. `INTEGER` and `BOOLEAN` are
-# extensions: DBAPI20 folds every number into NUMBER, but an int column
-# reported as `float` misleads anyone building an insert or a JSON payload.
-STRING = str
-BINARY = bytes
-NUMBER = float
-INTEGER = int
-DATETIME = _dt.datetime
-ROWID = int
-BOOLEAN = bool
-
-_INTEGERS = {
-    pa.int8(),
-    pa.int16(),
-    pa.int32(),
-    pa.int64(),
-    pa.uint8(),
-    pa.uint16(),
-    pa.uint32(),
-    pa.uint64(),
-}
-_FLOATS = {pa.float16(), pa.float32(), pa.float64()}
-_STRINGS = {pa.string(), pa.large_string()}
-_BINARY_TYPES = {pa.binary(), pa.large_binary()}
-_TEMPORALS = {
-    pa.timestamp("s"),
-    pa.timestamp("ms"),
-    pa.timestamp("us"),
-    pa.timestamp("ns"),
-    pa.date32(),
-    pa.date64(),
-}
-
-
-def _type_code(arrow_type: pa.DataType) -> Any:
-    """Map an Arrow type to a PEP 249 type object (or its name if unmapped)."""
-    if arrow_type in _STRINGS:
-        return STRING
-    if arrow_type in _BINARY_TYPES:
-        return BINARY
-    if arrow_type in _INTEGERS:
-        return INTEGER
-    if arrow_type in _FLOATS or pa.types.is_decimal(arrow_type):
-        return NUMBER
-    if arrow_type == pa.bool_():
-        return BOOLEAN
-    if arrow_type in _TEMPORALS or isinstance(arrow_type, pa.TimestampType):
-        return DATETIME
-    return str(arrow_type)
 
 
 class Cursor:
@@ -148,7 +105,7 @@ class Cursor:
             return None
         schema = self._result.table.schema
         return [
-            (field.name, _type_code(field.type), None, None, None, None, field.nullable)
+            (field.name, type_code(field.type), None, None, None, None, field.nullable)
             for field in schema
         ]
 

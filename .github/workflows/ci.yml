@@ -208,15 +208,15 @@ jobs:
       - name: Release pre-flight (build, twine check, artefact contents)
         run: python python/check_release.py --offline
 
-  # `pygtvdb-local` embeds the whole engine inside the Python process, so the
-  # compiled extension *is* the product: if it does not build, nothing else
-  # matters. Three platforms because that is what the wheel matrix ships.
+  # `pygtvdb` now carries the engine for `connect("gtv://local")`, so the wheel
+  # is platform-specific: three platforms, one Python (abi3 covers 3.9-3.13).
   #
-  # One Python version is enough — pyo3 is configured for abi3-py39, so a single
-  # wheel covers 3.9-3.13. A per-version matrix would compile the same artefact
-  # five times to prove the same thing.
+  # This job is the one that proves the in-process half works. The plain
+  # `python-driver` job above runs the same suite on a machine with no engine,
+  # where the in-process tests skip — together they cover both shapes of the
+  # distribution.
   python-local-driver:
-    name: In-process driver (${{ matrix.os }})
+    name: In-process engine (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -236,13 +236,13 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install --upgrade pip "pyarrow>=14"
       # Same entry point a human runs locally: normalises the lld/sccache/MSVC
-      # environment traps, builds, and drops the artefact into the package.
+      # environment traps, builds, and drops the artefact into gtvdb/_local/.
       - name: Build the extension and the wheel
-        run: python python_local/build_native.py --wheel
-      - name: PEP 249 conformance against the embedded engine
-        run: python -m unittest discover -s python_local/tests -t python_local/tests
+        run: python python/build_native.py --wheel
+      - name: Full suite (remote, in-process, dispatch)
+        run: python -m unittest discover -s python/tests -t python/tests
       # A wheel that builds is not a wheel that works: this installs it into a
       # temp dir and queries through it from outside the source tree.
-      - name: The wheel installs and answers a query
-        run: python python_local/check_wheel.py
+      - name: The wheel installs and answers a local query
+        run: python python/check_wheel.py
 

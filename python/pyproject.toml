@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 # This keeps existing user code working while reserving the publishable name.
 name = "pygtvdb"
 dynamic = ["version"]
-description = "DB-API 2.0 driver for the gtv temporal-graph engine (import gtvdb)"
+description = "DB-API 2.0 driver for the gtv temporal-graph engine: remote over gRPC, or in-process"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
@@ -44,7 +44,8 @@ classifiers = [
     "Topic :: Database :: Front-Ends",
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
-# Pure Python over gRPC: no build step, no platform wheels, no compiler.
+# grpcio is the remote transport; pyarrow is the result format both modes share.
+# The compiled engine itself rides inside the platform wheel, not as a dependency.
 dependencies = [
     "grpcio>=1.60",
     "pyarrow>=14",
@@ -64,7 +65,9 @@ Issues = "https://github.com/jacalwu/gtvdb_core/issues"
 [tool.setuptools]
 # `gtvdb._stubs` is generated from `crates/gtv-proto/proto/gtvquery.proto` by
 # `python/gen_stubs.py`; it ships with the package so users need no protoc.
-packages = ["gtvdb", "gtvdb._stubs"]
+# `gtvdb._local` is the in-process engine's Python half; its compiled half
+# (`_gtv_native.pyd`/`.so`) is placed there by `python/build_native.py`.
+packages = ["gtvdb", "gtvdb._stubs", "gtvdb._local"]
 
 [tool.setuptools.dynamic]
 # `attr` is resolved by parsing the module, not importing it — so building the
@@ -74,3 +77,6 @@ version = { attr = "gtvdb._version.__version__" }
 [tool.setuptools.package-data]
 "gtvdb" = ["py.typed"]
 "gtvdb._stubs" = ["*.pyi"]
+# Present only in a wheel built on a machine with the extension; a wheel
+# without it still installs and serves remote mode.
+"gtvdb._local" = ["*.pyd", "*.so", "*.dylib"]

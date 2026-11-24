@@ -1,9 +1,20 @@
 name: Publish Python driver
 
-# Tag-driven releases of the `gtvdb` driver (python/). Uses PyPI trusted
-# publishing: no API token is stored in the repository. One-time setup is
-# described in python/PUBLISHING.md — the publisher must name this workflow and
-# the environment below, or the OIDC exchange will be rejected.
+# Tag-driven release of `pygtvdb`.
+#
+# The distribution carries the in-process engine, so `connect("gtv://local")`
+# works without a server — which makes the wheel platform-specific. Three
+# platforms build in parallel and `publish` waits for all of them: a partial
+# matrix is worse than a failed release, because pip on the missing platform
+# silently resolves an older pure-Python version instead of saying no.
+#
+# No sdist is uploaded on purpose. An sdist has no compiled engine, so pip on a
+# machine without a Rust toolchain would try to build one and fail; shipping only
+# per-platform wheels means every install is complete.
+#
+# One-time setup is in python/PUBLISHING.md: PyPI must have a pending publisher
+# naming this workflow and the `pypi` environment below, or the OIDC exchange is
+# rejected before any file is considered.
 on:
   push:
     tags: ["py-v*"]
@@ -20,21 +31,27 @@ permissions:
 
 jobs:
   build:
-    name: Build and verify
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
+    name: Build wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # fail-fast: a missing platform is worse than a failed release.
+      fail-fast: true
+      matrix:
+        # macos-latest is arm64. For Intel Macs add `macos-13`; the tag comes
+        # from the runner, so both can coexist in one release.
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install build tooling and runtime deps
-        run: python -m pip install --upgrade pip build twine "grpcio>=1.60" "pyarrow>=14" pandas
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
 
       - id: version
         name: Version tag must match gtvdb/_version.py
+        shell: bash
         run: |
           set -euo pipefail
           version=$(python -c "exec(open('python/gtvdb/_version.py').read()); print(__version__)")
@@ -47,19 +64,35 @@ jobs:
             fi
           fi
 
-      # The same gate a maintainer runs locally, so CI and laptop cannot disagree.
-      - name: Release pre-flight
-        run: python python/check_release.py --keep-dist
+      - name: Install build and test dependencies
+        run: python -m pip install --upgrade pip build "pyarrow>=14"
 
-      - name: Upload artefacts for the publish job
-        uses: actions/upload-artifact@v4
+      # The same script a contributor runs, so a green release proves the
+      # documented local command works on this platform.
+      - name: Build the extension and the wheel
+        run: python python/build_native.py --wheel
+
+      # Never tag a release that has not passed the suite where it is shipped.
+      - name: Full suite (remote, in-process, dispatch)
+        run: python -m unittest discover -s python/tests -t python/tests
+
+      - name: The wheel installs and answers a local query
+        run: python python/check_wheel.py
+
+      # The release must also pass the same metadata gate a maintainer runs.
+      # --offline: a tag push must not depend on PyPI being reachable to ask
+      # whether this version exists; the index answer is the same either way.
+      - name: Release pre-flight (metadata, artefact contents)
+        run: python python/check_release.py --offline --keep-dist
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: python-dist
-          path: python/dist/
+          name: python-dist-${{ matrix.os }}
+          path: python/dist/*.whl
           if-no-files-found: error
 
   publish:
-    name: Publish to PyPI
+    name: Publish to ${{ github.event.inputs.target || 'pypi' }}
     needs: build
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.target || 'pypi' }}
@@ -68,19 +101,32 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: python-dist
+          pattern: python-dist-*
+          merge-multiple: true
           path: dist/
+
+      # Every platform must be present: a partial upload cannot be corrected for
+      # this version, because a version number is burned once uploaded.
+      - name: Require a wheel for every platform
+        run: |
+          set -euo pipefail
+          ls -lh dist/
+          count=$(ls dist/*.whl | wc -l)
+          echo "wheels: $count"
+          if [ "$count" -lt 3 ]; then
+            echo "::error::expected 3 platform wheels, found $count — refusing to publish"
+            exit 1
+          fi
 
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: ${{ github.event.inputs.target == 'testpypi' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
-          # A tag push must never overwrite: every version is immutable anyway,
-          # but failing early gives a clearer message than a 400 from the index.
+          packages-dir: dist/
           skip-existing: false
           print-hash: true
 
   release:
-    name: Attach artefacts to the GitHub release
+    name: Attach wheels to the GitHub release
     needs: [build, publish]
     if: github.ref_type == 'tag' && (github.event.inputs.target || 'pypi') == 'pypi'
     runs-on: ubuntu-latest
@@ -89,7 +135,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: python-dist
+          pattern: python-dist-*
+          merge-multiple: true
           path: dist/
       - uses: softprops/action-gh-release@v2
         with:

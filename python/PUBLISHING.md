@@ -1,7 +1,8 @@
 # Publishing `gtvdb` to PyPI
 
-The driver is pure Python, so a release is: bump one string, run one gate, upload
-two files. There is no wheel matrix and no platform build.
+The driver carries the in-process engine, so it is no longer pure Python: a
+release is **three platform builds and one upload**. There is no universal
+artefact — each wheel contains a compiled engine for one OS and architecture.
 
 ## First release, in order
 
@@ -83,6 +84,31 @@ The packaging is done. Two things a first user used to hit within ten minutes:
 driver pointless against the production server. Its core pin now carries v1 —
 `ExecuteQuery`, `Negotiate`, and `Execute` for compatibility — so that gap is
 closed; what remains is the engine not being distributable, above.)
+
+## The platform matrix
+
+| runner | wheel tag | covers |
+|:--|:--|:--|
+| `ubuntu-latest` | `manylinux_2_34_x86_64` | glibc ≥ 2.34 (Ubuntu 22.04+) |
+| `windows-latest` | `win_amd64` | Windows 10+ x64 |
+| `macos-latest` | `macosx_*_arm64` | Apple Silicon |
+
+Every wheel is `cp39-abi3`, so one artefact per platform covers Python 3.9–3.13.
+`build_native.py` produces them and CI runs that same script, which is why a
+green pipeline proves the documented local command works.
+
+Intel Macs need `macos-13` added to the matrix; the tag comes from the runner, so
+both architectures can coexist in one release. Linux aarch64 would need an
+`ubuntu-24.04-arm` runner and a `manylinux_*_aarch64` tag.
+
+**No sdist is uploaded.** An sdist carries no compiled engine, so pip on a
+machine without a Rust toolchain would try to build one and fail. Per-platform
+wheels mean every install is complete. `check_release.py` still builds an sdist
+to prove it is self-sufficient, but the publish job uploads `*.whl` only.
+
+A platform missing from a release is worse than a failed release: pip there
+silently resolves an **older, remote-only** version instead of reporting that
+the new one has no wheel for it.
 
 ## Every release
 

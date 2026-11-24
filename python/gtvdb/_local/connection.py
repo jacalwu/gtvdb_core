@@ -1,19 +1,19 @@
-"""PEP 249 Connection backed by an in-process gtv engine."""
+"""PEP 249 `Connection` backed by an in-process gtv engine."""
 
 from __future__ import annotations
 
 from typing import Any, List, Optional
 
+from ..errors import InterfaceError
 from .cursor import Cursor
-from .errors import InterfaceError
 
 
 def _native_connection() -> Any:
     """Import the compiled extension on first use.
 
     Deliberately not at module scope: a source checkout that has not been built
-    yet should still `import pygtvdb_local` — `__version__`, the type codes and
-    the exception hierarchy are useful without an engine, and tooling that only
+    yet should still `import gtvdb` — `__version__`, the type codes and the
+    exception hierarchy are useful without an engine, and tooling that only
     reads metadata should not need a 91 MiB build. A missing extension then
     surfaces at `connect()` as an InterfaceError ("this install is broken")
     rather than as an ImportError escaping an unrelated import line.
@@ -26,7 +26,7 @@ def _native_connection() -> Any:
 
 
 class Connection:
-    """An open, in-process gtv engine. Create with :func:`pygtvdb_local.connect`."""
+    """An open, in-process gtv engine. Create with `gtvdb.connect("gtv://local")`."""
 
     def __init__(self, native: Any, catalog: Optional[str] = None) -> None:
         self._native = native

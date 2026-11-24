@@ -62,12 +62,12 @@ tools/cuda-probe/*.pdb
 *.parquet
 *.pdf
 
-# pygtvdb-local native build artifacts
-python_local/build/
-python_local/dist/
-python_local/*.egg-info/
-python_local/pygtvdb_local/*.so
-python_local/pygtvdb_local/*.pyd
+# pygtvdb in-process engine build artifacts (cargo output copied into the package)
+python/gtvdb/_local/*.so
+python/gtvdb/_local/*.pyd
+python/gtvdb/_local/*.dylib
+python/build/
+python/*.egg-info/
 
 t.tar.gz
 r.tar.gz

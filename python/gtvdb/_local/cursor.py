@@ -8,51 +8,20 @@ from typing import Any, Iterator, List, Optional, Sequence, Tuple
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-from ._params import render
-from .errors import InterfaceError, ProgrammingError
-
-# PEP 249 type codes are plain Python types, matching the network client so
-# callers can switch between pygtvdb and pygtvdb-local without changes.
-STRING = str
-NUMBER = float
-BINARY = bytes
-INTEGER = int
-BOOLEAN = bool
-ROWID = int
-DATETIME = __import__("datetime").datetime
-DATE = __import__("datetime").date
-TIME = __import__("datetime").time
-
-_STRINGS = {pa.string(), pa.large_string()}
-_BINARIES = {pa.binary(), pa.large_binary(), *[pa.binary(n) for n in (0,)]}
-
-
-def _type_code(arrow_type: pa.DataType) -> Any:
-    """Map an Arrow type to the same PEP 249 type object `gtvdb` reports.
-
-    Every number folding into `NUMBER`/`float` is what DBAPI20 does, but it
-    makes an `int64` column indistinguishable from a `double` — a caller
-    building a JSON payload or an INSERT then coerces integers to floats. Keep
-    `INTEGER` and `BOOLEAN` distinct so switching between the network client
-    and this one does not change the reported schema.
-    """
-    if arrow_type in _STRINGS:
-        return STRING
-    if arrow_type in _BINARIES:
-        return BINARY
-    if pa.types.is_boolean(arrow_type):
-        return BOOLEAN
-    if pa.types.is_integer(arrow_type):
-        return INTEGER
-    if pa.types.is_timestamp(arrow_type):
-        return DATETIME
-    if pa.types.is_date(arrow_type):
-        return DATE
-    if pa.types.is_time(arrow_type):
-        return TIME
-    if pa.types.is_floating(arrow_type) or pa.types.is_decimal(arrow_type):
-        return NUMBER
-    return STRING
+from .._params import render
+from .._types import (
+    BINARY,  # noqa: F401 - re-exported for parity with the remote cursor
+    BOOLEAN,
+    DATE,
+    DATETIME,
+    INTEGER,
+    NUMBER,
+    ROWID,
+    STRING,
+    TIME,
+    type_code,
+)
+from ..errors import InterfaceError, ProgrammingError
 
 
 class Cursor:
@@ -61,7 +30,7 @@ class Cursor:
     arraysize: int = 1
     lastrowid: Optional[int] = None
 
-    def __init__(self, connection: "Connection") -> None:
+    def __init__(self, connection: "Any") -> None:
         self._connection = connection
         self._table: Optional[pa.Table] = None
         self._rows: List[Tuple] = []
@@ -71,6 +40,7 @@ class Cursor:
     # -- execution ---------------------------------------------------------
 
     def execute(self, operation: str, parameters: Any = None) -> "Cursor":
+        """Run one statement. Returns `self`, so `cur.execute(...).fetchall()` works."""
         self._ensure_open()
         sql = render(operation, parameters)
         try:
@@ -81,6 +51,7 @@ class Cursor:
         return self
 
     def executemany(self, operation: str, seq_of_parameters: Sequence[Any]) -> "Cursor":
+        """Run the same statement once per parameter set."""
         for params in seq_of_parameters:
             self.execute(operation, params)
         return self
@@ -125,7 +96,7 @@ class Cursor:
         if self._table is None:
             return None
         return [
-            (field.name, _type_code(field.type), None, None, None, None, field.nullable)
+            (field.name, type_code(field.type), None, None, None, None, field.nullable)
             for field in self._table.schema
         ]
 
@@ -166,12 +137,12 @@ class Cursor:
         self._ensure_open()
         if self._table is None:
             # InterfaceError, not ProgrammingError: nothing was queried yet, so
-            # this is interface misuse. `gtvdb` raises the same type for the
-            # same state, and the two drivers must be swappable.
+            # this is interface misuse. The remote cursor raises the same type
+            # for the same state, and the two must be swappable.
             raise InterfaceError("no result set; call execute() first")
 
     def __iter__(self) -> Iterator[Tuple]:
-        """Iterate the remaining rows as tuples (as `gtvdb` and sqlite3 do)."""
+        """Iterate the remaining rows as tuples (as the remote cursor does)."""
         self._ensure_result()
         while True:
             row = self.fetchone()

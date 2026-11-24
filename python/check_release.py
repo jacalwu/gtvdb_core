@@ -168,7 +168,7 @@ def build(dist: Path) -> tuple[Path, Path] | None:
     return wheels[0], sdists[0]
 
 
-def check_artefacts(wheel: Path, sdist: Path) -> bool:
+def check_artefacts(wheel: Path, sdist: Path, *, require_engine: bool = True) -> bool:
     """The wheel must carry what a reader of the source expects to be there."""
     required = {
         "gtvdb/py.typed",
@@ -183,6 +183,26 @@ def check_artefacts(wheel: Path, sdist: Path) -> bool:
     if missing:
         fail(f"wheel is missing: {', '.join(missing)}")
         return False
+
+    # The in-process engine is the reason this distribution is a platform wheel
+    # at all. Shipping one without it would advertise `connect("gtv://local")`
+    # and then fail at that call, so a release must say so loudly rather than
+    # quietly publish a remote-only build under a two-mode description.
+    engine = [
+        n for n in names
+        if n.startswith("gtvdb/_local/") and n.endswith((".pyd", ".so", ".dylib"))
+    ]
+    if engine:
+        ok(f"wheel carries the in-process engine ({engine[0].rsplit('/', 1)[-1]})")
+    elif require_engine:
+        fail(
+            "wheel has no in-process engine: run `python python/build_native.py` "
+            "before building, or pass --allow-missing-engine for a remote-only build"
+        )
+        return False
+    else:
+        skip("wheel is remote-only (no in-process engine)")
+
     if any("__pycache__" in n for n in names):
         fail("wheel contains __pycache__")
         return False
@@ -228,6 +248,12 @@ def main() -> int:
     ap.add_argument("--offline", action="store_true", help="skip the PyPI name/version query")
     ap.add_argument("--keep-dist", action="store_true", help="keep artefacts in python/dist")
     ap.add_argument("--skip-tests", action="store_true", help="skip the unit-test gate")
+    ap.add_argument(
+        "--allow-missing-engine",
+        action="store_true",
+        help="accept a remote-only wheel (no in-process engine). Use this for a "
+        "metadata-only gate; a release should not need it",
+    )
     args = ap.parse_args()
 
     print(f"gtvdb {version()} — release pre-flight\n")
@@ -246,7 +272,12 @@ def main() -> int:
     print(f"\n{DIM}building into {dist}{RESET}")
     built = build(dist)
     if built is not None:
-        results.append(("artefacts", check_artefacts(*built)))
+        results.append(
+            (
+                "artefacts",
+                check_artefacts(*built, require_engine=not args.allow_missing_engine),
+            )
+        )
     else:
         results.append(("artefacts", False))
 
