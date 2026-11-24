@@ -282,7 +282,25 @@ def build_wheel() -> int:
         command = [sys.executable, "-m", "build", "--wheel"]
 
     print("building wheel: " + subprocess.list2cmdline(command))
-    return subprocess.run(command, cwd=HERE, check=False).returncode
+    result = subprocess.run(command, cwd=HERE, check=False)
+    if result.returncode != 0:
+        # Name the stage that failed: the cargo build above succeeded, so a
+        # non-zero exit here is packaging, not compilation, and saying so saves
+        # reading a 20 000-line log to find out.
+        print(
+            f"error: the extension built, but the wheel step failed "
+            f"(exit {result.returncode})",
+            file=sys.stderr,
+        )
+        return result.returncode
+
+    built = sorted(HERE.glob("dist/*.whl"))
+    if not built:
+        print("error: the wheel step reported success but produced no file", file=sys.stderr)
+        return 4
+    for path in built:
+        print(f"wheel: {path.relative_to(REPO)}")
+    return 0
 
 
 def check() -> int:

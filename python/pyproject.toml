@@ -1,6 +1,9 @@
 [build-system]
 # PEP 639 (`license = "<SPDX>"` + `license-files`) needs setuptools >= 77.
-requires = ["setuptools>=77"]
+# `wheel` is listed because setup.py subclasses its `bdist_wheel`: setuptools
+# vendors a copy, but relying on that emits a deprecation warning on every build
+# and would break when the vendored shim is removed.
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
