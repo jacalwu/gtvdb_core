@@ -608,13 +608,29 @@ gtv> SELECT step, gate, prefix_probability
 
 ## 12. 用 Python 跑同一套查询
 
-**能，而且能 `pip install pygtvdb`——但装的是驱动，不是引擎。** 本仓没有任何 PyO3 / maturin 代码（`grep -rn pyo3 --include=Cargo.toml .` 为空），ROADMAP §4 把 M9（pyo3）判为 🗑 下架，所以 Python 侧永远不编译扩展：`gtvdb` 是纯 Python 的 DB-API 2.0 客户端，引擎仍在别处跑。今天有两条可用的路：**Python 当客户端驱动 `gtv` 子进程**（本地、零依赖），或**走 gRPC 协议 v1 连一个跑着的服务**（跨机器、带回执）。
+**能，而且有三种方式——区别只在引擎跑在哪。** `pygtvdb` 是纯 Python 的 DB-API 2.0 客户端（`import gtvdb`），引擎在别处跑；`pygtvdb-local` 把**同一个 `gtv-engine`** 编译进 Python 进程（pyo3 + abi3，`import pygtvdb_local`），不需要服务端也不需要 Docker。两者 PEP 249 表面一致，切换成本是一次 import 改名。
 
 | 方式 | 今天能用 | 能力 | 代价 |
 |:--|:--|:--|:--|
 | **A. 客户端驱动 REPL**（§12.1–12.5） | ✅ | REPL 的全部能力（SQL + 12 条 `.` 指令） | 继承 REPL 的边界（§12.5）；每进程 335 ms 启动 |
 | **B. gRPC 协议 v1**（§12.6） | ✅ | DB-API 2.0（`pip install pygtvdb`），远程 SQL、`as_of` / `snapshot_id` 固定、`QueryReceipt`（含 tri-state 与 freshness） | 需先起服务；服务端目前只注册演示表；只读、无流式、无服务端分页 |
-| C. 原生绑定（pyo3 / cdylib） | ❌ 需立项 | 可绕开 REPL 边界（图遍历、建索引） | 新 crate + 跨平台 wheel + 错误模型映射；M9 已下架 |
+| **C. 进程内引擎**（`pip install pygtvdb-local`） | ✅ | 与 server 同一引擎：SQL 全量、`as_of`、`knn`、图表函数、`gtv_segments()`；无服务端、无 Docker、无 Rust 工具链 | 每个平台一个 abi3 wheel（约 27 MB）；Python 层**不提供** `tri_state` / `receipt` 证据链——需要「空结果必须能证明」时走 B |
+
+进程内模式就是去掉连接串：
+
+```bash
+pip install pygtvdb-local
+```
+
+```python
+import pygtvdb_local as gtv
+
+con = gtv.connect()                                  # 引擎就在这个进程里
+print(con.cursor().execute("SELECT n, n*n AS sq FROM range(1,4) t(n)").fetchall())
+con.register_parquet("prices.parquet", "prices")     # 本地文件直接当表查
+```
+
+两个包可以并存（import 名不同），本仓从源码构建与发布见 [`python_local/README.md`](../python_local/README.md) 与 [`python_local/PUBLISHING.md`](../python_local/PUBLISHING.md)。
 
 ### 12.1 三十秒上手
 

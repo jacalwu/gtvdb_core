@@ -40,9 +40,9 @@ print(cur.fetchall(), cur.tri_state)   # 结果 + 可证明的「无匹配/无�
 
 ```bash
 # 容器：零依赖，同时提供 REPL 与协议 v1 的 gRPC 服务
-docker run --rm -it ghcr.io/<owner>/gtvdb-core:0.1.0                       # REPL
+docker run --rm -it ghcr.io/jacalwu/gtvdb-core:0.1.0                       # REPL
 docker run --rm -p 50051:50051 -e GTV_ADDR=0.0.0.0:50051 \
-  ghcr.io/<owner>/gtvdb-core:0.1.0 gtv-demo-server                        # 供 Python 驱动连接
+  ghcr.io/jacalwu/gtvdb-core:0.1.0 gtv-demo-server                        # 供 Python 驱动连接
 ```
 
 Linux x86_64 静态产物见 GitHub Release 的 `v*` tag（`gtv` REPL + `gtv-demo-server`，

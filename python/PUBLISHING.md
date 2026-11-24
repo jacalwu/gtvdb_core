@@ -70,7 +70,7 @@ The packaging is done. Two things a first user used to hit within ten minutes:
    container image to GHCR; the root `Dockerfile` builds the same image locally:
 
        docker run --rm -p 50051:50051 -e GTV_ADDR=0.0.0.0:50051 \
-         ghcr.io/<owner>/gtvdb-core:0.1.0 gtv-demo-server
+         ghcr.io/jacalwu/gtvdb-core:0.1.0 gtv-demo-server
        # then: python -c "import gtvdb; ...connect('gtv://127.0.0.1:50051')"
 
    The image's `gtv-demo-server` serves one immutable snapshot for protocol
