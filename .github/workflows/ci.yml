@@ -185,7 +185,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install runtime and test deps
-        run: python -m pip install --upgrade pip "grpcio>=1.60" "pyarrow>=14" pandas
+        # grpcio-tools is pinned, not floored: the stub check compares protoc's
+        # output byte-for-byte against the committed files, so a newer protoc
+        # would fail the job for a reason that has nothing to do with the .proto.
+        run: |
+          python -m pip install --upgrade pip "grpcio>=1.60" "pyarrow>=14" pandas
+          python -m pip install "grpcio-tools==1.85.3"
       - name: Stubs match crates/gtv-proto/proto/gtvquery.proto
         run: python python/gen_stubs.py --check
       - name: PEP 249 contract and wire round-trip
@@ -205,8 +210,12 @@ jobs:
             "grpcio>=1.60" "pyarrow>=14" pandas
       # --offline: a pull request must not depend on pypi.org being reachable,
       # and must not query whether a version exists (it may already, by design).
+      # --allow-missing-engine: this job does not build the native artefact —
+      # the three-platform job below is what proves the engine ships. Both
+      # shapes are real: a remote-only wheel is a legitimate build, it just has
+      # to say so at `connect("gtv://local")`.
       - name: Release pre-flight (build, twine check, artefact contents)
-        run: python python/check_release.py --offline
+        run: python python/check_release.py --offline --allow-missing-engine
 
   # `pygtvdb` now carries the engine for `connect("gtv://local")`, so the wheel
   # is platform-specific: three platforms, one Python (abi3 covers 3.9-3.13).

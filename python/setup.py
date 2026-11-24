@@ -16,7 +16,11 @@ before setuptools ever looks at it.
 """
 
 from setuptools import Distribution, setup
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
+try:  # setuptools >= 70.1 ships the command; the `wheel` package is deprecated
+    from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
+except ImportError:  # pragma: no cover - older setuptools only
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
 class BinaryDistribution(Distribution):

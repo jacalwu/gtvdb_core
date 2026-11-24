@@ -27,7 +27,16 @@ GENERATED = ("gtvquery_pb2.py", "gtvquery_pb2.pyi", "gtvquery_pb2_grpc.py")
 
 
 def generate(target: Path) -> None:
-    from grpc_tools import protoc  # imported late so --help works without it
+    try:
+        from grpc_tools import protoc  # imported late so --help works without it
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise SystemExit(
+            "grpcio-tools is not installed, so the stubs cannot be generated "
+            "and therefore cannot be checked.\n"
+            "  python -m pip install grpcio-tools==1.85.3\n"
+            "The version is pinned on purpose: this check compares protoc's "
+            "output byte-for-byte, and a different protoc changes it."
+        ) from exc
 
     target.mkdir(parents=True, exist_ok=True)
     rc = protoc.main(
@@ -81,7 +90,7 @@ def main() -> int:
         ]
         if stale:
             print("stubs are out of date: " + ", ".join(stale), file=sys.stderr)
-            print("run: python examples/python/gen_stubs.py", file=sys.stderr)
+            print("run: python python/gen_stubs.py", file=sys.stderr)
             return 1
         print("stubs match the .proto")
         return 0
