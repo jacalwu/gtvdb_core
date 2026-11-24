@@ -88,7 +88,10 @@ jobs:
         run: python -m unittest discover -s tests -t tests
 
       - name: The wheel installs and answers a local query
-        run: python python/check_wheel.py
+        # --fresh-venv: install into a new virtualenv so only the dependencies
+        # the wheel declares are present. The fast path runs beside this
+        # machine's site-packages, where a missing Requires-Dist is invisible.
+        run: python python/check_wheel.py --fresh-venv
 
       # The release must also pass the same metadata gate a maintainer runs.
       # --offline: a tag push must not depend on PyPI being reachable to ask

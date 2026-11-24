@@ -48,10 +48,17 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 # grpcio is the remote transport; pyarrow is the result format both modes share.
+# protobuf is *not* implied by grpcio: the committed stubs in `gtvdb/_stubs`
+# import `google.protobuf` directly, and without this line `import gtvdb` fails
+# in any environment that does not already have protobuf — which is every fresh
+# venv. The lower bound is the gencode version stamped into those stubs
+# (`ValidateProtobufRuntimeVersion` refuses an older runtime at import time);
+# the upper bound keeps a new major from arriving unreviewed.
 # The compiled engine itself rides inside the platform wheel, not as a dependency.
 dependencies = [
     "grpcio>=1.60",
     "pyarrow>=14",
+    "protobuf>=7.35.1,<8",
 ]
 
 [project.optional-dependencies]

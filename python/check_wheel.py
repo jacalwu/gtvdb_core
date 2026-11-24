@@ -13,6 +13,15 @@ directory on `PYTHONPATH`.
 
     python python/check_wheel.py                    # newest wheel in dist/
     python python/check_wheel.py --wheel path.whl
+    python python/check_wheel.py --fresh-venv       # release gate (see below)
+
+`--fresh-venv` installs into a brand-new virtual environment instead of a
+directory, so only the dependencies the wheel *declares* are present. The fast
+path deliberately skips that: it runs with this interpreter's site-packages, so
+a package missing from `Requires-Dist` still imports here — which is how
+`import gtvdb` once shipped broken, with `protobuf` used by the committed stubs
+but absent from the metadata. That check costs a `pip install`, so a release
+pays it and a local loop does not.
 """
 
 from __future__ import annotations
@@ -110,7 +119,11 @@ def check_contents(wheel: Path) -> None:
     print(f"contents ok: {extension[0]} present, {len(names)} files")
 
 
-def install_and_probe(wheel: Path) -> None:
+def install_and_probe(wheel: Path, *, fresh_env: bool = False) -> None:
+    if fresh_env:
+        _probe_in_fresh_venv(wheel)
+        return
+
     target = Path(tempfile.mkdtemp(prefix="gtvpy-wheel-"))
     print(f"installing into {target}")
 
@@ -150,6 +163,43 @@ def install_and_probe(wheel: Path) -> None:
         )
 
 
+def _probe_in_fresh_venv(wheel: Path) -> None:
+    """Install the wheel into a new venv, resolving only its declared deps.
+
+    A wheel's metadata is a promise about what the machine needs. This is the
+    only check that can break that promise: everything else runs next to
+    packages that happen to be installed already.
+    """
+    root = Path(tempfile.mkdtemp(prefix="gtvpy-venv-")) / "v"
+    print(f"creating a clean venv at {root}")
+    subprocess.run([sys.executable, "-m", "venv", str(root)], check=True)
+    python = (
+        root / "Scripts" / "python.exe"
+        if sys.platform == "win32"
+        else root / "bin" / "python"
+    )
+
+    install = subprocess.run(
+        [str(python), "-m", "pip", "install", "--quiet", "--no-cache-dir", str(wheel)],
+        check=False,
+    )
+    if install.returncode != 0:
+        raise SystemExit(
+            "error: pip could not install the wheel with its declared dependencies"
+        )
+
+    probe = subprocess.run(
+        [str(python), "-c", PROBE, str(root)],
+        cwd=tempfile.gettempdir(),
+        check=False,
+    )
+    if probe.returncode != 0:
+        raise SystemExit(
+            "error: the wheel does not work in a clean environment — its "
+            "Requires-Dist is incomplete (see the traceback above)"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Verify that a built pygtvdb_local wheel installs and works.",
@@ -157,12 +207,18 @@ def main() -> int:
         epilog=__doc__,
     )
     parser.add_argument("--wheel", help="wheel path (default: the one in dist/)")
+    parser.add_argument(
+        "--fresh-venv",
+        action="store_true",
+        help="install into a new venv so only declared dependencies are present "
+        "(slower; this is the check a release should pass)",
+    )
     args = parser.parse_args()
 
     wheel = find_wheel(args.wheel)
     print(f"checking {wheel.name} ({wheel.stat().st_size / (1024 * 1024):.1f} MiB)")
     check_contents(wheel)
-    install_and_probe(wheel)
+    install_and_probe(wheel, fresh_env=args.fresh_venv)
     return 0
 
 
