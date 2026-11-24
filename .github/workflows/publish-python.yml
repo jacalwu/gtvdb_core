@@ -156,7 +156,12 @@ jobs:
         with:
           repository-url: ${{ github.event.inputs.target == 'testpypi' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
           packages-dir: dist/
-          skip-existing: false
+          # 0.2.0 was first published with only the Windows wheel. PyPI allows
+          # adding platform wheels to an existing version, but only when the
+          # uploader skips files that are already there. Without this, the
+          # three-platform matrix fails on the duplicate Windows file and the
+          # Linux wheel never reaches the index.
+          skip-existing: true
           print-hash: true
 
   release:
