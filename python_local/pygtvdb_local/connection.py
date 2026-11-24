@@ -4,15 +4,25 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-try:
-    from . import _gtv_native  # normal: extension sits inside the package
-except ImportError:  # building/developing with the .so next to the package dir
-    import _gtv_native  # type: ignore[no-redef]
-
 from .cursor import Cursor
 from .errors import InterfaceError
 
-_Native = _gtv_native.LocalConnection
+
+def _native_connection() -> Any:
+    """Import the compiled extension on first use.
+
+    Deliberately not at module scope: a source checkout that has not been built
+    yet should still `import pygtvdb_local` — `__version__`, the type codes and
+    the exception hierarchy are useful without an engine, and tooling that only
+    reads metadata should not need a 91 MiB build. A missing extension then
+    surfaces at `connect()` as an InterfaceError ("this install is broken")
+    rather than as an ImportError escaping an unrelated import line.
+    """
+    try:
+        from . import _gtv_native
+    except ImportError:  # developing with the artefact next to the package dir
+        import _gtv_native  # type: ignore[no-redef]
+    return _gtv_native.LocalConnection
 
 
 class Connection:
@@ -28,8 +38,8 @@ class Connection:
     @classmethod
     def open(cls, *, catalog: Optional[str] = None) -> "Connection":
         try:
-            native = _Native()
-        except Exception as exc:  # engine/runtime init failure
+            native = _native_connection()()
+        except Exception as exc:  # engine/runtime init failure, or no extension
             raise InterfaceError(f"cannot open local engine: {exc}") from exc
         return cls(native, catalog=catalog)
 
