@@ -18,10 +18,43 @@
 
 ---
 
-## 2. 快速开始
+## 2. 安装与运行
+
+最短路径不需要 Rust 工具链，也不需要 clone 本仓。
+
+**作为客户端（Python）：**
 
 ```bash
-# 全量回归（无需网络，依赖已缓存时）
+pip install pygtvdb
+```
+
+```python
+import gtvdb
+con = gtvdb.connect("gtv://127.0.0.1:50051")
+cur = con.cursor()
+cur.execute("SELECT * FROM numbers WHERE n <= ?", (3,))
+print(cur.fetchall(), cur.tri_state)   # 结果 + 可证明的「无匹配/无结论」三态
+```
+
+**作为引擎（容器 / 二进制）：**
+
+```bash
+# 容器：零依赖，同时提供 REPL 与协议 v1 的 gRPC 服务
+docker run --rm -it ghcr.io/<owner>/gtvdb-core:0.1.0                       # REPL
+docker run --rm -p 50051:50051 -e GTV_ADDR=0.0.0.0:50051 \
+  ghcr.io/<owner>/gtvdb-core:0.1.0 gtv-demo-server                        # 供 Python 驱动连接
+```
+
+Linux x86_64 静态产物见 GitHub Release 的 `v*` tag（`gtv` REPL + `gtv-demo-server`，
+带 SHA256）。镜像里的 `gtv-demo-server` 服务一个不可变快照用于协议开发；带真实存储的
+生产服务 `gtv-server` 在扩展仓 [`gtvdb_ext`](https://github.com/jacalwu/gtvdb_ext)。
+`pip install pygtvdb` 装的是客户端，不内嵌引擎。完整说明见 [python/README.md](python/README.md)
+与 [python/PUBLISHING.md](python/PUBLISHING.md)。
+
+### 从源码开发（需要 Rust 1.95+，见 [rust-toolchain.toml](rust-toolchain.toml)）
+
+```bash
+# 全量回归（无网络且依赖已缓存时）
 cargo test --workspace --no-fail-fast
 
 # 启动零扩展的核心 REPL
@@ -29,6 +62,9 @@ cargo run -p gtv-cli --bin gtv
 
 # 跑一个核心示例
 cargo run -p gtv-core --example quantum_state_demo
+
+# 本地起一个协议 v1 服务（默认 127.0.0.1:50051）
+cargo run -p gtv-engine --example serve_demo
 ```
 
 REPL 内：`.help` 查看命令，`.quit` 退出，其余输入直接作为 SQL 执行。
@@ -145,6 +181,9 @@ let ctx = GtvContext::with_extensions(
 | [docs/assessment-2026-11.md](docs/assessment-2026-11.md) | A/B/C 路线评估（本仓走 A） |
 | [docs/storage_design.md](docs/storage_design.md) | 早期存储设计存档 |
 | [ROADMAP.md](ROADMAP.md) | 核心主线里程碑 |
+| [docs/api-compat.md](docs/api-compat.md) | 公开 API / 协议兼容、逐 crate MSRV、发布基线检查清单 |
+| [Dockerfile](Dockerfile) / [publish-engine.yml](.github/workflows/publish-engine.yml) | 引擎镜像与 `v*` tag 二进制发行 |
+| [python/PUBLISHING.md](python/PUBLISHING.md) | Python 驱动的 PyPI 发布流程（与引擎发行分离） |
 
 ## License
 

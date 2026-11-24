@@ -1,0 +1,17 @@
+# Build context hygiene. Keep every crates/ file: cargo needs the full source
+# tree (some tests/examples are compiled by --all-targets in CI). Only exclude
+# things that are provably irrelevant to `cargo build` and bloat the context.
+target/
+.git/
+.github/
+docs/
+python/
+testcase/data/
+tools/cuda-probe/
+examples/
+*.csv
+*.parquet
+*.seg
+*.gtvd
+*.gtvobs
+*.pdf

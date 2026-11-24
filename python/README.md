@@ -4,12 +4,30 @@ DB-API 2.0 driver for the gtv temporal-graph engine. Pure Python over gRPC —
 nothing to compile, no platform wheel, no `protoc` on the user's machine.
 
 ```bash
-pip install gtvdb            # or: pip install gtvdb[pandas]
+pip install pygtvdb            # or: pip install pygtvdb[pandas]
 ```
 
-Requires Python 3.9+ and a reachable engine (`gtv-server`, or
-`cargo run -p gtv-engine --example serve_demo` from the core repo). The driver
-is a client only: it does not embed the engine, and it cannot create one.
+> The PyPI distribution is named **`pygtvdb`** (the shorter `gtvdb` name was
+> unavailable at publish time), but you still **`import gtvdb`** in Python —
+> distribution name and import name are deliberately decoupled, so the code
+> below is unchanged from earlier previews.
+
+Requires Python 3.9+ and a reachable engine. The driver is a client only: it
+does not embed the engine, and it cannot create one. The quickest engine is the
+published container image (no Rust toolchain, no git clone):
+
+```bash
+docker run --rm -p 50051:50051 -e GTV_ADDR=0.0.0.0:50051 \
+  ghcr.io/jacalwu/gtvdb-core:0.1.0 gtv-demo-server
+# in another shell: pip install pygtvdb && python your_client.py
+```
+
+The image also ships `gtv`, the zero-extension SQL REPL
+(`docker run --rm -it ghcr.io/jacalwu/gtvdb-core:0.1.0`). Linux binaries are on
+the GitHub release tagged `v*`. The `gtv-demo-server` serves one immutable
+snapshot for protocol development; the production store-backed engine
+(`gtv-server`) lives in the companion `gtvdb_ext` repository. From a source
+checkout, `cargo run -p gtv-engine --example serve_demo` works too.
 
 ```python
 import gtvdb
@@ -89,4 +107,4 @@ python python/check_release.py          # licence copy, stub freshness, tests,
 Pushing a `py-v*` tag publishes through GitHub Actions with PyPI trusted
 publishing, so no token is stored anywhere. The full procedure — including the
 first-release bootstrap, TestPyPI rehearsal, and why a version number can never
-be reused — is in [PUBLISHING.md](PUBLISHING.md).
+be reused — is in [PUBLISHING.md](https://github.com/jacalwu/gtvdb_core/blob/main/python/PUBLISHING.md).

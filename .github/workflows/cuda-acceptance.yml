@@ -122,7 +122,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain is pinned by rust-toolchain.toml (1.95.0). Do NOT use
+      # dtolnay/rust-toolchain@stable here: a moving toolchain hid the gap
+      # between the documented MSRV and the one Cargo.lock actually needs.
+      - name: Verify pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustc --version
+          rustc --version | grep -q '1\.95\.' || { echo "::error::expected rustc 1.95.x from rust-toolchain.toml"; exit 1; }
 
       # Separate cache key: this job builds --release --features cuda, which is
       # a different artifact set from the debug GPU-less jobs in ci.yml.

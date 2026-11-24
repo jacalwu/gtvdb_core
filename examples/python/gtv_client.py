@@ -1,7 +1,7 @@
 """Compatibility shim: the client now lives in the installable package.
 
 The protocol client moved to `python/gtvdb/client.py` so it ships as
-`pip install gtvdb` instead of being copy-pasted into example scripts. This
+`pip install pygtvdb` instead of being copy-pasted into example scripts. This
 file stays so `from gtv_client import connect` keeps working from the examples
 directory, with or without an install.
 

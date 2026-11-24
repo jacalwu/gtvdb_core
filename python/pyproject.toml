@@ -4,9 +4,11 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gtvdb"
+# PyPI distribution name is `pygtvdb`; the Python module stays `import gtvdb`.
+# This keeps existing user code working while reserving the publishable name.
+name = "pygtvdb"
 dynamic = ["version"]
-description = "DB-API 2.0 driver for the gtv temporal-graph engine"
+description = "DB-API 2.0 driver for the gtv temporal-graph engine (import gtvdb)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"

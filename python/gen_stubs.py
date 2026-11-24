@@ -4,7 +4,7 @@
     python python/gen_stubs.py --check    # fail if out of date (CI)
 
 The stubs are committed and shipped in the package, so a user can
-`pip install gtvdb` without owning a protobuf toolchain. This script exists so
+`pip install pygtvdb` without owning a protobuf toolchain. This script exists so
 the shipped copy cannot silently drift from
 `crates/gtv-proto/proto/gtvquery.proto`.
 

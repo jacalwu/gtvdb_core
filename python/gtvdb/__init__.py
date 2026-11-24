@@ -10,7 +10,7 @@
     import pandas as pd
     print(pd.read_sql("SELECT * FROM prices", con))
 
-Install with `pip install gtvdb`; there is nothing to compile — the driver is
+Install with `pip install pygtvdb`; there is nothing to compile — the driver is
 pure Python over gRPC, and Arrow comes from `pyarrow`.
 
 # The three layers, in case you need to drop below DB-API

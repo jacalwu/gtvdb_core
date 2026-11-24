@@ -1,0 +1,104 @@
+name: Publish engine binaries + image
+
+# The missing half of `pip install pygtvdb` (a client only): a distributable
+# engine. Triggered by a version tag `v*` (e.g. v0.1.0) or manually. Produces:
+#   1. Linux x86_64 tarballs (gtv REPL + demo gRPC server) on the GitHub release
+#   2. A container image on GHCR (ghcr.io/<owner>/gtvdb-core)
+# Python driver releases are separate: they use `py-v*` tags (publish-python.yml).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      image_only:
+        description: "Skip binary upload, build image only"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write      # attach binaries to the GitHub release
+  packages: write      # push the image to GHCR
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/gtvdb-core
+
+jobs:
+  binaries:
+    name: Linux x86_64 binaries
+    if: ${{ !github.event.inputs.image_only }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml pins 1.95.0)
+        run: |
+          rustc --version
+          rustc --version | grep -q '1\.95\.' || { echo "::error::expected rustc 1.95.x"; exit 1; }
+      - uses: Swatinem/rust-cache@v2
+      - name: Build REPL + demo server
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p gtv-cli --bin gtv
+          cargo build --release --locked -p gtv-engine --example serve_demo
+      - name: Assemble tarball
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          staging="gtvdb-core-${ver}-x86_64-unknown-linux-gnu"
+          mkdir -p "$staging"
+          cp target/release/gtv              "$staging/gtv"
+          cp target/release/examples/serve_demo "$staging/gtv-demo-server"
+          cp LICENSE.md README.md "$staging/"
+          cat > "$staging/START.md" <<'EOF'
+          # gtvdb-core engine (core build)
+
+          - `./gtv` — zero-extension SQL REPL. Run `./gtv`, type `.help`.
+          - `./gtv-demo-server` — protocol-v1 gRPC server for the `gtvdb` Python driver.
+            It reads the address from `GTV_ADDR` (default `127.0.0.1:50051`):
+                GTV_ADDR=0.0.0.0:50051 ./gtv-demo-server
+            The demo server serves ONE immutable snapshot. The production server
+            (`gtv-server`, backed by a real store) lives in the gtvdb_ext repository.
+
+          The Python client is installed separately: `pip install pygtvdb`.
+          EOF
+          tar czf "${staging}.tar.gz" "$staging"
+          sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+          echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
+      - name: Attach to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          generate_release_notes: true
+
+  image:
+    name: Container image (GHCR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

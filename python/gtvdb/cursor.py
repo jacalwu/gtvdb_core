@@ -195,7 +195,7 @@ class Cursor:
         return self._result.table
 
     def to_pandas(self):
-        """Result as a DataFrame (requires `pip install gtvdb[pandas]`)."""
+        """Result as a DataFrame (requires `pip install pygtvdb[pandas]`)."""
         return self.to_arrow().to_pandas()
 
     def to_polars(self):

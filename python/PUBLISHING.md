@@ -25,7 +25,7 @@ No token is stored anywhere; GitHub mints a short-lived credential per run.
 - [ ] PyPI → *Your account* → *Publishing* → *Add a pending publisher*:
       | field | value |
       |:--|:--|
-      | PyPI project name | `gtvdb` |
+      | PyPI project name | `pygtvdb` |
       | Owner | `jacalwu` |
       | Repository | `gtvdb_core` |
       | Workflow name | `publish-python.yml` |
@@ -40,7 +40,7 @@ have to exist yet. That is why no API token is needed even for `0.1.0`. Use a
 token only if you would rather not put OIDC in the path:
 
 - [ ] PyPI → *Account settings* → *API tokens* → *Add token*. The first release
-      needs an account-scoped token; afterwards re-scope it to the `gtvdb`
+      needs an account-scoped token; afterwards re-scope it to the `pygtvdb`
       project.
 
 ### 3. Rehearse on TestPyPI (once per new packaging change)
@@ -56,19 +56,26 @@ token only if you would rather not put OIDC in the path:
 
 - [ ] `git tag py-v0.1.0 && git push origin py-v0.1.0` — the tag must equal
       `gtvdb/_version.py` or the workflow stops at the version check.
-- [ ] Confirm <https://pypi.org/project/gtvdb/> renders the README, the licence,
+- [ ] Confirm <https://pypi.org/project/pygtvdb/> renders the README, the licence,
       and the Python 3.9–3.13 classifiers.
 
 ## What the repository still has to change before `0.1.0` means something
 
-The packaging is done; these are the gaps a first user will hit within ten
-minutes, and none of them are fixed by a metadata field:
+The packaging is done. Two things a first user used to hit within ten minutes:
 
-1. **There is no engine on PyPI.** `pip install gtvdb` installs a client. Its
-   README says to start `gtv-server` or `cargo run -p gtv-engine --example
-   serve_demo`, which requires a Rust toolchain and a git clone. A "Getting
-   started" that ends in `cargo build` is a real drop-off; shipping a container
-   image (or publishing the engine binary) is the missing half of the story.
+1. **Engine distribution — now solved.** `pip install pygtvdb` is still a client
+   only (it cannot embed the engine), but the server half no longer requires a
+   Rust toolchain and a git clone. The `v*` tag workflow (`.github/workflows/
+   publish-engine.yml`) publishes Linux binaries to the GitHub release and a
+   container image to GHCR; the root `Dockerfile` builds the same image locally:
+
+       docker run --rm -p 50051:50051 -e GTV_ADDR=0.0.0.0:50051 \
+         ghcr.io/<owner>/gtvdb-core:0.1.0 gtv-demo-server
+       # then: python -c "import gtvdb; ...connect('gtv://127.0.0.1:50051')"
+
+   The image's `gtv-demo-server` serves one immutable snapshot for protocol
+   development; the production store-backed server remains in `gtvdb_ext`.
+   Practise the image tag against TestPyPI's client before announcing either.
 2. **`gtvdb` is still an unclaimed name.** It was free at the time of writing,
    but names are first-come. `check_release.py` re-checks it on every run.
 

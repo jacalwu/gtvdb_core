@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Pre-flight gate for publishing the `gtvdb` driver to PyPI.
+"""Pre-flight gate for publishing the `pygtvdb` driver to PyPI.
 
     python python/check_release.py                # all checks, builds into a temp dir
     python python/check_release.py --keep-dist    # leave the artefacts in python/dist
@@ -31,7 +31,7 @@ REPO = HERE.parent
 LICENSE_SRC = REPO / "LICENSE.md"
 LICENSE_COPY = HERE / "LICENSE.md"
 STUBS_SCRIPT = HERE / "gen_stubs.py"
-NAME = "gtvdb"
+NAME = "pygtvdb"  # PyPI distribution name; the Python import stays `gtvdb`
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 
@@ -176,7 +176,7 @@ def check_artefacts(wheel: Path, sdist: Path) -> bool:
         "gtvdb/_stubs/gtvquery_pb2.py",
         "gtvdb/_stubs/gtvquery_pb2_grpc.py",
         "gtvdb/_stubs/gtvquery_pb2.pyi",
-        f"gtvdb-{version()}.dist-info/licenses/LICENSE.md",
+        f"{NAME}-{version()}.dist-info/licenses/LICENSE.md",
     }
     names = set(zipfile.ZipFile(wheel).namelist())
     missing = sorted(required - names)
