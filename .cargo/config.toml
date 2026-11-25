@@ -2,3 +2,17 @@
 # stay out of the normal build. See `crates/xtask/src/main.rs`.
 [alias]
 xtask = "run -p xtask --"
+
+# pyo3's `extension-module` feature intentionally leaves Python C API symbols
+# undefined; they are resolved by the interpreter at import time. The macOS
+# linker rejects undefined symbols by default, so every rustc invocation for an
+# Apple target needs these two flags. Without them the wheel builds on Linux and
+# Windows but the macOS job dies at the final link with dozens of
+# `_PyExc_* / _Py_* symbol(s) not found for architecture arm64`.
+#
+# Scoped by target: Linux/Windows builds are untouched.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
