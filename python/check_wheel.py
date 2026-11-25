@@ -43,9 +43,15 @@ DIST = HERE / "dist"
 #: fails exactly here.
 PROBE = """
 import sys
+from pathlib import Path
 import gtvdb
 
-assert gtvdb.__file__.startswith(sys.argv[1]), f"imported {gtvdb.__file__}, not the wheel"
+# On macOS /var is a symlink to /private/var: tempfile returns the former and
+# CPython reports the latter as __file__. Resolve both before comparing, or a
+# perfectly good wheel is rejected as "not installed" on every macOS runner.
+installed = Path(gtvdb.__file__).resolve()
+root = Path(sys.argv[1]).resolve()
+assert installed.is_relative_to(root), f"imported {installed}, not the wheel"
 
 con = gtvdb.connect("gtv://local")
 cur = con.cursor()
