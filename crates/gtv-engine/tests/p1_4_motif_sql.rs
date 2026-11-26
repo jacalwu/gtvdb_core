@@ -15,8 +15,10 @@ use arrow::array::{
     UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
-use gtv_core::TemporalCSR;
-use gtv_engine::{find_matches, match_schema, GtvContext, MotifShape, MotifSpec};
+use gtv_core::{TemporalCSR, TraversalBudget};
+use gtv_engine::{
+    find_matches, find_matches_bounded, match_schema, GtvContext, MotifShape, MotifSpec,
+};
 use gtv_pattern::{Match, Pattern, WindowedMotif};
 
 const T: i64 = 100;
@@ -266,10 +268,14 @@ async fn edge_table_reconstructs_every_matched_edge() {
         assert_eq!(rebuilt[i], expected, "match {i} edge projection");
         // The slot must actually address this edge in the snapshot.
         for e in &m.edges {
-            let (dst, vf, _vt, _et) = csr.edge_slices(e.src).unwrap();
+            let (base, dst, vf, _vt, _et) = csr.edge_slices_with_start(e.src).unwrap();
             let s = e.edge_idx as usize;
-            assert_eq!(dst[s], e.dst, "edge_idx {s} does not name this edge");
-            assert_eq!(vf[s], e.valid_from);
+            assert!(
+                s >= base && s < base + dst.len(),
+                "edge_idx {s} outside source run"
+            );
+            assert_eq!(dst[s - base], e.dst, "edge_idx {s} does not name this edge");
+            assert_eq!(vf[s - base], e.valid_from);
         }
     }
 }
@@ -432,4 +438,30 @@ async fn invalid_shape_is_rejected() {
     ctx.register_motif(&csr);
     let err = ctx.sql("SELECT * FROM motif('not_a_shape', 100)").await;
     assert!(err.is_err(), "unknown shape must fail loudly");
+}
+
+#[test]
+fn window_and_event_gap_work_with_a_budget() {
+    let csr = ring_graph();
+    let spec = MotifSpec::new(MotifShape::Path(2), T)
+        .with_limit(10)
+        .with_window(25)
+        .with_event_gap(0, 1, 5, Some(15))
+        .unwrap()
+        .with_budget(TraversalBudget::unlimited().with_max_edges(10_000));
+
+    let outcome = find_matches_bounded(&csr, &spec, Some(&[0])).unwrap();
+    assert_eq!(outcome.matches.len(), 2);
+    assert!(outcome.truncation.is_none());
+    assert_eq!(outcome.tri_state(), gtv_core::TriState::Found);
+
+    let too_tight = MotifSpec::new(MotifShape::Path(2), T)
+        .with_limit(10)
+        .with_window(25)
+        .with_event_gap(0, 1, 5, Some(9))
+        .unwrap()
+        .with_budget(TraversalBudget::unlimited().with_max_edges(10_000));
+    let none = find_matches_bounded(&csr, &too_tight, Some(&[0])).unwrap();
+    assert!(none.matches.is_empty());
+    assert!(none.truncation.is_none());
 }

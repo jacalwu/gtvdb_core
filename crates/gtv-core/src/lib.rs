@@ -9,6 +9,7 @@ pub mod bitemporal;
 pub mod chunk;
 pub mod column;
 pub mod csr;
+pub mod edge_attr;
 pub mod endpoint;
 pub mod error;
 pub mod graph;
@@ -32,6 +33,7 @@ pub use column::{Col, ColumnError, MappedRegion, Pod};
 pub use csr::{
     CsrColumns, DirectionMode, Neighbor, NeighborStrategy, Neighbors, TemporalCSR, TemporalCsrStats,
 };
+pub use edge_attr::{AttrCol, AttrPred, EdgeAttrSchema, EdgeAttrs, RangeOp};
 pub use endpoint::{
     ActiveNeighbors, EndpointPolicy, EndpointView, NodeLifetime, OPEN_FROM, OPEN_TO,
 };

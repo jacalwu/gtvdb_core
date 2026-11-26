@@ -8,8 +8,8 @@
 //! `valid_from`) ordering constraints.
 
 use gtv_core::{
-    BudgetTracker, CancelToken, DedupKey, EdgeRef, PathEvidence, Result, Sel, TemporalCSR,
-    TraversalBudget, TraversalStats, TriState, Truncation, UNBOUND_SNAPSHOT,
+    BudgetTracker, CancelToken, DedupKey, EdgePredicate, EdgeRef, Neighbor, PathEvidence, Result,
+    Sel, TemporalCSR, TraversalBudget, TraversalStats, TriState, Truncation, UNBOUND_SNAPSHOT,
 };
 
 /// A pattern edge from variable `from` to variable `to`.
@@ -25,12 +25,40 @@ pub struct PatternEdge {
     pub edge_type: Option<u16>,
 }
 
-/// Temporal ordering: the event time (`valid_from`) of edge `before` must be
-/// strictly less than that of edge `after`.
+/// Temporal ordering between two matched edges.
+///
+/// Defaults to strict ordering (`after - before >= 1`) so built-in patterns keep
+/// their original semantics. Setting `min_gap = 0` allows equal event times;
+/// `max_gap` bounds the delay. Both bounds are inclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventOrder {
     pub before: usize,
     pub after: usize,
+    pub min_gap: i64,
+    pub max_gap: Option<i64>,
+}
+
+impl EventOrder {
+    /// Strict ordering, equivalent to `before < after`.
+    pub fn strict(before: usize, after: usize) -> Self {
+        Self {
+            before,
+            after,
+            min_gap: 1,
+            max_gap: None,
+        }
+    }
+
+    /// Inclusive gap bounds. `min_gap > max_gap` is rejected at match time by
+    /// treating the constraint as unsatisfiable rather than panicking.
+    pub fn window(before: usize, after: usize, min_gap: i64, max_gap: Option<i64>) -> Self {
+        Self {
+            before,
+            after,
+            min_gap,
+            max_gap,
+        }
+    }
 }
 
 /// A temporal graph pattern.
@@ -54,10 +82,7 @@ impl Pattern {
             })
             .collect();
         let event_orders = (0..len.saturating_sub(1))
-            .map(|i| EventOrder {
-                before: i,
-                after: i + 1,
-            })
+            .map(|i| EventOrder::strict(i, i + 1))
             .collect();
         Self {
             num_vars: len + 1,
@@ -93,16 +118,7 @@ impl Pattern {
                     edge_type: None,
                 },
             ],
-            event_orders: vec![
-                EventOrder {
-                    before: 0,
-                    after: 2,
-                },
-                EventOrder {
-                    before: 1,
-                    after: 3,
-                },
-            ],
+            event_orders: vec![EventOrder::strict(0, 2), EventOrder::strict(1, 3)],
         }
     }
 
@@ -118,10 +134,7 @@ impl Pattern {
             })
             .collect();
         let event_orders = (0..len.saturating_sub(1))
-            .map(|i| EventOrder {
-                before: i,
-                after: i + 1,
-            })
+            .map(|i| EventOrder::strict(i, i + 1))
             .collect();
         Self {
             num_vars: len,
@@ -408,14 +421,14 @@ fn ring3_from(
     limit: usize,
     out: &mut Vec<Match>,
 ) -> Result<()> {
-    let (da, vfa, vta, eta) = csr.edge_slices(a)?;
+    let (base_a, da, vfa, vta, eta) = csr.edge_slices_with_start(a)?;
     for i in 0..da.len() {
         let b = da[i];
         let t0 = vfa[i];
         if b == a || (!all_active && (t0 > valid_at || valid_at >= vta[i])) {
             continue;
         }
-        let (db, vfb, vtb, etb) = csr.edge_slices(b)?;
+        let (base_b, db, vfb, vtb, etb) = csr.edge_slices_with_start(b)?;
         for j in 0..db.len() {
             let c = db[j];
             if c == a || c == b {
@@ -425,7 +438,7 @@ fn ring3_from(
             if t1 <= t0 || (!all_active && (t1 > valid_at || valid_at >= vtb[j])) {
                 continue;
             }
-            let (dc, vfc, vtc, etc_) = csr.edge_slices(c)?;
+            let (base_c, dc, vfc, vtc, etc_) = csr.edge_slices_with_start(c)?;
             for k in 0..dc.len() {
                 if dc[k] != a {
                     continue;
@@ -443,7 +456,7 @@ fn ring3_from(
                             edge_type: eta[i],
                             valid_from: t0,
                             valid_to: vta[i],
-                            edge_idx: i as u32,
+                            edge_idx: (base_a + i) as u32,
                         },
                         MatchedEdge {
                             src: b,
@@ -451,7 +464,7 @@ fn ring3_from(
                             edge_type: etb[j],
                             valid_from: t1,
                             valid_to: vtb[j],
-                            edge_idx: j as u32,
+                            edge_idx: (base_b + j) as u32,
                         },
                         MatchedEdge {
                             src: c,
@@ -459,7 +472,7 @@ fn ring3_from(
                             edge_type: etc_[k],
                             valid_from: t2,
                             valid_to: vtc[k],
-                            edge_idx: k as u32,
+                            edge_idx: (base_c + k) as u32,
                         },
                     ],
                 });
@@ -588,6 +601,54 @@ pub fn find_bounded(
     budget: &TraversalBudget,
     cancel: Option<&CancelToken>,
 ) -> Result<MatchSet> {
+    find_bounded_impl(
+        csr, pattern, None, valid_at, limit, candidates, budget, cancel, None,
+    )
+}
+
+/// Bounded search with window/sequence constraints and a push-down edge
+/// predicate (for example a fixed-width attribute range).
+///
+/// This is the general form used by domain extensions that need all three at
+/// once: a snapshot-bound candidate set, a resource budget that reports
+/// truncation, and an attribute filter that must run before a match is emitted.
+/// The plain [`find_bounded`] remains the zero-predicate, non-windowed case.
+#[allow(clippy::too_many_arguments)]
+pub fn find_bounded_motif(
+    csr: &TemporalCSR,
+    motif: &WindowedMotif,
+    valid_at: i64,
+    limit: usize,
+    candidates: &Sel,
+    budget: &TraversalBudget,
+    cancel: Option<&CancelToken>,
+    predicate: Option<&dyn EdgePredicate>,
+) -> Result<MatchSet> {
+    find_bounded_impl(
+        csr,
+        &motif.pattern,
+        Some(motif),
+        valid_at,
+        limit,
+        candidates,
+        budget,
+        cancel,
+        predicate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_bounded_impl(
+    csr: &TemporalCSR,
+    pattern: &Pattern,
+    motif: Option<&WindowedMotif>,
+    valid_at: i64,
+    limit: usize,
+    candidates: &Sel,
+    budget: &TraversalBudget,
+    cancel: Option<&CancelToken>,
+    predicate: Option<&dyn EdgePredicate>,
+) -> Result<MatchSet> {
     if let Some(id) = csr.snapshot_id() {
         candidates.check_against(id)?;
     }
@@ -607,7 +668,7 @@ pub fn find_bounded(
         }
         tracker.set_hop(1);
         state.nodes[0] = start;
-        let keep = dfs(
+        let keep = dfs_inner(
             csr,
             pattern,
             valid_at,
@@ -616,7 +677,8 @@ pub fn find_bounded(
             &mut out,
             limit,
             Some(&tracker),
-            None,
+            motif,
+            predicate,
         )?;
         if !keep {
             break;
@@ -686,10 +748,16 @@ impl DfsState {
     }
 
     fn event_orders_satisfied(&self, pattern: &Pattern) -> bool {
-        pattern
-            .event_orders
-            .iter()
-            .all(|o| self.valid_from[o.before] < self.valid_from[o.after])
+        pattern.event_orders.iter().all(|o| {
+            let Some(delta) = self.valid_from[o.after].checked_sub(self.valid_from[o.before])
+            else {
+                return false;
+            };
+            if delta < o.min_gap {
+                return false;
+            }
+            o.max_gap.is_none_or(|max| delta <= max)
+        })
     }
 }
 
@@ -698,7 +766,7 @@ impl DfsState {
 /// The partial `matches` stay in the caller's buffer: a truncated search is a
 /// partial answer, not an error.
 #[allow(clippy::too_many_arguments)]
-fn dfs(
+fn dfs_inner(
     csr: &TemporalCSR,
     pattern: &Pattern,
     valid_at: i64,
@@ -708,6 +776,7 @@ fn dfs(
     limit: usize,
     tracker: Option<&BudgetTracker>,
     motif: Option<&WindowedMotif>,
+    predicate: Option<&dyn EdgePredicate>,
 ) -> Result<bool> {
     if matches.len() >= limit {
         return Ok(true);
@@ -729,7 +798,7 @@ fn dfs(
 
     // Direct slice access — skips the `neighbors` iterator's per-edge `Neighbor`
     // struct and closure overhead, which dominates a multi-million-node scan.
-    let (dst, vf, vt, et) = csr.edge_slices(from_node)?;
+    let (base, dst, vf, vt, et) = csr.edge_slices_with_start(from_node)?;
     for idx in 0..dst.len() {
         if let Some(t) = tracker {
             // A tripped cap unwinds one frame at a time; `false` propagates all
@@ -751,6 +820,19 @@ fn dfs(
                 continue;
             }
         }
+        if let Some(pred) = predicate {
+            let slot = (base + idx) as u32;
+            let edge = Neighbor {
+                dst: dst[idx],
+                edge_type: et[idx],
+                valid_from: vf_i,
+                valid_to: vt[idx],
+                edge_idx: slot,
+            };
+            if !pred.keep(&edge) {
+                continue;
+            }
+        }
         let dst_i = dst[idx];
         if to_bound {
             // The destination is already fixed: only edges into it count.
@@ -760,8 +842,8 @@ fn dfs(
             state.valid_from[ei] = vf_i;
             state.valid_to[ei] = vt[idx];
             state.edge_type[ei] = et[idx];
-            state.edge_idx[ei] = idx as u32;
-            let keep = dfs(
+            state.edge_idx[ei] = (base + idx) as u32;
+            let keep = dfs_inner(
                 csr,
                 pattern,
                 valid_at,
@@ -771,6 +853,7 @@ fn dfs(
                 limit,
                 tracker,
                 motif,
+                predicate,
             )?;
             if !keep {
                 return Ok(false);
@@ -791,8 +874,8 @@ fn dfs(
             state.valid_from[ei] = vf_i;
             state.valid_to[ei] = vt[idx];
             state.edge_type[ei] = et[idx];
-            state.edge_idx[ei] = idx as u32;
-            let keep = dfs(
+            state.edge_idx[ei] = (base + idx) as u32;
+            let keep = dfs_inner(
                 csr,
                 pattern,
                 valid_at,
@@ -802,6 +885,7 @@ fn dfs(
                 limit,
                 tracker,
                 motif,
+                predicate,
             )?;
             state.nodes[e.to] = u64::MAX;
             if !keep {
@@ -810,6 +894,23 @@ fn dfs(
         }
     }
     Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dfs(
+    csr: &TemporalCSR,
+    pattern: &Pattern,
+    valid_at: i64,
+    ei: usize,
+    state: &mut DfsState,
+    matches: &mut Vec<Match>,
+    limit: usize,
+    tracker: Option<&BudgetTracker>,
+    motif: Option<&WindowedMotif>,
+) -> Result<bool> {
+    dfs_inner(
+        csr, pattern, valid_at, ei, state, matches, limit, tracker, motif, None,
+    )
 }
 
 #[cfg(test)]
@@ -1096,5 +1197,109 @@ mod tests {
         assert!(find_windowed_from(g.csr(), &motif, 0, 500, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn event_order_gap_bounds_are_inclusive() {
+        let nodes = NodeTable::new(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
+                vec![Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as _],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let edges = EdgeTable::from_vecs(
+            vec![0, 1],
+            vec![1, 2],
+            vec![1u16, 1],
+            vec![10, 70],
+            vec![1000, 1000],
+        )
+        .unwrap();
+        let g = TemporalGraph::new(nodes, edges).unwrap();
+
+        let mut pattern = Pattern::temporal_path(2);
+        pattern.event_orders = vec![EventOrder::window(0, 1, 50, Some(65))];
+        assert_eq!(find_from(g.csr(), &pattern, 0, 500, 10).unwrap().len(), 1);
+
+        pattern.event_orders = vec![EventOrder::window(0, 1, 50, Some(55))];
+        assert!(find_from(g.csr(), &pattern, 0, 500, 10).unwrap().is_empty());
+
+        pattern.event_orders = vec![EventOrder::window(0, 1, 61, None)];
+        assert!(find_from(g.csr(), &pattern, 0, 500, 10).unwrap().is_empty());
+
+        let mut equal = Pattern::temporal_path(2);
+        equal.event_orders = vec![EventOrder::window(0, 1, 0, None)];
+        assert_eq!(find_from(g.csr(), &equal, 0, 500, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn matched_edge_idx_is_the_global_csr_slot() {
+        let nodes = NodeTable::new(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
+                vec![Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as _],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let edges = EdgeTable::from_vecs(
+            vec![0, 1],
+            vec![1, 2],
+            vec![1u16, 1],
+            vec![10, 20],
+            vec![1000, 1000],
+        )
+        .unwrap();
+        let g = TemporalGraph::new(nodes, edges).unwrap();
+
+        let matches = find_from(g.csr(), &Pattern::temporal_path(1), 1, 500, 10).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].edges[0].dst, 2);
+        assert_eq!(matches[0].edges[0].edge_idx, 1);
+    }
+
+    #[test]
+    fn bounded_motif_pushes_attribute_predicate_into_matching() {
+        use gtv_core::{AttrPred, EdgeAttrs};
+
+        let nodes = NodeTable::new(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
+                vec![Arc::new(UInt64Array::from(vec![0u64, 1])) as _],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let edges = EdgeTable::from_vecs(
+            vec![0, 0],
+            vec![1, 1],
+            vec![1u16, 1],
+            vec![10, 20],
+            vec![1000, 1000],
+        )
+        .unwrap();
+        let g = TemporalGraph::new(nodes, edges).unwrap();
+
+        let attrs = Arc::new(EdgeAttrs::from_vecs(&["amount"], vec![vec![5.0, 50.0]]).unwrap());
+        let pred = AttrPred::gt(attrs, 0, 10.0).unwrap();
+        let motif = WindowedMotif::new(Pattern::temporal_path(1));
+        let candidates = Sel::all(UNBOUND_SNAPSHOT, g.csr().node_count() as u64);
+        let set = find_bounded_motif(
+            g.csr(),
+            &motif,
+            500,
+            10,
+            &candidates,
+            &TraversalBudget::unlimited(),
+            None,
+            Some(&pred),
+        )
+        .unwrap();
+
+        assert_eq!(set.matches.len(), 1);
+        assert_eq!(set.matches[0].edges[0].edge_idx, 1);
+        assert!(set.truncation.is_none());
     }
 }

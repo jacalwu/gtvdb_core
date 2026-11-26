@@ -460,6 +460,15 @@ gtv_ext_lib/
 
 M2 起才动 Top-K 与 provenance 分层；CUDA 仍排在 M4 之后。
 
+### 7.2 通用过滤与时间窗补强
+
+- `gtv-core/src/edge_attr.rs`（新）：`EdgeAttrSchema` / `EdgeAttrs` / `AttrPred` / `RangeOp`。定宽 `f64` 属性通过全局 `edge_idx` 关联边；`AttrPred` 实现 `EdgePredicate` 且要求边身份，不把金额、币种、渠道等字段塞进 CSR 热数组。
+- `gtv-core/src/column.rs`：`f64` 进入 `Pod` 白名单，属性列可复用 `Col<T>` 的 owned / mmap 两种后端。
+- `gtv-core/src/csr.rs`：`edge_slices_with_start()` 暴露源节点 run 的全局起始槽位。此前 `gtv-pattern` 把 slice-local 下标当作 `edge_idx`，第二个及以后源节点的证据会指错边；现已修正。
+- `gtv-pattern::EventOrder`：新增 `min_gap` / `max_gap`，`strict()` 保持旧的严格递增语义，`window()` 支持非严格与有界延迟。`find_bounded_motif()` 把候选集、预算、窗口/序列、边谓词四条链合并到一个内核入口。
+- `gtv-engine::MotifSpec::with_event_gap()` 与 `find_matches_bounded_with_predicate()`：窗口/序列/事件间隔现在可以和安全预算同时使用；不再以“bounded 不支持 windowed”拒绝查询。
+- 仍未做：完整 provenance `origin` 列（`EdgeRef` 反查段/行）、向量空间强绑定、FullHit 真短路。它们不是 smurfing 首版的阻塞项。
+
 ---
 
 ## 8. 明确不做

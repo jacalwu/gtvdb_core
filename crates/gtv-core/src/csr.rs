@@ -523,8 +523,24 @@ impl TemporalCSR {
     /// range.
     #[inline]
     pub fn edge_slices(&self, src: u64) -> Result<(&[u64], &[i64], &[i64], &[u16])> {
+        let (_, dst, vf, vt, et) = self.edge_slices_with_start(src)?;
+        Ok((dst, vf, vt, et))
+    }
+
+    /// Like [`TemporalCSR::edge_slices`], but also returns the first *global*
+    /// slot of `src`'s run in the sorted edge arrays.
+    ///
+    /// Operators that attach evidence or attribute sidecars keyed by
+    /// [`Neighbor::edge_idx`] must add this base to their local loop index.
+    /// A slice-local index is only unique inside one source's run and silently
+    /// points at the wrong row for any other source.
+    pub fn edge_slices_with_start(
+        &self,
+        src: u64,
+    ) -> Result<(usize, &[u64], &[i64], &[i64], &[u16])> {
         let (start, end) = self.edge_range(src)?;
         Ok((
+            start,
             &self.dst[start..end],
             &self.valid_from[start..end],
             &self.valid_to[start..end],

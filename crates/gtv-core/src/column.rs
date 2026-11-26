@@ -47,6 +47,7 @@ mod sealed {
     impl Sealed for u64 {}
     impl Sealed for i64 {}
     impl Sealed for f32 {}
+    impl Sealed for f64 {}
 }
 
 /// Plain-old-data element types allowed to back a [`Col`].
@@ -57,10 +58,10 @@ mod sealed {
 /// reinterpretation undefined behaviour.
 ///
 /// The admission criterion is «every bit pattern is a valid value and there is
-/// no padding»: `f32` qualifies because NaN / infinities / ±0 are all valid
-/// `f32` bit patterns (this is the same judgment `bytemuck` makes), and
-/// `size_of::<f32>() == align_of::<f32>() == 4`. Any future addition (`f64`,
-/// `i32`, …) must be reviewed against the same criterion.
+/// no padding»: `f32` and `f64` qualify because NaN / infinities / ±0 are all
+/// valid floating-point bit patterns (this is the same judgment `bytemuck`
+/// makes), and each has `size_of == align_of`. Any future addition (`i32`, …)
+/// must be reviewed against the same criterion.
 pub trait Pod: sealed::Sealed + Copy + Send + Sync + 'static {}
 
 impl<T> Pod for T where T: sealed::Sealed + Copy + Send + Sync + 'static {}

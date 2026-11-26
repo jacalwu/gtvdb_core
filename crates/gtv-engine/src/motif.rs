@@ -51,10 +51,10 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use gtv_core::{
-    Incomplete, QueryReceipt, Sel, TemporalCSR, TraversalBudget, TraversalStats,
+    EdgePredicate, Incomplete, QueryReceipt, Sel, TemporalCSR, TraversalBudget, TraversalStats,
     TriState, Truncation, UNBOUND_SNAPSHOT,
 };
-use gtv_pattern::{Match, Pattern, WindowedMotif};
+use gtv_pattern::{EventOrder, Match, Pattern, WindowedMotif};
 
 use crate::expr_util::{expr_to_i64, expr_to_string, expr_to_u64};
 
@@ -119,6 +119,15 @@ impl MotifShape {
     }
 }
 
+/// Inclusive delay bounds between two consecutive pattern edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventGap {
+    pub before: usize,
+    pub after: usize,
+    pub min_gap: i64,
+    pub max_gap: Option<i64>,
+}
+
 /// Complete specification of one motif query.
 #[derive(Debug, Clone)]
 pub struct MotifSpec {
@@ -129,8 +138,11 @@ pub struct MotifSpec {
     pub max_event_span: Option<i64>,
     /// Matched edge types, ordered by event time, must equal this sequence.
     pub sequence: Vec<u16>,
+    /// Optional per-pair time gaps, applied on top of the shape's default
+    /// strict ordering. Zero means equal event times are allowed.
+    pub event_gaps: Vec<EventGap>,
     /// Optional resource cap. When set, the matcher runs through
-    /// `gtv_pattern::find_bounded`, counts every scanned edge, and reports
+    /// `gtv_pattern::find_bounded_motif`, counts every scanned edge, and reports
     /// truncation instead of pretending the prefix is the answer.
     pub budget: Option<TraversalBudget>,
 }
@@ -144,6 +156,7 @@ impl PartialEq for MotifSpec {
             && self.limit == other.limit
             && self.max_event_span == other.max_event_span
             && self.sequence == other.sequence
+            && self.event_gaps == other.event_gaps
     }
 }
 
@@ -155,6 +168,7 @@ impl MotifSpec {
             limit: DEFAULT_LIMIT,
             max_event_span: None,
             sequence: Vec::new(),
+            event_gaps: Vec::new(),
             budget: None,
         }
     }
@@ -182,6 +196,35 @@ impl MotifSpec {
         self
     }
 
+    /// Require `valid_from[after] - valid_from[before]` to fall inside the
+    /// inclusive bounds. Indices are pattern-edge indices, not node ids.
+    pub fn with_event_gap(
+        mut self,
+        before: usize,
+        after: usize,
+        min_gap: i64,
+        max_gap: Option<i64>,
+    ) -> Result<Self> {
+        let edges = self.shape.pattern().edges.len();
+        if before >= edges || after >= edges {
+            return Err(DataFusionError::Execution(format!(
+                "motif: event gap indices {before}->{after} outside a {edges}-edge pattern"
+            )));
+        }
+        if max_gap.is_some_and(|max| max < min_gap) {
+            return Err(DataFusionError::Execution(format!(
+                "motif: event gap {before}->{after} has upper bound below lower bound {min_gap}"
+            )));
+        }
+        self.event_gaps.push(EventGap {
+            before,
+            after,
+            min_gap,
+            max_gap,
+        });
+        Ok(self)
+    }
+
     pub fn num_vars(&self) -> usize {
         self.shape.num_vars()
     }
@@ -189,11 +232,24 @@ impl MotifSpec {
     /// Window / sequence constraints deliberately bypass the optimized 3-cycle
     /// fast path in `find`; this is why the two branches below are separate.
     pub fn is_windowed(&self) -> bool {
-        self.max_event_span.is_some() || !self.sequence.is_empty()
+        self.max_event_span.is_some() || !self.sequence.is_empty() || !self.event_gaps.is_empty()
     }
 
     fn windowed_motif(&self) -> WindowedMotif {
-        let mut motif = WindowedMotif::new(self.shape.pattern());
+        let mut pattern = self.shape.pattern();
+        for gap in &self.event_gaps {
+            let order = EventOrder::window(gap.before, gap.after, gap.min_gap, gap.max_gap);
+            if let Some(existing) = pattern
+                .event_orders
+                .iter_mut()
+                .find(|o| o.before == gap.before && o.after == gap.after)
+            {
+                *existing = order;
+            } else {
+                pattern.event_orders.push(order);
+            }
+        }
+        let mut motif = WindowedMotif::new(pattern);
         if let Some(span) = self.max_event_span {
             motif = motif.with_window(span);
         }
@@ -295,22 +351,33 @@ impl MotifOutcome {
 
 /// Like [`find_matches`], but honours `spec.budget`.
 ///
-/// With no budget this is exactly [`find_matches`] plus default stats. With a
-/// budget it routes through `gtv_pattern::find_bounded`, which accounts for
-/// every scanned edge; exceeding the cap returns the prefix **and** a
-/// [`Truncation`] instead of an error, so the caller decides whether a partial
-/// answer is acceptable.
-///
-/// Windowed specs (`max_event_span` / `sequence`) cannot be combined with a
-/// budget yet: the bounded kernel takes a plain [`Pattern`]. Rather than
-/// silently running unbounded — which would make the budget a lie — that
-/// combination is rejected.
+/// With no budget and no predicate this is exactly [`find_matches`] plus
+/// default stats. With a budget, window/sequence constraints, event gaps or a
+/// push-down predicate it routes through `gtv_pattern::find_bounded_motif`,
+/// which accounts for every scanned edge; exceeding the cap returns the prefix
+/// **and** a [`Truncation`] instead of an error.
 pub fn find_matches_bounded(
     csr: &TemporalCSR,
     spec: &MotifSpec,
     seeds: Option<&[u64]>,
 ) -> Result<MotifOutcome> {
-    let Some(budget) = spec.budget.as_ref() else {
+    find_matches_bounded_with_predicate(csr, spec, seeds, None)
+}
+
+/// Bounded motif search with a push-down edge predicate.
+///
+/// The predicate is evaluated for every candidate edge inside the kernel, so
+/// an attribute range cannot be confused with a post-filter that would let
+/// rejected edges consume the result budget. When no budget is supplied an
+/// effectively unlimited one is used, because that is the only path that can
+/// honour the predicate.
+pub fn find_matches_bounded_with_predicate(
+    csr: &TemporalCSR,
+    spec: &MotifSpec,
+    seeds: Option<&[u64]>,
+    predicate: Option<&dyn EdgePredicate>,
+) -> Result<MotifOutcome> {
+    if spec.budget.is_none() && predicate.is_none() {
         let matches = find_matches(csr, spec, seeds)?;
         let mut stats = TraversalStats {
             rows: matches.len() as u64,
@@ -328,13 +395,8 @@ pub fn find_matches_bounded(
             valid_at: spec.valid_at,
             limit: spec.limit,
         });
-    };
-
-    if spec.is_windowed() {
-        return Err(DataFusionError::Execution(
-            "motif: a resource budget cannot be combined with a window/sequence spec yet".into(),
-        ));
     }
+
     if spec.limit == 0 {
         return Ok(MotifOutcome {
             matches: Vec::new(),
@@ -345,25 +407,68 @@ pub fn find_matches_bounded(
         });
     }
 
+    let budget = spec.budget.clone().unwrap_or_default();
+    let motif = if spec.is_windowed() || predicate.is_some() {
+        Some(spec.windowed_motif())
+    } else {
+        None
+    };
     let pattern = spec.shape.pattern();
     let set = match seeds {
         Some(seeds) if !seeds.is_empty() => {
             let snapshot = csr.snapshot_id().unwrap_or(UNBOUND_SNAPSHOT);
-            let candidates = Sel::from_ids(snapshot, csr.node_count() as u64, seeds.iter().copied())
-                .map_err(kernel_err)?;
-            gtv_pattern::find_bounded(
+            let candidates =
+                Sel::from_ids(snapshot, csr.node_count() as u64, seeds.iter().copied())
+                    .map_err(kernel_err)?;
+            match motif.as_ref() {
+                Some(m) => gtv_pattern::find_bounded_motif(
+                    csr,
+                    m,
+                    spec.valid_at,
+                    spec.limit,
+                    &candidates,
+                    &budget,
+                    None,
+                    predicate,
+                )
+                .map_err(kernel_err)?,
+                None => gtv_pattern::find_bounded(
+                    csr,
+                    &pattern,
+                    spec.valid_at,
+                    spec.limit,
+                    &candidates,
+                    &budget,
+                    None,
+                )
+                .map_err(kernel_err)?,
+            }
+        }
+        _ => match motif.as_ref() {
+            Some(m) => {
+                let all = Sel::all(snapshot_of(csr), csr.node_count() as u64);
+                gtv_pattern::find_bounded_motif(
+                    csr,
+                    m,
+                    spec.valid_at,
+                    spec.limit,
+                    &all,
+                    &budget,
+                    None,
+                    predicate,
+                )
+                .map_err(kernel_err)?
+            }
+            None => gtv_pattern::find_bounded_all(
                 csr,
                 &pattern,
                 spec.valid_at,
                 spec.limit,
-                &candidates,
-                budget,
+                &budget,
                 None,
             )
-            .map_err(kernel_err)?
-        }
-        _ => gtv_pattern::find_bounded_all(csr, &pattern, spec.valid_at, spec.limit, budget, None)
             .map_err(kernel_err)?,
+        },
     };
 
     Ok(MotifOutcome {
@@ -373,6 +478,10 @@ pub fn find_matches_bounded(
         valid_at: spec.valid_at,
         limit: spec.limit,
     })
+}
+
+fn snapshot_of(csr: &TemporalCSR) -> u64 {
+    csr.snapshot_id().unwrap_or(UNBOUND_SNAPSHOT)
 }
 
 /// One row per match: `match_id`, `n0..n{k-1}`, `event_min`, `event_max`.
