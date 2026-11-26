@@ -118,11 +118,25 @@ pub struct EdgeRef {
 }
 
 impl EdgeRef {
+    /// Sentinel for a slot with no stable physical address (for example an
+    /// unflushed WAL row folded into a materialised CSR). It can never be a
+    /// real reference: real segment ids start at 0 and rows are `< u32::MAX`.
+    pub const UNRESOLVED: Self = Self {
+        segment_id: u64::MAX,
+        row_in_segment: u32::MAX,
+    };
+
     pub const fn new(segment_id: u64, row_in_segment: u32) -> Self {
         Self {
             segment_id,
             row_in_segment,
         }
+    }
+
+    /// Whether this reference names a real physical row.
+    #[inline]
+    pub const fn is_resolved(self) -> bool {
+        self.segment_id != u64::MAX && self.row_in_segment != u32::MAX
     }
 
     /// Resolve a CSR edge slot to a segment-local reference.

@@ -273,6 +273,34 @@ impl Match {
         )
     }
 
+    /// Build evidence using the CSR's physical provenance when available.
+    ///
+    /// For a single-segment CSR this agrees with [`Self::evidence`] (slot is
+    /// the physical row). For a materialised graph whose slots were re-ordered
+    /// by a k-way merge, `origin_of` is the only way to name the *original*
+    /// row; without it, a slot would cite the wrong segment/row. An edge whose
+    /// source has no stable address (unflushed WAL row, or a pull-direction
+    /// synthetic edge) is refused rather than cited at a plausible-but-wrong
+    /// row.
+    pub fn evidence_from(&self, csr: &TemporalCSR) -> Result<PathEvidence> {
+        let mut edges = Vec::with_capacity(self.edges.len());
+        for e in &self.edges {
+            let edge = csr.origin_of(e.edge_idx).ok_or_else(|| {
+                gtv_core::GtvError::InvalidArgument(format!(
+                    "match edge {}->{} (slot {}) has no physical origin",
+                    e.src, e.dst, e.edge_idx
+                ))
+            })?;
+            edges.push(edge);
+        }
+        PathEvidence::new(
+            self.nodes.clone(),
+            edges,
+            self.edges.iter().map(|e| e.valid_from).collect(),
+            self.edges.iter().map(|e| e.valid_to).collect(),
+        )
+    }
+
     /// Canonical dedup identity: `ring = true` for cycles (rotation-invariant),
     /// `false` for ordered paths (direction-sensitive).
     pub fn dedup_key(&self, ring: bool) -> DedupKey {

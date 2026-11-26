@@ -22,6 +22,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::column::Col;
 use crate::error::{GtvError, Result};
+use crate::receipt::EdgeRef;
 use crate::selection::Sel;
 use crate::table::edge_schema;
 use crate::traits::TemporalGraphIndex;
@@ -161,6 +162,17 @@ pub struct TemporalCSR {
     /// transposed copy, and handing it out as an edge id would silently point
     /// at the wrong row.
     edge_identity: bool,
+    /// Optional physical provenance for each edge slot: the immutable
+    /// `(segment_id, row_in_segment)` the edge was read from.
+    ///
+    /// `None` when the CSR owns its rows (a single segment, where slot *is* the
+    /// physical row and [`EdgeRef::from_slot`] is authoritative) or when the
+    /// caller did not ask for provenance. `Some` only for materialised graphs
+    /// whose slots were re-ordered by a k-way merge, where a slot alone cannot
+    /// name the source row. Length always equals `edge_count`; a slot whose
+    /// source has no stable address (an unflushed WAL row) carries
+    /// [`EdgeRef::UNRESOLVED`].
+    origins: Option<Vec<EdgeRef>>,
 }
 
 impl TemporalCSR {
@@ -405,7 +417,52 @@ impl TemporalCSR {
             chunk_max_valid_to,
             snapshot_id: None,
             edge_identity: true,
+            origins: None,
         })
+    }
+
+    /// Attach physical provenance for every edge slot.
+    ///
+    /// `origins[e]` names the immutable `(segment_id, row_in_segment)` that
+    /// slot `e` was read from. Length must equal [`Self::edge_count`]. Use
+    /// [`EdgeRef::UNRESOLVED`] for slots whose source has no stable address.
+    /// This is opt-in because a materialised graph pays 12 B per edge for it,
+    /// and most traversals never cite a physical row.
+    pub fn with_origins(mut self, origins: Vec<EdgeRef>) -> Result<Self> {
+        if origins.len() != self.edge_count() {
+            return Err(GtvError::InvalidArgument(format!(
+                "provenance has {} rows but the CSR has {} edges",
+                origins.len(),
+                self.edge_count()
+            )));
+        }
+        self.origins = Some(origins);
+        Ok(self)
+    }
+
+    /// Whether this CSR carries per-slot physical provenance.
+    #[inline]
+    pub fn has_origins(&self) -> bool {
+        self.origins.is_some()
+    }
+
+    /// Physical row this edge slot was read from, when it can be named.
+    ///
+    /// With an attached provenance sidecar the answer is exact even after a
+    /// k-way merge re-ordered the slots. Without one, a graph that owns its
+    /// rows falls back to `(current segment, slot)` — the identity a single
+    /// segment's sorted columns already guarantee — while a re-sorted copy
+    /// (a transpose) reports `None` rather than a misleading slot.
+    #[inline]
+    pub fn origin_of(&self, edge_idx: u32) -> Option<EdgeRef> {
+        let e = edge_idx as usize;
+        if let Some(origins) = &self.origins {
+            return origins.get(e).copied().filter(|r| r.is_resolved());
+        }
+        if !self.edge_identity || e >= self.edge_count() {
+            return None;
+        }
+        EdgeRef::from_slot(0, edge_idx)
     }
 
     /// Declare which snapshot this graph came from (builder form).
@@ -1708,5 +1765,42 @@ mod tests {
             .unwrap();
         assert!(!again.frontiers.is_empty());
         assert!(again.is_complete());
+    }
+
+    #[test]
+    fn provenance_sidecar_roundtrips_and_rejects_bad_length() {
+        use crate::receipt::EdgeRef;
+
+        let csr = TemporalCSR::from_edge_columns(
+            &[0, 0, 1],
+            &[1, 2, 0],
+            &[10, 20, 30],
+            &[100, 200, 300],
+            &[0, 0, 0],
+            3,
+        )
+        .unwrap();
+        assert!(!csr.has_origins());
+        // Without a sidecar, a graph that owns its rows falls back to
+        // (segment 0, slot) — the single-segment identity.
+        assert_eq!(csr.origin_of(1), Some(EdgeRef::new(0, 1)));
+        assert_eq!(csr.origin_of(99), None);
+
+        let origins = vec![EdgeRef::new(7, 0), EdgeRef::new(7, 1), EdgeRef::UNRESOLVED];
+        let with = csr.clone().with_origins(origins.clone()).unwrap();
+        assert!(with.has_origins());
+        assert_eq!(with.origin_of(0), Some(EdgeRef::new(7, 0)));
+        assert_eq!(with.origin_of(1), Some(EdgeRef::new(7, 1)));
+        // An unresolved source is refused, not cited at a plausible row.
+        assert_eq!(with.origin_of(2), None);
+
+        // A transpose re-sorts slots and has no identity; without a sidecar it
+        // must refuse to name a physical row.
+        let rev = with.transpose().unwrap();
+        assert!(!rev.has_origins());
+        assert_eq!(rev.origin_of(0), None);
+
+        // The sidecar length is part of the contract.
+        assert!(csr.clone().with_origins(vec![EdgeRef::new(0, 0)]).is_err());
     }
 }

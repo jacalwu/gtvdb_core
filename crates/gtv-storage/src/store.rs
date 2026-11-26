@@ -52,6 +52,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow::record_batch::RecordBatch;
 use gtv_core::csr::{CsrColumns, TemporalCSR, CHUNK_SIZE};
 use gtv_core::endpoint::NodeLifetime;
+use gtv_core::receipt::EdgeRef;
 use gtv_core::GtvError;
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +87,22 @@ const MEM_ROW_NAMESPACE: u64 = u64::MAX;
 
 fn err(msg: impl Into<String>) -> StorageError {
     StorageError::Msg(msg.into())
+}
+
+/// Distinct `(src, dst, edge_type)` tuples in a CSR, computed once at flush
+/// time. A segment may hold two physical rows for the same logical edge (a
+/// repeated put, or the disjoint fragments of an interval split); the L2
+/// aggregate counts that as one edge. Caching the number on the manifest lets
+/// a FullHit answer the distinct count without opening the segment file.
+fn distinct_edge_count(c: &CsrColumns<'_>) -> u64 {
+    let mut seen: HashSet<(u64, u64, u16)> = HashSet::with_capacity(c.dst.len());
+    for s in 0..c.node_count {
+        let (a, b) = (c.offsets[s] as usize, c.offsets[s + 1] as usize);
+        for e in a..b {
+            seen.insert((s as u64, c.dst[e], c.edge_type[e]));
+        }
+    }
+    seen.len() as u64
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -148,6 +165,13 @@ pub struct SegmentEntry {
     /// `AS KNOWN AT` queries still see the original segment set.
     #[serde(default)]
     pub superseded_at: Option<i64>,
+    /// Distinct `(src, dst, edge_type)` tuples in this segment, computed once
+    /// at flush time. Used by the FullHit zero-scan count: a FullHit segment
+    /// has every row active, so its contribution to the distinct count is this
+    /// number, not its raw `edge_count` (a repeated put can make them differ).
+    /// `None` on a legacy manifest disables the fast path for that segment.
+    #[serde(default)]
+    pub distinct_edges: Option<u64>,
 }
 
 /// One immutable, published `SnapshotDelta` file.
@@ -441,6 +465,9 @@ pub struct PruneSummary {
     pub scan: usize,
     /// `full_hit + scan`.
     pub selected: usize,
+    /// True when `active_edge_count_at` answered from segment metadata alone,
+    /// without opening a `.seg` file or running the retract fold.
+    pub zero_scan: bool,
 }
 
 impl PruneSummary {
@@ -987,12 +1014,14 @@ impl SegmentStore {
             // L2: one linear pass over the (already sorted) CSR columns.
             // Flush-time only — the read path never recomputes this.
             let meta = SegmentMeta::from_csr(&csr);
+            let distinct = distinct_edge_count(&csr.columns());
             let bytes = encode_segment(&csr)?;
             let checksum = to_hex(blake3::hash(&bytes[HEADER_SIZE..]).as_bytes());
             let id = self.manifest.next_segment_id;
             let file = format!("seg_{id:08}_t{table_id}_p{partition_id}.seg");
             write_atomic(&self.segments_dir().join(&file), &bytes)?;
             new_entries.push(SegmentEntry {
+                distinct_edges: Some(distinct),
                 id,
                 file,
                 table_id: *table_id,
@@ -1788,10 +1817,19 @@ impl SegmentStore {
     /// segment-level pruning decision.
     ///
     /// Segment classification (`Skip` / `FullHit` / `Scan`) is O(1) per segment
-    /// and never opens a segment file. The *count* still goes through the single
-    /// retract fold, because a FullHit segment may contain retracted rows and
-    /// interval-split fragments must be de-duplicated — correctness wins over
-    /// an O(1) sum that would double count.
+    /// and never opens a segment file.
+    ///
+    /// The count has a **zero-scan fast path** (§4.1 of the AML enablement
+    /// doc): when the visible set is exactly a set of `FullHit` baseline
+    /// segments with no live delta and no unflushed WAL, every row is active,
+    /// a `FullHit` segment cannot contain an interval-split duplicate (its
+    /// intersection window would be empty), and disjoint `src` boxes rule out
+    /// cross-segment logical-edge duplicates. Then the distinct count is just
+    /// `Σ segment.distinct_edges` (cached at flush) — no segment file is opened
+    /// and no retract fold
+    /// runs. `PruneSummary::zero_scan` records that the fast path was taken.
+    /// Any other shape falls back to the single authoritative retract fold, so
+    /// a delta or a scan segment never gets an approximate answer.
     pub fn active_edge_count_at(
         &self,
         system_t: i64,
@@ -1799,8 +1837,11 @@ impl SegmentStore {
     ) -> Result<(u64, PruneSummary)> {
         let _scope = ReadScope::new(&self.readers);
         self.check_history(system_t)?;
+        let entries = self.entries_at_system(system_t);
+
+        // Classify first — this is the L2 decision, always O(segments).
         let mut summary = PruneSummary::default();
-        for e in self.entries_at_system(system_t) {
+        for e in &entries {
             match e.classify(business_t, business_t.saturating_add(1)) {
                 PruneOutcome::Skip => summary.skipped += 1,
                 PruneOutcome::FullHit => {
@@ -1813,6 +1854,66 @@ impl SegmentStore {
                 }
             }
         }
+
+        // Zero-scan proof, all checks read only the manifest / in-memory WAL:
+        //  * at least one segment is selected (an empty answer must still be
+        //    reported as such, but it costs nothing either way);
+        //  * no segment needs a per-edge Scan;
+        //  * no live delta (its puts/retracts would add/remove rows);
+        //  * no unflushed row visible at system_t;
+        //  * every FullHit segment cached its distinct-edge count at flush;
+        //  * selected segments' `src` boxes are known and pairwise disjoint.
+        let view = self.view();
+        let has_live_delta = self.manifest.deltas.iter().any(|d| {
+            d.system_ts <= system_t && d.superseded_at.is_none_or(|m| m > system_t)
+        });
+        let has_visible_wal = view
+            .mem_records
+            .iter()
+            .any(|r| r.edge.system_ts <= system_t);
+
+        // Collect the FastHit segments once: their cached distinct count and
+        // src box. A missing count or src box (legacy manifest) disables the
+        // fast path rather than guessing — the fold stays authoritative.
+        let mut hit_boxes: Vec<(u64, u64)> = Vec::with_capacity(summary.full_hit);
+        let mut distinct_total = 0u64;
+        let mut provable =
+            summary.scan == 0 && summary.full_hit > 0 && !has_live_delta && !has_visible_wal;
+        for e in &entries {
+            if e.classify(business_t, business_t.saturating_add(1)) != PruneOutcome::FullHit {
+                continue;
+            }
+            match (e.distinct_edges, e.src_id_min, e.src_id_max) {
+                (Some(distinct), Some(lo), Some(hi)) => {
+                    distinct_total += distinct;
+                    hit_boxes.push((lo, hi));
+                }
+                _ => {
+                    provable = false;
+                    break;
+                }
+            }
+        }
+        hit_boxes.sort_unstable();
+        provable &= hit_boxes.windows(2).all(|w| w[0].1 < w[1].0);
+
+        if provable {
+            summary.zero_scan = true;
+            return Ok((distinct_total, summary));
+        }
+
+        self.count_at_by_fold(system_t, business_t, summary)
+    }
+
+    /// The authoritative (folded) count path used when the zero-scan proof
+    /// does not hold. `summary` carrying the already-computed L2 decision is
+    /// threaded through so classification runs exactly once.
+    fn count_at_by_fold(
+        &self,
+        system_t: i64,
+        business_t: i64,
+        summary: PruneSummary,
+    ) -> Result<(u64, PruneSummary)> {
         let distinct: HashSet<LogicalEdge> = live_rows_from(self.view(), system_t)?
             .iter()
             .filter(|r| r.edge.valid_from <= business_t && business_t < r.edge.valid_to)
@@ -2160,6 +2261,10 @@ struct Head {
     valid_from: i64,
     valid_to: i64,
     edge_type: u16,
+    /// Physical `(segment, row)` this head came from, used to build the
+    /// materialised CSR's provenance sidecar. `UNRESOLVED` for an unflushed
+    /// WAL row, which has no stable address yet.
+    origin: EdgeRef,
 }
 
 impl Head {
@@ -2228,14 +2333,15 @@ impl Cursor<'_> {
                 if *src >= *hi {
                     return None;
                 }
+                let pos = RowPos::new(*entry_id, *row);
                 let head = Head {
                     src: *src as u64,
                     dst: cols.dst[*edge],
                     valid_from: cols.valid_from[*edge],
                     valid_to: cols.valid_to[*edge],
                     edge_type: cols.edge_type[*edge],
+                    origin: EdgeRef::new(pos.segment_id, pos.row),
                 };
-                let pos = RowPos::new(*entry_id, *row);
                 *row += 1;
                 *edge += 1;
                 if !retracts.contains(pos) {
@@ -2257,12 +2363,18 @@ impl Cursor<'_> {
                     continue;
                 }
                 let e = rows[i];
+                // A delta put has a stable published address; an unflushed WAL
+                // row does not, so it is deliberately left unresolved.
+                let origin = namespace
+                    .map(|ns| EdgeRef::new(ns, i as u32))
+                    .unwrap_or(EdgeRef::UNRESOLVED);
                 return Some(Head {
                     src: e.src,
                     dst: e.dst,
                     valid_from: e.valid_from,
                     valid_to: e.valid_to,
                     edge_type: e.edge_type,
+                    origin,
                 });
             },
         }
@@ -2282,6 +2394,7 @@ impl Cursor<'_> {
         let Cursor::Columns {
             cols,
             retracts,
+            entry_id,
             hi,
             src,
             edge,
@@ -2296,6 +2409,11 @@ impl Cursor<'_> {
         if cols.node_count != node_count || cols.offsets.len() != node_count + 1 {
             return Ok(None);
         }
+        // Verbatim copy: every output slot is the segment's own row, so the
+        // provenance sidecar is the identity map keyed by the real segment id.
+        let origins = (0..cols.dst.len() as u32)
+            .map(|row| EdgeRef::new(*entry_id, row))
+            .collect();
         TemporalCSR::from_columns(
             cols.node_count,
             cols.offsets.to_vec().into(),
@@ -2309,6 +2427,7 @@ impl Cursor<'_> {
             cols.chunk_index.to_vec().into(),
             cols.chunk_max_valid_to.to_vec().into(),
         )
+        .and_then(|csr| csr.with_origins(origins))
         .map(Some)
         .map_err(|e| err(format!("invalid delta CSR: {e}")))
     }
@@ -2326,6 +2445,8 @@ struct ColumnSink {
     valid_from: Vec<i64>,
     valid_to: Vec<i64>,
     edge_type: Vec<u16>,
+    /// Physical origin of each output slot, in lockstep with the edge columns.
+    origins: Vec<EdgeRef>,
     node_count: usize,
     max_valid_from: i64,
     min_valid_to: i64,
@@ -2339,6 +2460,7 @@ impl ColumnSink {
             valid_from: Vec::with_capacity(capacity),
             valid_to: Vec::with_capacity(capacity),
             edge_type: Vec::with_capacity(capacity),
+            origins: Vec::with_capacity(capacity),
             node_count,
             // The same identity values `from_edge_columns` uses, so an empty
             // graph gets the same bounding box from both paths.
@@ -2363,6 +2485,7 @@ impl ColumnSink {
         self.valid_from.push(h.valid_from);
         self.valid_to.push(h.valid_to);
         self.edge_type.push(h.edge_type);
+        self.origins.push(h.origin);
         self.max_valid_from = self.max_valid_from.max(h.valid_from);
         self.min_valid_to = self.min_valid_to.min(h.valid_to);
         Ok(())
@@ -2407,6 +2530,7 @@ impl ColumnSink {
             chunk_index.into(),
             chunk_max_valid_to.into(),
         )
+        .and_then(|csr| csr.with_origins(self.origins))
         .map_err(|e| err(format!("invalid delta CSR: {e}")))
     }
 }
@@ -2620,6 +2744,7 @@ fn prepare_compaction(v: LiveRowsView<'_>, system_ts: i64) -> Result<CompactionP
         }
         let csr = MemSegment::to_csr(edges, v.node_count)?;
         let meta = SegmentMeta::from_csr(&csr);
+        let distinct = distinct_edge_count(&csr.columns());
         let bytes = encode_segment(&csr)?;
         let checksum = to_hex(blake3::hash(&bytes[HEADER_SIZE..]).as_bytes());
         let id = next_id;
@@ -2627,6 +2752,7 @@ fn prepare_compaction(v: LiveRowsView<'_>, system_ts: i64) -> Result<CompactionP
         let file = format!("seg_{id:08}_t{table_id}_p{partition_id}.seg");
         segments.push((
             SegmentEntry {
+                distinct_edges: Some(distinct),
                 id,
                 file,
                 table_id: *table_id,

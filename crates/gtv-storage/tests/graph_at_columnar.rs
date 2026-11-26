@@ -190,6 +190,60 @@ fn a_retract_is_folded_out_of_a_merged_segment() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A merged CSR re-orders slots, so a bare `edge_idx` cannot cite a physical
+/// row. The provenance sidecar must map every slot back to the exact
+/// `(segment, row)` whose edge now occupies it.
+#[test]
+fn merged_slots_keep_physical_provenance() {
+    use std::collections::HashMap;
+
+    use gtv_core::receipt::EdgeRef;
+    use gtv_storage::delta::RowPos;
+
+    let root = temp_root("provenance");
+    let mut store = SegmentStore::open(&root, NODES).unwrap();
+    for (i, at) in [10i64, 20, 30].iter().enumerate() {
+        store.ingest(1, 1, &edges(i as u64 * 50, 50, *at)).unwrap();
+        store.flush_at(*at).unwrap();
+    }
+
+    // Oracle: the physical address of every live row, keyed by that address.
+    let by_pos: HashMap<RowPos, gtv_storage::EdgeRecord> = store
+        .live_rows_at(30)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.pos, r.edge))
+        .collect();
+
+    let g = store.graph_at(30).unwrap();
+    assert!(g.has_origins(), "a merged CSR must carry provenance");
+    let c = g.columns();
+    let mut checked = 0usize;
+    for s in 0..c.node_count {
+        for e in c.offsets[s] as usize..c.offsets[s + 1] as usize {
+            let origin = g
+                .origin_of(e as u32)
+                .expect("every flushed slot must resolve to a physical row");
+            let pos = RowPos::new(origin.segment_id, origin.row_in_segment);
+            let row = by_pos
+                .get(&pos)
+                .unwrap_or_else(|| panic!("slot {e} cites unknown row {origin}"));
+            assert_eq!(row.src, s as u64, "origin src at slot {e}");
+            assert_eq!(row.dst, c.dst[e], "origin dst at slot {e}");
+            assert_eq!(row.valid_from, c.valid_from[e], "origin vf at slot {e}");
+            assert_eq!(row.valid_to, c.valid_to[e], "origin vt at slot {e}");
+            assert_eq!(row.edge_type, c.edge_type[e], "origin type at slot {e}");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 150, "every merged edge was provenance-checked");
+
+    // An unresolved slot is refused rather than cited at a plausible row.
+    assert!(EdgeRef::UNRESOLVED == EdgeRef::new(u64::MAX, u32::MAX));
+    assert!(!EdgeRef::UNRESOLVED.is_resolved());
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn unflushed_rows_join_the_merge_and_stay_ordered() {
     let root = temp_root("wal");

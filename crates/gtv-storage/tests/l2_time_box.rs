@@ -273,3 +273,89 @@ fn meta_survives_reopen() {
     assert_eq!(m.classify(450, 900), PruneOutcome::Skip);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// §4.1: a FullHit answer must be O(1) — no `.seg` file opened and no retract
+/// fold — when the visible set is a single all-active segment with no overlay.
+/// The count still has to be the distinct-logical-edge count, not a raw row sum.
+#[test]
+fn full_hit_zero_scan_returns_the_exact_distinct_count() {
+    let root = temp_root("fullhit_zero_scan");
+    let mut store = SegmentStore::open(&root, NODE_COUNT).unwrap();
+    // One segment, disjoint srcs, every edge active across [0, 1000).
+    let batch: Vec<EdgeRecord> = (0..40u64)
+        .map(|i| {
+            EdgeRecord::new(
+                i,              // src 0..39 — tight, disjoint box
+                (i + 1) % 40,   // dst
+                0,              // valid_from
+                1000,           // valid_to
+                (i % 2) as u16, // edge_type
+                1,              // system_ts
+            )
+        })
+        .collect();
+    store.ingest(0, 0, &batch).unwrap();
+    store.flush_at(1).unwrap();
+
+    let head = store.system_ts();
+    let (count, summary) = store.active_edge_count_at(head, 500).unwrap();
+    assert_eq!(count, 40, "all 40 logical edges are active");
+    assert_eq!(summary.full_hit, 1);
+    assert_eq!(summary.scan, 0);
+    assert!(
+        summary.zero_scan,
+        "single FullHit segment must be zero-scan"
+    );
+    assert_eq!(store.active_edge_count_at(head, 500).unwrap().0, count);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// When a scan segment is present, the zero-scan proof must not fire and the
+/// answer must come from the authoritative fold (which still agrees with the
+/// aggregate projection).
+#[test]
+fn scan_segment_falls_back_to_the_fold() {
+    let root = temp_root("fullhit_scan_fallback");
+    let mut store = SegmentStore::open(&root, NODE_COUNT).unwrap();
+    // src 0 is all-active; the second segment mixes an all-active edge with a
+    // later one ([600,700)), so at t=500 its intersection window is empty and
+    // it classifies as Scan — the fast path must be refused.
+    let a = vec![EdgeRecord::new(0, 10, 0, 1000, 0, 1)];
+    let b = vec![
+        EdgeRecord::new(1, 11, 0, 1000, 0, 2),
+        EdgeRecord::new(2, 12, 600, 700, 0, 2),
+    ];
+    store.ingest(0, 0, &a).unwrap();
+    store.flush_at(1).unwrap();
+    store.ingest(0, 0, &b).unwrap();
+    store.flush_at(2).unwrap();
+
+    let head = store.system_ts();
+    let (count, summary) = store.active_edge_count_at(head, 500).unwrap();
+    assert!(!summary.zero_scan, "a Scan segment must force the fold");
+    assert_eq!(summary.scan, 1);
+    assert_eq!(count, 2, "both segments contribute one edge at t=500");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A repeated put of the same logical edge must not be counted twice by the
+/// zero-scan path: the cached distinct count, not the raw row count, is the
+/// authoritative contribution of a FullHit segment.
+#[test]
+fn full_hit_zero_scan_dedups_repeated_puts() {
+    let root = temp_root("fullhit_dedup");
+    let mut store = SegmentStore::open(&root, NODE_COUNT).unwrap();
+    let dup = EdgeRecord::new(3, 9, 0, 1000, 1, 1);
+    store.ingest(0, 0, &[dup, dup]).unwrap();
+    store.flush_at(1).unwrap();
+
+    let head = store.system_ts();
+    let (count, summary) = store.active_edge_count_at(head, 500).unwrap();
+    assert!(summary.zero_scan, "single FullHit segment still qualifies");
+    assert_eq!(summary.full_hit, 1);
+    assert_eq!(count, 1, "two physical rows, one logical edge");
+    // The folded path agrees.
+    let view = store.aggregate_view(head).unwrap();
+    assert_eq!(view.active_edge_count(500), count);
+    let _ = fs::remove_dir_all(&root);
+}

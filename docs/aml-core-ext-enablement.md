@@ -467,7 +467,15 @@ M2 起才动 Top-K 与 provenance 分层；CUDA 仍排在 M4 之后。
 - `gtv-core/src/csr.rs`：`edge_slices_with_start()` 暴露源节点 run 的全局起始槽位。此前 `gtv-pattern` 把 slice-local 下标当作 `edge_idx`，第二个及以后源节点的证据会指错边；现已修正。
 - `gtv-pattern::EventOrder`：新增 `min_gap` / `max_gap`，`strict()` 保持旧的严格递增语义，`window()` 支持非严格与有界延迟。`find_bounded_motif()` 把候选集、预算、窗口/序列、边谓词四条链合并到一个内核入口。
 - `gtv-engine::MotifSpec::with_event_gap()` 与 `find_matches_bounded_with_predicate()`：窗口/序列/事件间隔现在可以和安全预算同时使用；不再以“bounded 不支持 windowed”拒绝查询。
-- 仍未做：完整 provenance `origin` 列（`EdgeRef` 反查段/行）、向量空间强绑定、FullHit 真短路。它们不是 smurfing 首版的阻塞项。
+- 仍未做：向量空间强绑定。它不是 smurfing 首版的阻塞项。
+
+### 7.3 provenance 物理来源与 FullHit 真短路
+
+- `gtv-core/src/receipt.rs`：`EdgeRef::UNRESOLVED` 哨兵 + `is_resolved()`。无法命名物理行的槽位（未 flush 的 WAL 行）显式标记，而不是占用一个看似合理的行号。
+- `gtv-core/src/csr.rs`：`TemporalCSR` 新增可选 `origins: Vec<EdgeRef>`（builder `with_origins()`）+ `origin_of(edge_idx)`。单段 CSR 天然 `slot == row`，`origin_of` 回退到 `(segment 0, slot)`；k-way merge 后的 CSR 用 sidecar 精确保留每条边来自哪个 `(segment, row)`；transpose 重排后明确拒绝命名来源。
+- `gtv-storage/src/store.rs`：`live_csr_from()` 的 `ColumnSink` 与 `Cursor` 在 merge 时收集每个输出槽位的物理来源（baseline 段用 `RowPos`，delta put 用 `put_segment_id`，WAL 行用 `UNRESOLVED`）。`Match::evidence_from(csr)` 据此重建 `PathEvidence`，不再把 merge 后的槽位误当成段内行号。
+- `gtv-storage/src/store.rs`：`active_edge_count_at()` 新增 O(1) 零扫描路径。可证明安全的条件（无 live delta、无可见 WAL、全部选中段 FullHit、每段有 flush 时缓存的 distinct 边数、段间 `src` 区间两两不重叠）满足时，直接返回 `Σ distinct_edges`，不打开 `.seg` 也不跑 retract fold；`PruneSummary::zero_scan` 标记该路径。任一条件不满足（含旧 manifest 缺字段）即回退到唯一权威的折叠路径。缓存 distinct 数而非 raw `edge_count`，是因为重复 put 会让两者不同——`AggregateView` 的去重口径必须一致。
+- 未做：把 provenance sidecar 持久化进 GTVSeg 磁盘格式（当前只在物化后的 CSR 内存中存在；单段场景由 `slot == row` 保证，不落盘也正确）。
 
 ---
 
