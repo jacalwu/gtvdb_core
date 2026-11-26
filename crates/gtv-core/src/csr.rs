@@ -211,6 +211,46 @@ impl TemporalCSR {
         edge_type: &[u16],
         node_count: usize,
     ) -> Result<Self> {
+        Self::build_edge_columns(src, dst, valid_from, valid_to, edge_type, node_count, false)
+            .map(|(csr, _)| csr)
+    }
+
+    /// Like [`from_edge_columns`], but also reports which **input row** ended up
+    /// in each CSR slot.
+    ///
+    /// An edge-attribute sidecar ([`crate::edge_attr::EdgeAttrs`]) is addressed
+    /// by `edge_idx`, i.e. the CSR *slot*, while callers hold their attributes
+    /// in input-row order. Those two orders are not the same: the build sorts by
+    /// `(src, valid_from, valid_to, dst)`. Aligning them by position therefore
+    /// happens to work only for already-sorted input, and silently misattributes
+    /// attributes otherwise — a smurfing amount limit applied to the wrong
+    /// transfer is a wrong answer, not a slow one.
+    ///
+    /// `slot_to_input[i]` is the input row now living at slot `i`; a caller
+    /// permutes its columns through it once, at build time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_edge_columns_permuted(
+        src: &[u64],
+        dst: &[u64],
+        valid_from: &[i64],
+        valid_to: &[i64],
+        edge_type: &[u16],
+        node_count: usize,
+    ) -> Result<(Self, Vec<u32>)> {
+        Self::build_edge_columns(src, dst, valid_from, valid_to, edge_type, node_count, true)
+            .map(|(csr, perm)| (csr, perm.unwrap_or_default()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_edge_columns(
+        src: &[u64],
+        dst: &[u64],
+        valid_from: &[i64],
+        valid_to: &[i64],
+        edge_type: &[u16],
+        node_count: usize,
+        want_permutation: bool,
+    ) -> Result<(Self, Option<Vec<u32>>)> {
         let n = src.len();
         if dst.len() != n || valid_from.len() != n || valid_to.len() != n || edge_type.len() != n {
             return Err(GtvError::InvalidArgument(
@@ -226,24 +266,33 @@ impl TemporalCSR {
             )));
         }
 
-        let mut rows: Vec<EdgeRow> = (0..n)
-            .map(|i| EdgeRow {
-                src: src[i],
-                dst: dst[i],
-                valid_from: valid_from[i],
-                valid_to: valid_to[i],
-                edge_type: edge_type[i],
+        let mut rows: Vec<(EdgeRow, u32)> = (0..n)
+            .map(|i| {
+                (
+                    EdgeRow {
+                        src: src[i],
+                        dst: dst[i],
+                        valid_from: valid_from[i],
+                        valid_to: valid_to[i],
+                        edge_type: edge_type[i],
+                    },
+                    i as u32,
+                )
             })
             .collect();
 
-        if let Some(bad) = rows.iter().map(|r| r.src).find(|s| *s >= node_count as u64) {
+        if let Some(bad) = rows
+            .iter()
+            .map(|(r, _)| r.src)
+            .find(|s| *s >= node_count as u64)
+        {
             return Err(GtvError::NodeOutOfRange(bad));
         }
 
-        rows.sort_unstable_by_key(|r| (r.src, r.valid_from, r.valid_to, r.dst));
+        rows.sort_unstable_by_key(|(r, _)| (r.src, r.valid_from, r.valid_to, r.dst));
 
         let mut offsets = vec![0u32; node_count + 1];
-        for r in &rows {
+        for (r, _) in &rows {
             offsets[r.src as usize + 1] += 1;
         }
         for i in 0..node_count {
@@ -256,7 +305,7 @@ impl TemporalCSR {
         let mut et_vec = Vec::with_capacity(n);
         let mut max_valid_from = i64::MIN;
         let mut min_valid_to = i64::MAX;
-        for r in &rows {
+        for (r, _) in &rows {
             dst_vec.push(r.dst);
             vf_vec.push(r.valid_from);
             vt_vec.push(r.valid_to);
@@ -286,6 +335,7 @@ impl TemporalCSR {
             chunk_index.push(chunk_max_valid_to.len() as u32);
         }
 
+        let perm = want_permutation.then(|| rows.iter().map(|(_, i)| *i).collect());
         Self::from_columns(
             node_count,
             offsets.into(),
@@ -299,6 +349,7 @@ impl TemporalCSR {
             chunk_index.into(),
             chunk_max_valid_to.into(),
         )
+        .map(|csr| (csr, perm))
     }
 
     /// Read-only view of every column plus the scalar metadata.
@@ -1802,5 +1853,51 @@ mod tests {
 
         // The sidecar length is part of the contract.
         assert!(csr.clone().with_origins(vec![EdgeRef::new(0, 0)]).is_err());
+    }
+
+    #[test]
+    fn permutation_maps_each_slot_back_to_its_input_row() {
+        // Deliberately unsorted input, with a unique amount per row.
+        let src = [2u64, 0, 1, 0];
+        let dst = [3u64, 5, 4, 1];
+        let vf = [70i64, 10, 40, 20];
+        let vt = [80i64, 110, 140, 120];
+        let et = [0u16, 0, 0, 0];
+        let amounts = [20.0f64, 10.0, 40.0, 30.0];
+
+        let (csr, slot_to_input) =
+            TemporalCSR::from_edge_columns_permuted(&src, &dst, &vf, &vt, &et, 6).unwrap();
+
+        // A permutation, not a copy: every input row appears exactly once.
+        let mut seen = slot_to_input.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+        // Sorted by src: rows 1 and 3 (src 0, by valid_from), then 2, then 0.
+        assert_eq!(slot_to_input, vec![1, 3, 2, 0]);
+        assert_ne!(
+            slot_to_input,
+            vec![0, 1, 2, 3],
+            "aligned-by-position only works by luck; this input proves it"
+        );
+
+        // Slot i now holds the row named by slot_to_input[i]. Without this map,
+        // a sidecar supplied in input order would attach the wrong amount.
+        let cols = csr.columns();
+        for (slot, &input) in slot_to_input.iter().enumerate() {
+            assert_eq!(cols.dst[slot], dst[input as usize], "dst at slot {slot}");
+            assert_eq!(
+                cols.valid_from[slot], vf[input as usize],
+                "vf at slot {slot}"
+            );
+            assert_eq!(cols.valid_to[slot], vt[input as usize], "vt at slot {slot}");
+        }
+        let slot_amounts: Vec<f64> = slot_to_input.iter().map(|&i| amounts[i as usize]).collect();
+        assert_eq!(slot_amounts, vec![10.0, 30.0, 40.0, 20.0]);
+
+        // The plain constructor produces the identical index, so the map is a
+        // reporting side-channel, not a different build.
+        let plain = TemporalCSR::from_edge_columns(&src, &dst, &vf, &vt, &et, 6).unwrap();
+        assert_eq!(plain.columns().dst, cols.dst);
+        assert_eq!(plain.columns().offsets, cols.offsets);
     }
 }
