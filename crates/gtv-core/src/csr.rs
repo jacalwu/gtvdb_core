@@ -1175,6 +1175,50 @@ impl TemporalCSR {
         rev.snapshot_id = self.snapshot_id;
         Ok(rev)
     }
+
+    /// Like [`transpose`], but also reports which **forward** slot each
+    /// transposed slot came from.
+    ///
+    /// A reverse index is a rebuild, so its slots name nothing in the forward
+    /// arrays. Anything keyed by forward `edge_idx` — an attribute sidecar, a
+    /// provenance record, a citation — therefore cannot be read with a
+    /// transposed slot; doing so cites a real but *wrong* edge, which is worse
+    /// than refusing. `rev_slot_to_forward_slot[i]` is the map, and it is exact
+    /// because the transpose is built in forward-slot order.
+    ///
+    /// The reverse index stays `edge_identity == false`: the mapping is for
+    /// reading attributes about the edge, not for claiming the edge's identity.
+    pub fn transpose_with_permutation(&self) -> Result<(TemporalCSR, Vec<u32>)> {
+        let n = self.dst.len();
+        let mut src = Vec::with_capacity(n);
+        let mut dst = Vec::with_capacity(n);
+        let mut vf = Vec::with_capacity(n);
+        let mut vt = Vec::with_capacity(n);
+        let mut et = Vec::with_capacity(n);
+        for s in 0..self.node_count {
+            let (a, b) = self.edge_range(s as u64)?;
+            for e in a..b {
+                src.push(self.dst[e]);
+                dst.push(s as u64);
+                vf.push(self.valid_from[e]);
+                vt.push(self.valid_to[e]);
+                et.push(self.edge_type[e]);
+            }
+        }
+        // Built from forward-slot order, so the build permutation *is* the map
+        // back to the forward edge.
+        let (mut rev, rev_slot_to_forward_slot) = TemporalCSR::from_edge_columns_permuted(
+            &src,
+            &dst,
+            &vf,
+            &vt,
+            &et,
+            self.node_count,
+        )?;
+        rev.edge_identity = false;
+        rev.snapshot_id = self.snapshot_id;
+        Ok((rev, rev_slot_to_forward_slot))
+    }
 }
 
 /// Iterator over the neighbors of one source that are active at `valid_at`.
@@ -1899,5 +1943,60 @@ mod tests {
         let plain = TemporalCSR::from_edge_columns(&src, &dst, &vf, &vt, &et, 6).unwrap();
         assert_eq!(plain.columns().dst, cols.dst);
         assert_eq!(plain.columns().offsets, cols.offsets);
+    }
+
+    #[test]
+    fn a_transposed_slot_can_be_traced_back_to_its_forward_edge() {
+        // 0->1, 0->2, 1->3. The reverse index of 2 and 3 has one edge each.
+        let fwd = TemporalCSR::from_edge_columns(
+            &[0, 0, 1],
+            &[1, 2, 3],
+            &[10, 20, 30],
+            &[100, 200, 300],
+            &[0, 0, 0],
+            4,
+        )
+        .unwrap();
+
+        let (rev, rev_to_fwd) = fwd.transpose_with_permutation().unwrap();
+        assert_eq!(rev_to_fwd.len(), 3);
+        let mut seen = rev_to_fwd.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2], "every forward edge appears once");
+
+        // A transposed slot is still not an edge identity...
+        assert!(!rev.has_origins());
+        // ...but it now names the forward edge, so an amount sidecar keyed by
+        // `edge_idx` can be read for an incoming edge.
+        let fc = fwd.columns();
+        let rc = rev.columns();
+        for (rev_slot, &fwd_slot) in rev_to_fwd.iter().enumerate() {
+            let fi = fwd_slot as usize;
+            assert_eq!(rc.dst[rev_slot], run_start(&fwd, fi), "rev dst is fwd src");
+            assert_eq!(rc.valid_from[rev_slot], fc.valid_from[fi]);
+            assert_eq!(rc.valid_to[rev_slot], fc.valid_to[fi]);
+            assert_eq!(rc.edge_type[rev_slot], fc.edge_type[fi]);
+        }
+
+        // Plain transpose is the same index, without the map.
+        let plain = fwd.transpose().unwrap();
+        assert_eq!(plain.columns().dst, rc.dst);
+        assert_eq!(plain.columns().offsets, rc.offsets);
+    }
+
+    /// The source node owning `slot`, recovered from the offsets (a CSR has no
+    /// explicit src column).
+    fn run_start(csr: &TemporalCSR, slot: usize) -> u64 {
+        let offsets = csr.columns().offsets;
+        let (mut lo, mut hi) = (0usize, csr.node_count());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if offsets[mid + 1] as usize <= slot {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo as u64
     }
 }
