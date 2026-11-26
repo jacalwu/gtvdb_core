@@ -689,9 +689,16 @@ fn find_bounded_impl(
             truncation: None,
         });
     }
+    // Ask for one more match than the caller wants.
+    //
+    // `limit` alone cannot say whether the answer was cut: filling it exactly is
+    // also what an exhausted search does. Collecting the (limit+1)-th match and
+    // throwing it away is the cheapest way to tell the two apart, and it stops
+    // "this is a prefix" and "this is everything" from being the same value.
+    let probe = limit.saturating_add(1);
     let mut state = DfsState::new(pattern);
     for start in candidates.iter() {
-        if !tracker.check_time()? || out.len() >= limit {
+        if !tracker.check_time()? || out.len() >= probe {
             break;
         }
         tracker.set_hop(1);
@@ -703,7 +710,7 @@ fn find_bounded_impl(
             0,
             &mut state,
             &mut out,
-            limit,
+            probe,
             Some(&tracker),
             motif,
             predicate,
@@ -714,7 +721,14 @@ fn find_bounded_impl(
     }
     // Row accounting is done once, at the end: counting `out.len()` inside the
     // loop counted the same rows again on every start node.
+    let cut_by_limit = out.len() >= probe;
+    if cut_by_limit {
+        out.truncate(limit);
+    }
     tracker.add_rows(out.len() as u64);
+    if cut_by_limit {
+        tracker.trip_row_limit(limit, probe as u64);
+    }
     let stats = tracker.stats(0);
     Ok(MatchSet {
         matches: out,
@@ -1329,5 +1343,41 @@ mod tests {
         assert_eq!(set.matches.len(), 1);
         assert_eq!(set.matches[0].edges[0].edge_idx, 1);
         assert!(set.truncation.is_none());
+    }
+
+    #[test]
+    fn a_limit_cut_is_reported_and_an_exact_fit_is_not() {
+        // Three independent edges, so a one-hop path matches exactly three times.
+        let csr = TemporalCSR::from_edge_columns(
+            &[0, 1, 2],
+            &[1, 2, 3],
+            &[0, 0, 0],
+            &[10, 10, 10],
+            &[0, 0, 0],
+            4,
+        )
+        .unwrap();
+        let pattern = Pattern::temporal_path(1);
+        let all = Sel::from_ids(UNBOUND_SNAPSHOT, 4, [0u64, 1, 2]).unwrap();
+        let budget = TraversalBudget::unlimited();
+
+        // More matches exist than were asked for: the answer is a prefix, and
+        // says so instead of reading as the whole result.
+        let cut = find_bounded(&csr, &pattern, 0, 2, &all, &budget, None).unwrap();
+        assert_eq!(cut.matches.len(), 2);
+        let t = cut
+            .truncation
+            .as_ref()
+            .expect("a limit-cut answer must be reported");
+        assert!(matches!(t.reason, TruncReason::Rows));
+        assert_eq!(t.limit, 2);
+        assert_eq!(t.observed, 3);
+        assert!(!cut.is_complete());
+
+        // Exactly as many matches as asked for: nothing was cut, and claiming
+        // otherwise would make every full page look incomplete.
+        let exact = find_bounded(&csr, &pattern, 0, 3, &all, &budget, None).unwrap();
+        assert_eq!(exact.matches.len(), 3);
+        assert!(exact.is_complete(), "an exact fit is not a truncation");
     }
 }

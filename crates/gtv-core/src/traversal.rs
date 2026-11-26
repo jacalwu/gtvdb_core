@@ -397,6 +397,18 @@ impl BudgetTracker {
         }
     }
 
+    /// Record that the caller's own row cap (not `max_rows`) cut the output.
+    ///
+    /// `limit` is a separate knob from the budget: it bounds the *answer*, not
+    /// the work. Reporting it through the same channel keeps "what you got is a
+    /// prefix" in one place, so a caller cannot accidentally treat a capped
+    /// result as a complete one just because it used `limit` instead of a
+    /// budget.
+    #[inline]
+    pub fn trip_row_limit(&self, limit: usize, observed: u64) {
+        self.trip(TruncReason::Rows, limit as u64, observed);
+    }
+
     #[inline]
     fn ok(&self) -> bool {
         !self.is_truncated()
