@@ -41,4 +41,12 @@ pub struct IndexManifest {
     pub row_count: u64,
     #[serde(default)]
     pub tombstone_count: u64,
+    /// Stable id of the embedding space this index belongs to, derived from
+    /// `(model_id, model_version, feature_version, metric, dim)`. Two indexes
+    /// with the same dimension but a different model get different ids, which
+    /// is what lets a query refuse a cross-space lookup. `None` on a manifest
+    /// written before this field existed; such an index cannot be bound and the
+    /// engine treats it as unbound (no silent cross-space fallback).
+    #[serde(default)]
+    pub vector_space_id: Option<u64>,
 }

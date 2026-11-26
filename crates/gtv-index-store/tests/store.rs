@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gtv_core::{Metric, VectorIndex};
+use gtv_core::{Metric, VectorIndex, VectorSpace};
 use gtv_index::{AnyIndex, BuildOptions};
 use gtv_index_store::{IndexMeta, IndexStore};
 
@@ -60,6 +60,10 @@ fn save_load_roundtrip(tag: &str, options: BuildOptions, metric: Metric) {
     assert_eq!(loaded.manifest.metric, metric.as_str());
     assert_eq!(loaded.index.metric(), metric);
     assert_eq!(loaded.index.len(), 128);
+    // The embedding space is derived from (model, version, feature, metric, dim)
+    // and survives the save/load round-trip unchanged.
+    let expected_space = VectorSpace::new("bge", "1", "", metric, 8).id();
+    assert_eq!(loaded.vector_space_id(), Some(expected_space));
 
     let q = vs[3].clone();
     let a: Vec<u64> = index
@@ -377,4 +381,50 @@ fn concurrent_readers_survive_shadow_swap() {
     assert!(reads.load(Ordering::Relaxed) > 0, "readers made progress");
     assert_eq!(errors.load(Ordering::Relaxed), 0, "no reader was disrupted");
     assert_eq!(store.current_version(tag).unwrap(), Some(2));
+}
+
+/// The vector-space id is a first-class manifest field: derived at build time
+/// from the descriptor, distinct for a same-dimension different model, and
+/// preserved verbatim when an explicit id is supplied (save/load round-trip).
+#[test]
+fn vector_space_id_is_persisted_model_sensitive_and_overridable() {
+    let store = IndexStore::open(root("vspace")).unwrap();
+    let (ids, vs) = vectors(16, 8, 3);
+    let index = AnyIndex::build(ids, vs, Metric::Cosine, &BuildOptions::Flat).unwrap();
+
+    let mut m1 = meta();
+    m1.feature_version = "feat-v1".into();
+    store.save("a", &index, &BuildOptions::Flat, &m1).unwrap();
+
+    let mut m2 = meta();
+    m2.model_id = "other-model".into();
+    m2.feature_version = "feat-v1".into();
+    store.save("b", &index, &BuildOptions::Flat, &m2).unwrap();
+
+    let a = store.load("a", None).unwrap().vector_space_id().unwrap();
+    let b = store.load("b", None).unwrap().vector_space_id().unwrap();
+    assert_eq!(
+        a,
+        VectorSpace::new("bge", "1", "feat-v1", Metric::Cosine, 8).id()
+    );
+    assert_ne!(a, b, "same dim/metric but a different model must be a different space");
+
+    // An explicit id passes straight through, so re-saving a bound index does
+    // not re-key its space.
+    let mut m3 = meta();
+    m3.vector_space_id = Some(0xDEAD_BEEF);
+    store.save("c", &index, &BuildOptions::Flat, &m3).unwrap();
+    assert_eq!(
+        store.load("c", None).unwrap().vector_space_id(),
+        Some(0xDEAD_BEEF)
+    );
+
+    // The sibling-manifest cold-open helper surfaces the same id.
+    let container = store
+        .root()
+        .join(store.resolve("a").unwrap().to_string())
+        .join("v1")
+        .join("index.gtvidx");
+    let (_, manifest) = gtv_index_store::load_index_with_manifest(&container).unwrap();
+    assert_eq!(manifest.and_then(|m| m.vector_space_id), Some(a));
 }

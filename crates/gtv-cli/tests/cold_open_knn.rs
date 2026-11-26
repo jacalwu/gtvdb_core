@@ -284,3 +284,49 @@ async fn knn_ivf_labels_survive_cold_open() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The REPL cold-open path must bind the collection to the embedding space the
+/// manifest recorded, so a later query naming a different model is refused.
+#[tokio::test]
+async fn knn_cold_open_binds_the_recorded_vector_space() {
+    use gtv_core::{VectorSpace, VectorSpaceBinding};
+
+    let root = temp_store_root();
+    let container = build_fixture(&root);
+
+    let (index, manifest) = gtv_index_store::load_index_with_manifest(&container).unwrap();
+    // build_fixture uses default meta: empty model/version/feature, L2, dim 4.
+    let space = VectorSpace::new("", "", "", Metric::L2, 4);
+    let recorded = manifest
+        .and_then(|m| m.vector_space_id)
+        .expect("cold-open manifest records a vector_space_id");
+    assert_eq!(recorded, space.id());
+
+    let ctx = GtvContext::new();
+    ctx.register_knn_bound(
+        "songs",
+        index,
+        None,
+        Some(VectorSpaceBinding::new(None, recorded)),
+    )
+    .unwrap();
+
+    // A query naming a *different* space is refused, not answered.
+    let other = VectorSpace::new("other", "", "", Metric::L2, 4);
+    let sql = format!(
+        "SELECT id FROM knn('songs', '0,0,0,0', 1, '*', 'l2', '{}')",
+        other.id()
+    );
+    let err = ctx.sql(&sql).await.unwrap_err();
+    assert!(
+        format!("{err}").contains("vector space mismatch"),
+        "unexpected error: {err}"
+    );
+
+    // The matching space answers normally.
+    let ok_sql = format!(
+        "SELECT id FROM knn('songs', '0,0,0,0', 1, '*', 'l2', '{}')",
+        recorded
+    );
+    ctx.sql(&ok_sql).await.unwrap();
+}

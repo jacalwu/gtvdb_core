@@ -133,6 +133,11 @@ pub struct KnnCollection {
     /// Content version for the device cache. Assigned at registration; a
     /// re-registered collection gets a new one.
     version: u64,
+    /// Embedding-space/snapshot this collection was built for. `None` for an
+    /// ad-hoc collection that did not declare one; such a collection cannot be
+    /// checked against a query that names a space (that is refused, not
+    /// ignored), but still answers unqualified queries unchanged.
+    binding: Option<gtv_core::VectorSpaceBinding>,
 }
 
 impl KnnCollection {
@@ -178,6 +183,7 @@ impl KnnCollection {
             index: Repr::Flat(index),
             labels,
             version: 0,
+            binding: None,
         })
     }
 
@@ -229,6 +235,7 @@ impl KnnCollection {
             index: Repr::Ivf(index),
             labels,
             version: 0,
+            binding: None,
         })
     }
 
@@ -273,7 +280,24 @@ impl KnnCollection {
             index,
             labels,
             version: 0,
+            binding: None,
         })
+    }
+
+    /// Attach the embedding-space binding this collection answers for.
+    ///
+    /// A bound collection refuses a query that names a different space (see
+    /// [`Self::check_binding`]); an unbound one answers unqualified queries as
+    /// before. Builder form so a cold-open path can chain it onto the
+    /// constructors without a second mutable pass.
+    pub fn with_binding(mut self, binding: gtv_core::VectorSpaceBinding) -> Self {
+        self.binding = Some(binding);
+        self
+    }
+
+    /// The binding this collection carries, if any.
+    pub fn binding(&self) -> Option<gtv_core::VectorSpaceBinding> {
+        self.binding
     }
 
     /// Snapshot this collection as an [`AnyIndex`] so it can be persisted.
@@ -375,6 +399,41 @@ impl KnnCollection {
             });
         }
         Ok(())
+    }
+
+    /// Refuse a query that names a different embedding space (or snapshot)
+    /// than this collection answers for.
+    ///
+    /// Semantics, in order:
+    /// * The collection is bound → a named space/snapshot must match exactly;
+    ///   a mismatch is [`GtvError::VectorSpaceMismatch`] /
+    ///   [`GtvError::SnapshotMismatch`], never a fallback.
+    /// * The collection is **unbound** but the query names a space → refused,
+    ///   because "cannot verify" is not "compatible". Unqualified queries
+    ///   (`None`) still pass.
+    ///
+    /// `snapshot` is the corpus snapshot the caller expects, not the graph
+    /// snapshot: a vector index annotates a different snapshot than the
+    /// temporal graph, so the caller decides whether to pin it.
+    pub fn check_binding(
+        &self,
+        snapshot: Option<u64>,
+        vector_space_id: Option<u64>,
+    ) -> std::result::Result<(), GtvError> {
+        match &self.binding {
+            Some(binding) => binding.check(snapshot, vector_space_id),
+            None => {
+                if vector_space_id.is_some() {
+                    Err(GtvError::InvalidArgument(
+                        "knn collection: query names a vector space but the collection is \
+                         unbound; re-register it with a binding to use strong checks"
+                            .into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 
     /// Compile the label filter into an aligned bitmask, if a label was asked
@@ -618,6 +677,25 @@ impl TableFunctionImpl for KnnTableFunction {
         )?;
         crate::vec_surface::check_dim("knn", &query, collection.dim())?;
 
+        // Optional 6th argument: the vector-space id the caller expects. It is
+        // a u64 (a 64-bit hash), so it is accepted as a decimal string rather
+        // than an SQL integer, which would truncate values above i64::MAX.
+        let requested_space = exprs
+            .get(5)
+            .map(expr_to_string)
+            .transpose()?
+            .map(|s| {
+                s.trim().parse::<u64>().map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "knn: vector_space_id `{s}` is not a decimal u64"
+                    ))
+                })
+            })
+            .transpose()?;
+        collection
+            .check_binding(None, requested_space)
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
         let rows = collection.search_with(
             &name,
             Some(self.accelerators.as_ref()),
@@ -724,6 +802,49 @@ mod tests {
             err.to_string().contains("labels/index length mismatch"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn bound_collection_refuses_a_different_space() {
+        use gtv_core::{VectorSpace, VectorSpaceBinding};
+
+        let space = VectorSpace::new("model-a", "v1", "feat-v1", Metric::L2, 2);
+        let other = VectorSpace::new("model-b", "v1", "feat-v1", Metric::L2, 2);
+        let bound = songs().with_binding(VectorSpaceBinding::new(Some(9), space.id()));
+
+        // No constraint, matching space+snapshot, and a matching space with an
+        // unspecified snapshot all pass.
+        assert!(bound.check_binding(None, None).is_ok());
+        assert!(bound.check_binding(None, Some(space.id())).is_ok());
+        assert!(bound.check_binding(Some(9), Some(space.id())).is_ok());
+
+        // A different model at the same dimension must be refused, never
+        // silently answered.
+        assert!(matches!(
+            bound.check_binding(None, Some(other.id())),
+            Err(GtvError::VectorSpaceMismatch { .. })
+        ));
+        assert!(matches!(
+            bound.check_binding(Some(10), Some(space.id())),
+            Err(GtvError::SnapshotMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn unbound_collection_refuses_a_named_space() {
+        use gtv_core::VectorSpace;
+
+        let c = songs();
+        // (Metric comes in through `use super::*`.)
+        // Unqualified query: unchanged behaviour.
+        assert!(c.check_binding(None, None).is_ok());
+        // A named space against an unbound collection cannot be verified, so it
+        // is refused rather than treated as compatible.
+        let space = VectorSpace::new("m", "v1", "f", Metric::L2, 2);
+        assert!(matches!(
+            c.check_binding(None, Some(space.id())),
+            Err(GtvError::InvalidArgument(_))
+        ));
     }
 
     fn songs() -> KnnCollection {

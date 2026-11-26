@@ -467,7 +467,7 @@ M2 起才动 Top-K 与 provenance 分层；CUDA 仍排在 M4 之后。
 - `gtv-core/src/csr.rs`：`edge_slices_with_start()` 暴露源节点 run 的全局起始槽位。此前 `gtv-pattern` 把 slice-local 下标当作 `edge_idx`，第二个及以后源节点的证据会指错边；现已修正。
 - `gtv-pattern::EventOrder`：新增 `min_gap` / `max_gap`，`strict()` 保持旧的严格递增语义，`window()` 支持非严格与有界延迟。`find_bounded_motif()` 把候选集、预算、窗口/序列、边谓词四条链合并到一个内核入口。
 - `gtv-engine::MotifSpec::with_event_gap()` 与 `find_matches_bounded_with_predicate()`：窗口/序列/事件间隔现在可以和安全预算同时使用；不再以“bounded 不支持 windowed”拒绝查询。
-- 仍未做：向量空间强绑定。它不是 smurfing 首版的阻塞项。
+- 原“仍未做”的向量空间强绑定已在 §7.4 落地。
 
 ### 7.3 provenance 物理来源与 FullHit 真短路
 
@@ -476,6 +476,15 @@ M2 起才动 Top-K 与 provenance 分层；CUDA 仍排在 M4 之后。
 - `gtv-storage/src/store.rs`：`live_csr_from()` 的 `ColumnSink` 与 `Cursor` 在 merge 时收集每个输出槽位的物理来源（baseline 段用 `RowPos`，delta put 用 `put_segment_id`，WAL 行用 `UNRESOLVED`）。`Match::evidence_from(csr)` 据此重建 `PathEvidence`，不再把 merge 后的槽位误当成段内行号。
 - `gtv-storage/src/store.rs`：`active_edge_count_at()` 新增 O(1) 零扫描路径。可证明安全的条件（无 live delta、无可见 WAL、全部选中段 FullHit、每段有 flush 时缓存的 distinct 边数、段间 `src` 区间两两不重叠）满足时，直接返回 `Σ distinct_edges`，不打开 `.seg` 也不跑 retract fold；`PruneSummary::zero_scan` 标记该路径。任一条件不满足（含旧 manifest 缺字段）即回退到唯一权威的折叠路径。缓存 distinct 数而非 raw `edge_count`，是因为重复 put 会让两者不同——`AggregateView` 的去重口径必须一致。
 - 未做：把 provenance sidecar 持久化进 GTVSeg 磁盘格式（当前只在物化后的 CSR 内存中存在；单段场景由 `slot == row` 保证，不落盘也正确）。
+
+### 7.4 向量空间强绑定（§4.2 第 1、3 项）
+
+- `gtv-core/src/vector_space.rs`（新）：`VectorSpace`（`model_id / model_version / feature_schema_id / metric / dim`）+ `VectorSpaceId = u64` + `VectorSpaceBinding`。id 由五元组经 FNV-1a 64（字段长度前缀，消除拼接歧义）稳定派生：同维度不同模型必然不同 id，跨进程/跨编译器一致（不用 `DefaultHasher`，它不保证稳定）。`VectorSpaceBinding::check` 对不匹配的 space/snapshot 报错而非回落。
+- `GtvError::VectorSpaceMismatch { expected, got }`，并映射到 wire `invalid_argument`。
+- `gtv-index-store`：`IndexManifest.vector_space_id: Option<u64>`（serde default，旧 manifest 读出 `None`）；`IndexStore::build` 由描述符计算并写入，`IndexMeta.vector_space_id` 可显式覆盖以保住 save/load round-trip；`LoadedIndex::vector_space_id()` 与 `load_index_with_manifest()` 便于冷开方读取。
+- `gtv-engine`：`KnnCollection` 携带可选 `VectorSpaceBinding`（`with_binding`/`binding`），`check_binding(snapshot, vector_space_id)` 在“集合已绑定但请求不符”或“集合未绑定却指名空间”时报错。`register_knn_bound()` 是带绑定的冷开注册入口；`knn(name, query, k [, label [, metric [, vector_space_id]]])` 第 6 参数（十进制字符串，避免 u64 超 i64 截断）触发查询期强校验。`GtvContext::knn_binding()` 供保存路径保留 id。
+- `gtv-cli`：`.knn-index` 冷开改用 `load_index_with_manifest` 并按 manifest 绑定；`.knn-save` 把集合的 space id 写回 `IndexMeta`，保证往返不变。
+- 未做：§4.2 第 2 项“每行向量 `business_valid_from/to`”（向量版本化，与“强绑定”正交，属后续）；`VectorSpaceBinding.snapshot_id` 当前由调用方以 u64 语料快照指纹表达（`IndexManifest.corpus_snapshot_id` 是 Uuid，未强映射，避免误报）。
 
 ---
 

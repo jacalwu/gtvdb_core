@@ -360,17 +360,25 @@ async fn run(ctx: &GtvContext, cmd: Command) -> Result<bool> {
             println!("registered {count} published segment(s) from `{path}` as `{prefix}_*`");
         }
         Command::KnnIndex { name, path, labels } => {
-            let index = load_index(&path)?;
+            // Carry the manifest's vector-space id into the collection so a
+            // later query naming a different embedding space is refused rather
+            // than answered from the wrong model.
+            let (index, manifest) = gtv_index_store::load_index_with_manifest(&path)?;
+            let binding = manifest
+                .and_then(|m| m.vector_space_id)
+                .map(|id| gtv_core::VectorSpaceBinding::new(None, id));
             let labels = labels.as_deref().map(read_labels).transpose()?;
             let with_labels = labels.is_some();
-            ctx.register_knn_from_index(&name, index, labels)?;
+            let bound = binding.is_some();
+            ctx.register_knn_bound(&name, index, labels, binding)?;
             println!(
-                "cold-opened `{path}` as knn collection `{name}` (mmap-backed, no re-decode{})",
+                "cold-opened `{path}` as knn collection `{name}` (mmap-backed, no re-decode{}{})",
                 if with_labels {
                     "; labels restored from sidecar"
                 } else {
                     ""
-                }
+                },
+                if bound { "; bound to vector space" } else { "" }
             );
         }
         Command::AnnIndex { name, path } => {
@@ -385,7 +393,14 @@ async fn run(ctx: &GtvContext, cmd: Command) -> Result<bool> {
                 .knn_to_any_index(&name)
                 .ok_or_else(|| anyhow!("knn-save: unknown collection `{name}`"))?;
             let store = gtv_index_store::IndexStore::open(&path)?;
-            let v = store.save(&name, &index, &options, &gtv_index_store::IndexMeta::default())?;
+            // Preserve the collection's vector-space id across the save so a
+            // later cold-open re-binds the same space instead of re-deriving a
+            // different one from the (possibly empty) default meta.
+            let meta = gtv_index_store::IndexMeta {
+                vector_space_id: ctx.knn_binding(&name).map(|b| b.vector_space_id),
+                ..Default::default()
+            };
+            let v = store.save(&name, &index, &options, &meta)?;
             let container = store
                 .root()
                 .join(v.index_id.to_string())

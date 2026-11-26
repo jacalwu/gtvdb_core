@@ -152,16 +152,40 @@ pub fn open_mapped_payload(path: impl AsRef<Path>) -> Result<Option<AnyIndex>> {
 /// store registry or version directory, which is exactly what a REPL
 /// `.knn-index` / `.ann-index` cold-open command wants.
 pub fn load_index(path: impl AsRef<Path>) -> Result<AnyIndex> {
+    load_index_with_manifest(path).map(|(index, _)| index)
+}
+
+/// Like [`load_index`], but also returns the index manifest when one is
+/// available.
+///
+/// The manifest is what carries the `vector_space_id`, so a cold-open caller
+/// needs it to bind a `knn` collection to its embedding space. It is looked up
+/// in two places, in order: a sibling `manifest.json` (the `IndexStore`
+/// version directory layout), then the manifest embedded in a legacy container.
+/// A cold-open `.gtvidx` payload with neither yields `None` — the caller then
+/// registers an unbound collection rather than guessing a space.
+pub fn load_index_with_manifest(
+    path: impl AsRef<Path>,
+) -> Result<(AnyIndex, Option<IndexManifest>)> {
+    let path = path.as_ref();
+    let sibling_manifest = path
+        .parent()
+        .map(|dir| dir.join("manifest.json"))
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|bytes| serde_json::from_slice::<IndexManifest>(&bytes).ok());
+
     // Cold-open path first: zero-copy mmap view for GTVVEC / GIVFCMP payloads.
-    if let Some(any) = open_mapped_payload(&path)? {
-        return Ok(any);
+    if let Some(any) = open_mapped_payload(path)? {
+        return Ok((any, sibling_manifest));
     }
     // Legacy payload: read the file, split the container, and hand the payload
     // to `AnyIndex` with the manifest-recorded index type.
-    let bytes = std::fs::read(path.as_ref()).map_err(IndexStoreError::Io)?;
+    let bytes = std::fs::read(path).map_err(IndexStoreError::Io)?;
     let (manifest_json, payload) = decode(&bytes)?;
     let manifest: IndexManifest = serde_json::from_slice(&manifest_json)?;
-    AnyIndex::from_bytes(manifest.index_type, &payload).map_err(IndexStoreError::Index)
+    let index = AnyIndex::from_bytes(manifest.index_type, &payload).map_err(IndexStoreError::Index)?;
+    // The embedded manifest is authoritative for a legacy container.
+    Ok((index, Some(manifest)))
 }
 
 /// Run the O(file size) data-integrity check over a container's mapped payload.

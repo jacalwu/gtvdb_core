@@ -1493,6 +1493,44 @@ impl GtvContext {
         Ok(())
     }
 
+    /// Register a `knn` collection from a persisted index **together with** the
+    /// embedding-space binding it answers for.
+    ///
+    /// This is the cold-open counterpart of [`Self::register_knn_from_index`]:
+    /// the caller (which has access to the index manifest) passes the
+    /// `vector_space_id` recorded at build time. The resulting collection
+    /// refuses any query that names a different space; an unbound collection
+    /// registered through the plain path keeps its old behaviour.
+    pub fn register_knn_bound(
+        &self,
+        name: &str,
+        index: AnyIndex,
+        labels: Option<Vec<String>>,
+        binding: Option<gtv_core::VectorSpaceBinding>,
+    ) -> Result<()> {
+        let mut collection = KnnCollection::from_any_index(index, labels)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        if let Some(binding) = binding {
+            collection = collection.with_binding(binding);
+        }
+        collection.assign_version(self.accelerators.next_version());
+        self.knn_collections
+            .write()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution(
+                    "knn collection registry poisoned".into(),
+                )
+            })?
+            .insert(name.to_string(), collection);
+        Ok(())
+    }
+
+    /// The embedding-space binding of a registered collection, if it declared
+    /// one. Used by the save path to preserve the id across a round-trip.
+    pub fn knn_binding(&self, name: &str) -> Option<gtv_core::VectorSpaceBinding> {
+        self.knn_collections.read().ok()?.get(name)?.binding()
+    }
+
     /// Register a persisted (loaded) index for `ann(name, query, k [, metric])`.
     pub fn register_any_index(&self, name: &str, index: AnyIndex) {
         if let Ok(mut map) = self.any_indexes.write() {

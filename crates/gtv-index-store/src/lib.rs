@@ -20,7 +20,9 @@ pub use container::{decode, encode, split_container_header, CONTAINER_MAGIC, CON
 pub use embedding::{build_and_save, build_index_from_embeddings, EmbeddingIndexError, EmbeddingIndexSpec};
 pub use gtv_index::AnyIndex;
 pub use manifest::IndexManifest;
-pub use payload::{container_payload_kind, load_index, open_mapped_payload, PayloadKind};
+pub use payload::{
+    container_payload_kind, load_index, load_index_with_manifest, open_mapped_payload, PayloadKind,
+};
 pub use store::{IndexMeta, IndexStore, IndexVersion, LoadedIndex};
 pub use vector_segment_io::{
     container_payload_is_gtvvec, corpus_file_name, corpus_path, open_vector_segment_at,

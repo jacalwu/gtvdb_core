@@ -135,6 +135,9 @@ impl From<gtv_core::GtvError> for WireError {
             SnapshotMismatch { expected, got } => {
                 Self::snapshot_mismatch(format!("snapshot mismatch: expected {expected}, got {got}"))
             }
+            VectorSpaceMismatch { expected, got } => Self::invalid_argument(format!(
+                "vector space mismatch: index={expected}, query={got}"
+            )),
             UniverseMismatch { expected, got } => Self::invalid_argument(format!(
                 "universe mismatch: expected {expected}, got {got}"
             )),

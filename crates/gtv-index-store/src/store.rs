@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gtv_catalog::{DataFileId, IndexId, SnapshotId, TableId};
-use gtv_core::VectorIndex;
+use gtv_core::{VectorIndex, VectorSpace};
 use gtv_index::{encode_ivf_payload, encode_vector_segment, AnyIndex, BuildOptions};
 use gtv_storage::write_atomic;
 
@@ -39,6 +39,11 @@ pub struct IndexMeta {
     pub feature_version: String,
     pub normalized: bool,
     pub tombstone_count: u64,
+    /// Override the computed vector-space id. Set this when re-saving an index
+    /// that was already bound to a space, so a save/load round-trip does not
+    /// silently re-key the space (for example when `model_id` is not carried in
+    /// the meta). `None` derives the id from the descriptor.
+    pub vector_space_id: Option<u64>,
 }
 
 /// Identifies one built version of an index.
@@ -53,6 +58,15 @@ pub struct IndexVersion {
 pub struct LoadedIndex {
     pub manifest: IndexManifest,
     pub index: AnyIndex,
+}
+
+impl LoadedIndex {
+    /// Embedding-space id this index was built for, if the manifest recorded
+    /// one. `None` on a legacy manifest; such an index cannot be bound, so the
+    /// engine will treat it as unbound rather than guess.
+    pub fn vector_space_id(&self) -> Option<u64> {
+        self.manifest.vector_space_id
+    }
 }
 
 /// Filesystem-backed, versioned index store.
@@ -198,7 +212,20 @@ impl IndexStore {
             AnyIndex::Hnsw(_) => index.to_bytes(),
         };
         let payload_checksum = blake3::hash(&payload).to_hex().to_string();
+        // The embedding space is fully described by the model identity, the
+        // feature pipeline and the vector geometry. Its id is persisted so a
+        // cold-open consumer can bind a collection to it and refuse a query
+        // that names a different space.
+        let space = VectorSpace::new(
+            meta.model_id.clone(),
+            meta.model_version.clone(),
+            meta.feature_version.clone(),
+            index.metric(),
+            index.dim(),
+        );
+        let vector_space_id = meta.vector_space_id.or(Some(space.id()));
         let manifest = IndexManifest {
+            vector_space_id,
             index_id: id,
             name: name.to_string(),
             table_id: meta.table_id,

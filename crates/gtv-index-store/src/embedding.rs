@@ -112,6 +112,7 @@ pub fn build_and_save(
         feature_version: spec.feature_version.clone(),
         normalized: spec.normalized,
         tombstone_count: 0,
+        vector_space_id: None,
     };
     let version = store.save(&spec.name, &index, &spec.build_options, &meta)?;
     let manifest = store.manifest(&spec.name, Some(version.version))?;

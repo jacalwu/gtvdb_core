@@ -42,6 +42,12 @@ pub enum GtvError {
     #[error("snapshot mismatch: expected {expected}, got {got}")]
     SnapshotMismatch { expected: u64, got: u64 },
 
+    /// A vector collection was queried for a different embedding space than the
+    /// one it was built for. Answering would return meaningless neighbours, so
+    /// the query is refused instead of falling back.
+    #[error("vector space mismatch: index={expected}, query={got}")]
+    VectorSpaceMismatch { expected: u64, got: u64 },
+
     /// A candidate set/index covers a different number of rows than expected.
     #[error("universe mismatch: expected {expected} rows, operand has {got}")]
     UniverseMismatch { expected: u64, got: u64 },

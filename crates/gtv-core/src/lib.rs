@@ -22,6 +22,7 @@ pub mod table;
 pub mod temporal;
 pub mod traits;
 pub mod traversal;
+pub mod vector_space;
 
 pub use active_bitmap::{ActiveNodeBitmap, BitmapCache, BitmapDecision, BitmapKey, BitmapPlanner};
 pub use bitemporal::{
@@ -61,3 +62,4 @@ pub use traversal::{
     BudgetTracker, CancelToken, EdgePredicate, KhopResult, TraversalBudget, TraversalOutcome,
     TraversalStats, TriState, TruncReason, Truncation, VisitedSet,
 };
+pub use vector_space::{VectorSpace, VectorSpaceBinding, VectorSpaceId};
