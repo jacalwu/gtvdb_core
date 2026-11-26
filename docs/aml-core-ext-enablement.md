@@ -486,6 +486,16 @@ M2 起才动 Top-K 与 provenance 分层；CUDA 仍排在 M4 之后。
 - `gtv-cli`：`.knn-index` 冷开改用 `load_index_with_manifest` 并按 manifest 绑定；`.knn-save` 把集合的 space id 写回 `IndexMeta`，保证往返不变。
 - 未做：§4.2 第 2 项“每行向量 `business_valid_from/to`”（向量版本化，与“强绑定”正交，属后续）；`VectorSpaceBinding.snapshot_id` 当前由调用方以 u64 语料快照指纹表达（`IndexManifest.corpus_snapshot_id` 是 Uuid，未强映射，避免误报）。
 
+### 7.5 M3：ext 侧四个 Pattern 落地（在 `gtvdb_ext`，此处只记结论）
+
+`gtv_ext_lib/gtv-ext-aml-pattern`（新 crate）把 §5.3 的映射表变成代码，四个 Pattern 全部只调 core 原语，无自建图结构：smurfing 用 `neighbors` + sidecar `EdgePredicate` + 尾随窗口；structuring 链用 `Sel` + `temporal_path` + `EventOrder::window` + `AttrPred` + `find_bounded_motif`；circular 用 `ring` + `WindowedMotif` + `AttrPred`；fan-in/out 用 `neighbors` 与 `transpose()`。core 侧同步补了唯一缺口：`TemporalCSR::from_edge_columns_permuted()` 返回“槽位 → 输入行”置换，否则属性 sidecar 在非有序输入下会把金额挂到另一笔转账上。
+
+三处判定值得记在 core 这一侧，因为它们划的是边界而不是实现：
+
+1. **金额带必须左闭右开。** `AttrPred::between` 两端闭区间，而 AML 的上界是申报阈值；恰好等于阈值的那笔本身就是应申报交易，不能同时充当“拆单的一部分”。这条使 ext 自己实现 `AmountBand`，而 `AttrPred` 仍用于单边阈值（`lt`）。
+2. **环的金额关系不能下推。** 它是两条边之间的关系，谓词一次只看一条边，所以只能留作后置过滤——这也正说明 §3.2 的 sidecar 必须能与槽位对齐。
+3. **`full_hit`/`limit` 截断必须上报。** pattern 的 `limit` 在引擎里是静默截断（`add_rows` 只在返回后统计），ext 侧只能“返回条数恰好等于 limit 即视为可能被截断”，并把截断变成 SQL 错误。若要让这条变精确，core 需要在 `find_bounded_impl` 的 `out.len() >= limit` 分支里记 `TruncReason::Rows`——属 core 的后续小改动。
+
 ---
 
 ## 8. 明确不做
