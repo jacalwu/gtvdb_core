@@ -1207,14 +1207,8 @@ impl TemporalCSR {
         }
         // Built from forward-slot order, so the build permutation *is* the map
         // back to the forward edge.
-        let (mut rev, rev_slot_to_forward_slot) = TemporalCSR::from_edge_columns_permuted(
-            &src,
-            &dst,
-            &vf,
-            &vt,
-            &et,
-            self.node_count,
-        )?;
+        let (mut rev, rev_slot_to_forward_slot) =
+            TemporalCSR::from_edge_columns_permuted(&src, &dst, &vf, &vt, &et, self.node_count)?;
         rev.edge_identity = false;
         rev.snapshot_id = self.snapshot_id;
         Ok((rev, rev_slot_to_forward_slot))
